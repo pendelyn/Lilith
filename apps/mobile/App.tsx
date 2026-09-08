@@ -1,15 +1,13 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { parseHealthResponse } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   SafeAreaProvider,
   SafeAreaView,
 } from "react-native-safe-area-context";
 import {
   ActivityIndicator,
-  KeyboardAvoidingView,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -58,6 +56,8 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [identity, setIdentity] = useState<AgentIdentity | null>(null);
   const [persistError, setPersistError] = useState(false);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const saveRevision = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -77,12 +77,17 @@ export default function App() {
   }, []);
 
   async function persist(next: AgentIdentity) {
+    const revision = ++saveRevision.current;
     setIdentity(next);
+    const save = saveQueue.current
+      .catch(() => undefined)
+      .then(() => AsyncStorage.setItem(IDENTITY_STORAGE_KEY, serializeIdentity(next)));
+    saveQueue.current = save;
     try {
-      await AsyncStorage.setItem(IDENTITY_STORAGE_KEY, serializeIdentity(next));
-      setPersistError(false);
+      await save;
+      if (revision === saveRevision.current) setPersistError(false);
     } catch {
-      setPersistError(true);
+      if (revision === saveRevision.current) setPersistError(true);
     }
   }
 
@@ -90,25 +95,19 @@ export default function App() {
     <SafeAreaProvider>
       <SafeAreaView style={styles.safe}>
         <StatusBar style="light" />
-        <KeyboardAvoidingView
-          style={styles.flex}
-          behavior={Platform.OS === "ios" ? "padding" : undefined}
-          enabled={Platform.OS === "ios"}
-        >
-          {!ready ? (
-            <View style={styles.loading} accessibilityLabel="Loading">
-              <ActivityIndicator color="#C4B5FD" />
-            </View>
-          ) : identity === null ? (
-            <Onboarding onComplete={(next) => void persist(next)} />
-          ) : (
-            <Home
-              identity={identity}
-              persistError={persistError}
-              onIdentityChange={(next) => void persist(next)}
-            />
-          )}
-        </KeyboardAvoidingView>
+        {!ready ? (
+          <View style={styles.loading} accessibilityLabel="Loading">
+            <ActivityIndicator color="#C4B5FD" />
+          </View>
+        ) : identity === null ? (
+          <Onboarding onComplete={(next) => void persist(next)} />
+        ) : (
+          <Home
+            identity={identity}
+            persistError={persistError}
+            onIdentityChange={(next) => void persist(next)}
+          />
+        )}
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -131,20 +130,22 @@ function Onboarding({ onComplete }: { onComplete: (identity: AgentIdentity) => v
       <Text style={styles.lede}>Name your companion and choose a starting setup.</Text>
       <NameField value={name} onChangeText={setName} />
       <Text style={styles.sectionLabel}>Setup</Text>
-      <ModeChoice
-        mode="recommended"
-        title="Recommended"
-        detail="Web research and Memory"
-        selected={mode === "recommended"}
-        onSelect={setMode}
-      />
-      <ModeChoice
-        mode="blank"
-        title="Blank"
-        detail="No optional tools"
-        selected={mode === "blank"}
-        onSelect={setMode}
-      />
+      <View accessibilityRole="radiogroup" accessibilityLabel="Setup" style={styles.modeGroup}>
+        <ModeChoice
+          mode="recommended"
+          title="Recommended"
+          detail="Web research and Memory"
+          selected={mode === "recommended"}
+          onSelect={setMode}
+        />
+        <ModeChoice
+          mode="blank"
+          title="Blank"
+          detail="No optional tools"
+          selected={mode === "blank"}
+          onSelect={setMode}
+        />
+      </View>
       <View style={styles.spacer} />
       <Pressable
         onPress={() => {
@@ -188,7 +189,7 @@ function Home({
   function commitName(raw: string) {
     const next = identityFromChoice(raw, identity.mode);
     setName(next.name);
-    if (next.name !== identity.name) onIdentityChange(next);
+    if (next.name !== identity.name || persistError) onIdentityChange(next);
   }
 
   async function checkConnection() {
@@ -353,9 +354,9 @@ function ModeChoice({
   return (
     <Pressable
       onPress={() => onSelect(mode)}
-      accessibilityRole="button"
+      accessibilityRole="radio"
       accessibilityLabel={`${title}. ${detail}.`}
-      accessibilityState={{ selected }}
+      accessibilityState={{ checked: selected }}
       style={({ pressed }) => [
         styles.choice,
         selected && styles.choiceSelected,
@@ -378,9 +379,6 @@ const styles = StyleSheet.create({
   safe: {
     flex: 1,
     backgroundColor: "#121212",
-  },
-  flex: {
-    flex: 1,
   },
   loading: {
     flex: 1,
@@ -478,6 +476,9 @@ const styles = StyleSheet.create({
     color: "#A3A3A3",
     fontSize: 15,
     lineHeight: 20,
+  },
+  modeGroup: {
+    gap: 16,
   },
   spacer: {
     flexGrow: 1,
