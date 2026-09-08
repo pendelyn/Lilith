@@ -27,6 +27,11 @@ $args = @(
 
 if ($Mode -ne 'agent') {
     $args += @('--mode', $Mode)
+} else {
+    $branch = (& git -C $Workspace branch --show-current).Trim()
+    if ($LASTEXITCODE -ne 0 -or $branch -notmatch '^issue/\d+-') {
+        throw 'Writing Grok runs require an issue/<number>-... branch.'
+    }
 }
 if ($Worktree) {
     $args += '--worktree'
