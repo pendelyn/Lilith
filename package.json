@@ -1,0 +1,22 @@
+{
+  "name": "lilith",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run start --workspace=@lilith/api",
+    "dev:mobile": "npm run start --workspace=@lilith/mobile",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "npm run test --workspace=@lilith/api"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "Lilith",
+    "slug": "lilith",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "backgroundColor": "#121212"
+    },
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#121212"
+      }
+    },
+    "plugins": [
+      "expo-status-bar"
+    ]
+  }
+}
