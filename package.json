@@ -10,7 +10,7 @@
     "dev:api": "npm run start --workspace=@lilith/api",
     "dev:mobile": "npm run start --workspace=@lilith/mobile",
     "typecheck": "npm run typecheck --workspaces",
-    "test": "npm run test --workspace=@lilith/api"
+    "test": "npm run test --workspace=@lilith/api && npm run test --workspace=@lilith/mobile"
   },
   "engines": {
     "node": ">=24"
