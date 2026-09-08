@@ -61,7 +61,7 @@ Nur P0 gehört zur ersten Alpha. Sie muss Folgendes können:
 - nach einem Provider-Qualifikationsschritt genau einen Provider sicher verbinden
 - Nachrichten streamen
 - eine dafür vorgesehene Testaufgabe an mindestens einen Unteragenten delegieren
-- Zustände `wartet`, `arbeitet`, `braucht Eingabe`, `fertig`, `gestoppt`, `fehlgeschlagen` anzeigen
+- Zustände `wartet`, `arbeitet`, `braucht Eingabe`, `pausiert`, `fertig`, `gestoppt`, `fehlgeschlagen` anzeigen
 - Unteragent-Ergebnisse in den Hauptchat zurückführen
 - Aufgabe stoppen; danach dürfen keine neuen Tool-Aufrufe starten und verspätete Ergebnisse nicht als Erfolg erscheinen
 - Chat- und Aufgabenstatus nach einem App-Neustart wiederherstellen
@@ -155,7 +155,7 @@ Webseiten, Tool-Ausgaben und Dokumente sind **nicht vertrauenswürdige Eingaben*
 
 Jede Einmalfreigabe ist an eine unveränderliche Aktions-ID mit Origin, Operation, Payload-/Datei-Digest und maximalen Kosten gebunden, läuft kurzfristig ab und ist bei jeder Änderung erneut einzuholen. Stoppen verwirft offene Freigaben und verhindert neue Tool-Aufrufe; bereits extern ausgeführte Aktionen können nicht automatisch rückgängig gemacht werden. Wo möglich werden Idempotency Keys verwendet.
 
-Alpha-Limits: höchstens drei parallele Unteragenten, genau eine Delegationsebene, 15 Minuten Laufzeit pro Aufgabe und 1 USD Providerkosten pro Aufgabe, soweit messbar. Ein Unteragent darf keine weiteren Unteragenten starten. Eine Erhöhung benötigt eine Bestätigung.
+Alpha-Limits: höchstens drei parallele Unteragenten, genau eine Delegationsebene, 15 Minuten Laufzeit pro Aufgabe und 1 USD Providerkosten pro Aufgabe, soweit messbar. Ein Unteragent darf keine weiteren Unteragenten starten. Diese Grenzen können in P0 nicht erhöht werden.
 
 ## 9. Erinnerungen
 
@@ -174,7 +174,7 @@ Automatische Präferenzvorschläge, Suche und Export folgen erst nach der ersten
 ### Datenlebenszyklus der Alpha
 
 - Chats, Aufgaben und Erinnerungen bleiben bis zur Löschung durch den Nutzer erhalten.
-- Browser-Screenshots werden nach 7 Tagen gelöscht.
+- Browser-Screenshots werden ab P1 nach 7 Tagen gelöscht.
 - temporäre Aufgabendateien werden nach 30 Tagen gelöscht.
 - Sicherheits-Auditdaten werden 90 Tage aufbewahrt.
 - Backups laufen spätestens nach 30 Tagen aus.
@@ -237,10 +237,10 @@ Der definierte Alpha-Smoke-Test belegt:
 1. Nach Recommended sind Web-Recherche und Memory aktiv; nach Blank sind beide aus.
 2. Der Name Lilith kann geändert werden und bleibt nach Neustart erhalten.
 3. Der qualifizierte P0-Provider kann verbunden, geprüft und widerrufen werden, ohne Secrets an Client oder Logs auszugeben.
-4. Die Testaufgabe „Vergleiche drei angegebene Quellen und lasse einen Recherche-Unteragenten Gemeinsamkeiten sammeln“ erzeugt genau einen sichtbaren Unteragenten und führt sein Ergebnis in den Hauptchat zurück.
-5. Eine definierte Rückfrage zeigt zwei antippbare Optionen und verarbeitet die gewählte Antwort.
+4. Die Testaufgabe „Vergleiche Testquelle A, B und C und lasse einen Recherche-Unteragenten die gemeinsame Farbe sammeln“ nutzt kontrollierte Fixtures: A enthält Rot/Blau, B Blau/Grün und C Blau/Gelb. Sie erzeugt genau einen sichtbaren Unteragenten und führt `Blau` in den Hauptchat zurück.
+5. Die Rückfrage „Soll das Ergebnis kurz oder ausführlich sein?“ zeigt die Optionen `Kurz` und `Ausführlich`. `Kurz` setzt nachweisbar `detailLevel=short` am wartenden Task und setzt denselben Lauf fort.
 6. Stoppen setzt die Aufgabe auf `gestoppt`, startet keine weiteren Tools, verwirft offene Freigaben und zeigt kein verspätetes Ergebnis als Erfolg.
-7. Die Quellenvergleichs-Aufgabe liefert die drei Quellen im Ergebnis.
+7. Die Quellenvergleichs-Aufgabe liefert genau die drei Fixture-Quellen A, B und C im Ergebnis.
 8. Nach „Merk dir: Antwortsprache Deutsch“ liefert das Memory-Retrieval für die Testanfrage die gespeicherte Memory-ID. Nach Bearbeitung liefert es den neuen Wert, nach Löschung keine ID; bei pausiertem Memory erzeugt derselbe Speicherbefehl keinen Datensatz.
 9. Eine simulierte External-Write-Aktion erzeugt vor Ausführung eine gebundene Freigabe. Ablehnung führt zu null Aufrufen, Freigabe zu genau einem. Änderung von Origin, Operation, Payload-/Datei-Digest oder Kostenlimit sowie Ablauf der Freigabe blockiert die Ausführung und verlangt eine neue Freigabe.
 10. Nach App-Neustart zeigt eine zuvor laufende Aufgabe ihren serverseitig persistierten Zustand statt neu zu starten oder zu verschwinden.
@@ -248,9 +248,9 @@ Der definierte Alpha-Smoke-Test belegt:
 Automatisierte Sicherheits- und Lebenszykluschecks belegen zusätzlich:
 
 11. Loopback-, private, Link-Local- und Cloud-Metadaten-Ziele werden vor einem Netzwerkaufruf blockiert; eine Anfrage mit markierten Nutzerdaten in URL, Header oder Body wartet auf Freigabe.
-12. Ein vierter paralleler Unteragent und jede rekursive Delegation werden abgewiesen; Laufzeit- und messbares Kostenlimit pausieren die Aufgabe vor weiterer Arbeit.
+12. Ein vierter paralleler Unteragent und jede rekursive Delegation werden abgewiesen; Laufzeit- und messbares Kostenlimit setzen die Aufgabe auf `pausiert` und verhindern weitere Arbeit.
 13. Ein Runner läuft nicht als root, sieht weder Host-Dateisystem noch Host-/Container-Socket oder Backend-Umgebung und wird nach Abschluss samt temporären Job-Secrets zerstört.
-14. Ablaufjobs löschen einen abgelaufenen Screenshot nach 7 Tagen, eine temporäre Aufgabendatei nach 30 Tagen und Auditdaten nach 90 Tagen, ohne aktive Chat- oder Memory-Daten zu löschen.
+14. Ablaufjobs löschen eine temporäre Aufgabendatei nach 30 Tagen und Auditdaten nach 90 Tagen, ohne aktive Chat- oder Memory-Daten zu löschen. Die Screenshot-Frist wird mit P1 getestet.
 
 ## 14. Nicht-Ziele der ersten Alpha
 
@@ -263,14 +263,14 @@ Automatisierte Sicherheits- und Lebenszykluschecks belegen zusätzlich:
 - selbstlernendes Modelltraining auf Nutzerdaten
 - komplexe dauerhafte Berechtigungsregeln
 - Cloud und Self-hosting gleichzeitig als voll unterstützte Produkte
+- Sprachaufnahme oder Sprachchat
 
 ## 15. Offene Produktentscheidungen
 
 1. Welcher Provider gewinnt den P0-Qualifikationsschritt?
-2. Wie sieht Lilith im ersten visuellen Stil aus: 2D-Figur, Pixel-Art, Orb oder etwas anderes?
-3. Muss Sprachaufnahme bereits in die erste Alpha?
-4. Welche zusätzlichen Tools gehören nach P0 in Recommended?
-5. Welche Aufbewahrungszeiten sollen vor einer öffentlichen Beta geändert werden?
+2. Welche zusätzlichen Tools gehören nach P0 in Recommended?
+3. In welcher Roadmap-Phase soll Spracheingabe geprüft werden?
+4. Welche Aufbewahrungszeiten sollen vor einer öffentlichen Beta geändert werden?
 
 ## 16. Reihenfolge der Umsetzung
 
