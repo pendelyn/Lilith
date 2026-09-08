@@ -4,6 +4,7 @@ node_modules/
 !.env.example
 !**/.env.example
 .expo/
+.lilith-jobs/
 dist/
 web-build/
 npm-debug.log*
