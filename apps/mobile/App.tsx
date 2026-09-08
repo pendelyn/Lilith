@@ -1,10 +1,10 @@
 import { parseHealthResponse } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useState } from "react";
+import { SafeAreaView } from "react-native-safe-area-context";
 import {
   ActivityIndicator,
   Pressable,
-  SafeAreaView,
   StyleSheet,
   Text,
   TextInput,
