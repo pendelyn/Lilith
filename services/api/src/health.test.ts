@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createHealthServer, loadConfig } from "./health.ts";
 
-test("missing LOCAL_API_TOKEN fails closed", () => {
-  assert.throws(() => loadConfig({}), /LOCAL_API_TOKEN/);
-  assert.throws(() => loadConfig({ LOCAL_API_TOKEN: "   " }), /LOCAL_API_TOKEN/);
+test("missing authentication config fails closed", () => {
+  assert.throws(() => loadConfig({ ALPHA_OWNER_ID: "alpha-owner" }), /LOCAL_API_TOKEN/);
+  assert.throws(() => loadConfig({ LOCAL_API_TOKEN: "secret-token" }), /ALPHA_OWNER_ID/);
 });
 
 test("valid token returns exact HealthResponse JSON", async () => {
-  await withServer("secret-token", async (base) => {
+  await withServer(async (base) => {
     const response = await fetch(`${base}/health`, {
       headers: { Authorization: "Bearer secret-token" },
     });
@@ -19,7 +19,7 @@ test("valid token returns exact HealthResponse JSON", async () => {
 });
 
 test("missing credentials return 401", async () => {
-  await withServer("secret-token", async (base) => {
+  await withServer(async (base) => {
     const response = await fetch(`${base}/health`);
     assert.equal(response.status, 401);
     assert.equal(await response.text(), "");
@@ -27,7 +27,7 @@ test("missing credentials return 401", async () => {
 });
 
 test("wrong credentials return 401", async () => {
-  await withServer("secret-token", async (base) => {
+  await withServer(async (base) => {
     const response = await fetch(`${base}/health`, {
       headers: { Authorization: "Bearer wrong-token" },
     });
@@ -36,8 +36,8 @@ test("wrong credentials return 401", async () => {
   });
 });
 
-test("unknown route returns 404", async () => {
-  await withServer("secret-token", async (base) => {
+test("unknown authenticated route returns 404", async () => {
+  await withServer(async (base) => {
     const response = await fetch(`${base}/nope`, {
       headers: { Authorization: "Bearer secret-token" },
     });
@@ -46,8 +46,15 @@ test("unknown route returns 404", async () => {
   });
 });
 
+test("unknown unauthenticated route returns 401", async () => {
+  await withServer(async (base) => {
+    const response = await fetch(`${base}/nope`);
+    assert.equal(response.status, 401);
+  });
+});
+
 test("authenticated unsupported health method returns 405", async () => {
-  await withServer("secret-token", async (base) => {
+  await withServer(async (base) => {
     const response = await fetch(`${base}/health`, {
       method: "POST",
       headers: { Authorization: "Bearer secret-token" },
@@ -58,8 +65,8 @@ test("authenticated unsupported health method returns 405", async () => {
   });
 });
 
-async function withServer(token: string, run: (base: string) => Promise<void>): Promise<void> {
-  const server = createHealthServer(token);
+async function withServer(run: (base: string) => Promise<void>): Promise<void> {
+  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" });
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());
   });

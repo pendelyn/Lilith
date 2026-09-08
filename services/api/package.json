@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env --watch src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test src/health.test.ts"
+    "test": "node --test src/*.test.ts"
   },
   "dependencies": {
     "@lilith/contracts": "*"
