@@ -2,7 +2,7 @@ import { createHealthServer, loadConfig } from "./health.ts";
 
 try {
   const config = loadConfig();
-  const server = createHealthServer(config.token);
+  const server = createHealthServer(config);
   server.listen(config.port, config.host, () => {
     process.stdout.write(`API listening on http://${config.host}:${config.port}\n`);
   });

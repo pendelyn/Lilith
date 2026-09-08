@@ -22,7 +22,7 @@ Copy-Item apps\mobile\.env.example apps\mobile\.env
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-Paste the generated value into `services\api\.env` as `LOCAL_API_TOKEN`. Enter the same value in the app when prompted. The app keeps it in memory only; it is not written to `EXPO_PUBLIC_*` or disk.
+Paste the generated value into `services\api\.env` as `LOCAL_API_TOKEN`; keep `ALPHA_OWNER_ID=local-owner` for the private Alpha. Enter the token in the app when prompted. The owner ID is server-controlled, and the app keeps the token in memory only; neither value is written to `EXPO_PUBLIC_*` or app storage.
 
 ## Run
 
@@ -89,4 +89,5 @@ ipconfig
 
 - Development only. Do not expose this process to the public internet.
 - Do not put real secrets or user data through this HTTP endpoint.
-- Wrong or missing `LOCAL_API_TOKEN` must refuse to serve. Never commit `.env`.
+- Wrong or missing `LOCAL_API_TOKEN` or `ALPHA_OWNER_ID` must refuse to serve. Never commit `.env`.
+- `ALPHA_OWNER_ID` is fixed server-side. This private Alpha does not claim multi-user isolation.
