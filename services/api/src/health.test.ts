@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { parseChatStreamEvent } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer, loadConfig } from "./health.ts";
+import { COLOR_COMPARE_PROMPT, RESEARCH_ASSIGNMENT } from "./tasks.ts";
 
 test("missing authentication config fails closed", () => {
   assert.throws(() => loadConfig({ ALPHA_OWNER_ID: "alpha-owner" }), /LOCAL_API_TOKEN/);
@@ -40,8 +41,58 @@ test("chat replies stream as validated NDJSON without raw logs", async () => {
       deltas.map((event) => event.text).join(""),
       "No model is connected yet. You said: Hello\n🌙",
     );
+    assert.equal(events.some((event) => event.type === "subagent"), false);
     assert.deepEqual(events.at(-1), { type: "done" });
   });
+});
+
+test("color compare test task streams one research subagent and Blau", async () => {
+  await withServer(async (base) => {
+    const response = await fetch(`${base}/chat`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer secret-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: `  ${COLOR_COMPARE_PROMPT}  ` }),
+    });
+    assert.equal(response.status, 200);
+    const events = (await response.text()).trim().split("\n").map((line) =>
+      parseChatStreamEvent(JSON.parse(line))
+    );
+    const subagents = events.flatMap((event) => (event.type === "subagent" ? [event] : []));
+    const ids = new Set(subagents.map((event) => event.id));
+    const reply = events
+      .flatMap((event) => (event.type === "delta" ? [event.text] : []))
+      .join("");
+
+    assert.equal(ids.size, 1);
+    assert.deepEqual(
+      subagents.map((event) => event.state),
+      ["waiting", "working", "completed"],
+    );
+    assert.equal(subagents[0]?.role, "research");
+    assert.equal(subagents[0]?.assignment, RESEARCH_ASSIGNMENT);
+    assert.equal(subagents.at(-1)?.result, "Blau");
+    assert.match(reply, /Blau/);
+    assert.equal(reply.includes("No model is connected yet"), false);
+    assert.deepEqual(events.at(-1), { type: "done" });
+  });
+});
+
+test("subagent events reject extra fields", () => {
+  assert.throws(
+    () =>
+      parseChatStreamEvent({
+        type: "subagent",
+        id: "sub-1",
+        role: "research",
+        assignment: "task",
+        state: "working",
+        log: "raw tool output",
+      }),
+    /Invalid/,
+  );
 });
 
 test("invalid chat messages fail without echoing input", async () => {

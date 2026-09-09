@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { parseChatStreamEvent, parseHealthResponse } from "@lilith/contracts";
+import { parseChatStreamEvent, parseHealthResponse, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -39,7 +39,9 @@ import {
   parsePersistedChat,
   retryReply,
   serializeChat,
+  upsertSubagent,
   type ChatMessage,
+  type SubagentCard,
 } from "./chat";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
@@ -58,6 +60,16 @@ type ConnectionState =
   | "unauthorized"
   | "unreachable"
   | "unexpected";
+
+const TASK_STATE_LABEL: Record<TaskState, string> = {
+  waiting: "Waiting",
+  working: "Working",
+  needs_input: "Needs input",
+  paused: "Paused",
+  completed: "Completed",
+  stopped: "Stopped",
+  failed: "Failed",
+};
 
 const STATUS_TEXT: Record<ConnectionState, string> = {
   idle: "Enter the local API token, then check the connection.",
@@ -334,6 +346,16 @@ function Home({
           if (event.type === "delta") {
             spokenReply += event.text;
             setMessages((current) => appendReply(current, userId, event.text));
+          } else if (event.type === "subagent") {
+            setMessages((current) =>
+              upsertSubagent(current, userId, {
+                id: event.id,
+                role: event.role,
+                assignment: event.assignment,
+                state: event.state,
+                ...(event.result === undefined ? {} : { result: event.result }),
+              }),
+            );
           } else {
             AccessibilityInfo.announceForAccessibility(
               `${identity.name}: ${spokenReply || "Reply complete"}`,
@@ -542,6 +564,9 @@ function MessageBubble({
   return (
     <View style={[styles.messageRow, !assistant && styles.userMessageRow]}>
       <View style={[styles.bubble, assistant ? styles.assistantBubble : styles.userBubble]}>
+        {message.subagents?.map((card) => (
+          <SubagentStatusCard key={card.id} card={card} />
+        ))}
         <Text
           accessibilityLabel={`${assistant ? assistantName : "You"}: ${
             message.text || (message.status === "streaming" ? "Reply streaming" : "Reply interrupted")
@@ -563,6 +588,22 @@ function MessageBubble({
           </Pressable>
         ) : null}
       </View>
+    </View>
+  );
+}
+
+function SubagentStatusCard({ card }: { card: SubagentCard }) {
+  const status = TASK_STATE_LABEL[card.state];
+  const detail = card.result ? `${status}. ${card.result}` : status;
+  return (
+    <View
+      accessible
+      accessibilityLabel={`Research subagent. ${card.assignment}. ${detail}.`}
+      style={styles.subagentCard}
+    >
+      <Text style={styles.subagentRole}>Research</Text>
+      <Text style={styles.subagentAssignment}>{card.assignment}</Text>
+      <Text style={styles.subagentState}>{detail}</Text>
     </View>
   );
 }
@@ -753,6 +794,27 @@ const styles = StyleSheet.create({
     color: "#C4B5FD",
     fontSize: 15,
     fontWeight: "600",
+  },
+  subagentCard: {
+    gap: 2,
+    marginBottom: 8,
+    paddingBottom: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#3F3F3F",
+  },
+  subagentRole: {
+    color: "#C4B5FD",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  subagentAssignment: {
+    color: "#F5F5F5",
+    fontSize: 15,
+    lineHeight: 20,
+  },
+  subagentState: {
+    color: "#A3A3A3",
+    fontSize: 13,
   },
   composer: {
     flexDirection: "row",

@@ -1,6 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { parseHealthResponse, type ChatStreamEvent } from "@lilith/contracts";
-import { authenticateOwner } from "./auth.ts";
+import { authenticateOwner, type OwnerContext } from "./auth.ts";
+import {
+  createTaskStore,
+  isColorComparePrompt,
+  runColorCompare,
+  type TaskStore,
+} from "./tasks.ts";
 
 export type ApiConfig = {
   token: string;
@@ -30,9 +36,12 @@ export function loadConfig(env: NodeJS.Dict<string | undefined> = process.env): 
   return { token, ownerId, host, port };
 }
 
-export function createHealthServer(auth: Pick<ApiConfig, "token" | "ownerId">): Server {
+export function createHealthServer(
+  auth: Pick<ApiConfig, "token" | "ownerId">,
+  store: TaskStore = createTaskStore(),
+): Server {
   return createServer((req, res) => {
-    handleRequest(req, res, auth);
+    handleRequest(req, res, auth, store);
   });
 }
 
@@ -40,8 +49,10 @@ function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   auth: Pick<ApiConfig, "token" | "ownerId">,
+  store: TaskStore,
 ): void {
-  if (authenticateOwner(req.headers.authorization, auth) === null) {
+  const owner = authenticateOwner(req.headers.authorization, auth);
+  if (owner === null) {
     res.writeHead(401);
     res.end();
     return;
@@ -67,7 +78,7 @@ function handleRequest(
       res.end();
       return;
     }
-    void streamPlaceholderReply(req, res);
+    void streamChatReply(req, res, owner, store);
     return;
   }
 
@@ -75,9 +86,11 @@ function handleRequest(
   res.end();
 }
 
-async function streamPlaceholderReply(
+async function streamChatReply(
   req: IncomingMessage,
   res: ServerResponse,
+  owner: OwnerContext,
+  store: TaskStore,
 ): Promise<void> {
   try {
     req.setEncoding("utf8");
@@ -99,27 +112,49 @@ async function streamPlaceholderReply(
       throw new Error("Invalid message");
     }
 
-    // ponytail: deterministic bridge until the gated provider adapter in Issue #8 is activated.
-    const reply = `No model is connected yet. You said: ${value.message.trim()}`;
-    const chunks = reply.match(/[\s\S]{1,12}/g) ?? [];
-    res.writeHead(200, {
-      "Cache-Control": "no-store",
-      "Content-Type": "application/x-ndjson; charset=utf-8",
-    });
-    let index = 0;
-    const timer = setInterval(() => {
-      const event: ChatStreamEvent = index < chunks.length
-        ? { type: "delta", text: chunks[index++]! }
-        : { type: "done" };
-      res.write(`${JSON.stringify(event)}\n`);
-      if (event.type === "done") {
-        clearInterval(timer);
-        res.end();
-      }
-    }, 40);
-    res.on("close", () => clearInterval(timer));
+    streamNdjson(res, chatEvents(value.message.trim(), owner, store));
   } catch {
     if (!res.headersSent) res.writeHead(400);
     res.end();
   }
+}
+
+function chatEvents(message: string, owner: OwnerContext, store: TaskStore): ChatStreamEvent[] {
+  if (isColorComparePrompt(message)) {
+    const run = runColorCompare(store, owner);
+    return [
+      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+      ...deltaEvents(`A research subagent compared test sources A, B, and C. Shared color: ${run.result}.`),
+      { type: "done" },
+    ];
+  }
+
+  // ponytail: deterministic bridge until the gated provider adapter in Issue #8 is activated.
+  return [...deltaEvents(`No model is connected yet. You said: ${message}`), { type: "done" }];
+}
+
+function deltaEvents(reply: string): ChatStreamEvent[] {
+  return (reply.match(/[\s\S]{1,12}/g) ?? []).map((text) => ({ type: "delta", text }));
+}
+
+function streamNdjson(res: ServerResponse, events: ChatStreamEvent[]): void {
+  res.writeHead(200, {
+    "Cache-Control": "no-store",
+    "Content-Type": "application/x-ndjson; charset=utf-8",
+  });
+  let index = 0;
+  const timer = setInterval(() => {
+    const event = events[index++];
+    if (event === undefined) {
+      clearInterval(timer);
+      res.end();
+      return;
+    }
+    res.write(`${JSON.stringify(event)}\n`);
+    if (event.type === "done") {
+      clearInterval(timer);
+      res.end();
+    }
+  }, 40);
+  res.on("close", () => clearInterval(timer));
 }
