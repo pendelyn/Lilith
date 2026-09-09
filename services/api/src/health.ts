@@ -9,12 +9,15 @@ import {
 import { authenticateOwner, type OwnerContext } from "./auth.ts";
 import {
   createTaskStore,
+  answerTask,
   isColorComparePrompt,
   isHoldPrompt,
+  isQuestionPrompt,
   listResearchCards,
   resumeTask,
   runColorCompare,
   runHeldResearch,
+  runQuestionResearch,
   stopTask,
   subagentCard,
   type TaskStore,
@@ -158,7 +161,7 @@ async function handleTaskAction(
   res: ServerResponse,
   owner: OwnerContext,
   store: TaskStore,
-  action: { id: string; kind: "stop" | "resume" },
+  action: { id: string; kind: "stop" | "resume" | "answer" },
 ): Promise<void> {
   try {
     const body = await readJsonBody(req);
@@ -173,11 +176,21 @@ async function handleTaskAction(
       writeJson(res, parseSubagentCard(subagentCard(stopTask(store, owner, action.id))));
       return;
     }
+    if (action.kind === "answer") {
+      writeJson(res, parseSubagentCard(subagentCard(answerTask(store, owner, action.id, body))));
+      return;
+    }
     writeJson(res, parseSubagentCard(subagentCard(resumeTask(store, owner, action.id, parseResumeRequest(body)))));
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     const status =
-      message === "Task is not paused" ? 409 : message === "Resource access denied" || message === "Task not found" ? 404 : 400;
+      message === "Task is not paused" ||
+      message === "Answer conflict" ||
+      message === "Task is not waiting for input"
+        ? 409
+        : message === "Resource access denied" || message === "Task not found"
+          ? 404
+          : 400;
     if (!res.headersSent) res.writeHead(status);
     res.end();
   }
@@ -198,6 +211,15 @@ function chatEvents(message: string, owner: OwnerContext, store: TaskStore): Cha
     return [
       ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
       ...deltaEvents("A research subagent is working."),
+      { type: "done" },
+    ];
+  }
+
+  if (isQuestionPrompt(message)) {
+    const run = runQuestionResearch(store, owner);
+    return [
+      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+      ...deltaEvents("A research subagent needs a choice."),
       { type: "done" },
     ];
   }
@@ -243,9 +265,11 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(raw);
 }
 
-function taskAction(pathname: string): { id: string; kind: "stop" | "resume" } | undefined {
-  const match = /^\/tasks\/([^/]+)\/(stop|resume)$/.exec(pathname);
-  if (match?.[1] === undefined || (match[2] !== "stop" && match[2] !== "resume")) return undefined;
+function taskAction(pathname: string): { id: string; kind: "stop" | "resume" | "answer" } | undefined {
+  const match = /^\/tasks\/([^/]+)\/(stop|resume|answer)$/.exec(pathname);
+  if (match?.[1] === undefined || (match[2] !== "stop" && match[2] !== "resume" && match[2] !== "answer")) {
+    return undefined;
+  }
   return { id: decodeURIComponent(match[1]), kind: match[2] };
 }
 

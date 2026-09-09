@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseChatStreamEvent,
+  parseQuestionAnswer,
+  parseQuestionCard,
   parseResumeRequest,
   parseSubagentCard,
   parseTaskListResponse,
@@ -14,6 +16,10 @@ import {
   COLOR_COMPARE_PROMPT,
   HOLD_ASSIGNMENT,
   HOLD_PROMPT,
+  QUESTION_ASSIGNMENT,
+  QUESTION_OPTIONS,
+  QUESTION_PROMPT,
+  QUESTION_TEXT,
   RESEARCH_ASSIGNMENT,
   TASK_MAX_COST_CENTS,
   TASK_MAX_RUNTIME_MS,
@@ -410,6 +416,269 @@ test("task store file reload keeps working status after a new server boots", asy
   }
 });
 
+test("question parsers accept 2–4 unique options and reject the rest", () => {
+  const two = {
+    id: "q-1",
+    taskId: "sub-1",
+    prompt: QUESTION_TEXT,
+    options: QUESTION_OPTIONS,
+  };
+  const four = {
+    ...two,
+    options: [
+      { id: "a", label: "A" },
+      { id: "b", label: "B" },
+      { id: "c", label: "C" },
+      { id: "d", label: "D" },
+    ],
+  };
+  assert.deepEqual(parseQuestionCard(two).options.map((option) => option.label), ["Kurz", "Ausführlich"]);
+  assert.equal(parseQuestionCard(four).options.length, 4);
+  assert.throws(() => parseQuestionCard({ ...two, options: [{ id: "short", label: "Kurz" }] }), /Invalid/);
+  assert.throws(
+    () =>
+      parseQuestionCard({
+        ...two,
+        options: [...four.options, { id: "e", label: "E" }],
+      }),
+    /Invalid/,
+  );
+  assert.throws(
+    () => parseQuestionCard({ ...two, options: [{ id: "short", label: "Kurz" }, { id: "short", label: "Dup" }] }),
+    /Invalid/,
+  );
+  assert.throws(() => parseQuestionCard({ ...two, log: "secret" }), /Invalid/);
+  assert.throws(
+    () =>
+      parseQuestionCard({
+        id: "q-1",
+        taskId: "sub-1",
+        prompt: QUESTION_TEXT,
+        options: [
+          { id: "short", label: "Kurz", extra: true },
+          { id: "long", label: "Ausführlich" },
+        ],
+      } as unknown),
+    /Invalid/,
+  );
+  assert.throws(() => parseQuestionAnswer({}), /Invalid/);
+  assert.throws(() => parseQuestionAnswer({ optionId: "short", text: "x" }), /Invalid/);
+  assert.throws(() => parseQuestionAnswer({ extra: true }), /Invalid/);
+  assert.throws(() => parseQuestionAnswer({ text: "   " }), /Invalid/);
+  assert.throws(() => parseQuestionAnswer({ text: "x".repeat(401) }), /Invalid/);
+  assert.deepEqual(parseQuestionAnswer({ optionId: "short" }), { optionId: "short" });
+  assert.deepEqual(parseQuestionAnswer({ text: "  Nur Stichpunkte  " }), { text: "Nur Stichpunkte" });
+  assert.throws(
+    () =>
+      parseChatStreamEvent({
+        type: "question",
+        id: "q-1",
+        taskId: "sub-1",
+        prompt: QUESTION_TEXT,
+        options: QUESTION_OPTIONS,
+      }),
+    /Invalid/,
+  );
+  assert.throws(
+    () =>
+      parseSubagentCard({
+        id: "sub-1",
+        role: "research",
+        assignment: QUESTION_ASSIGNMENT,
+        state: "needs_input",
+        question: two,
+        detailLevel: "short",
+      }),
+    /Invalid/,
+  );
+  assert.deepEqual(
+    parseSubagentCard({
+      id: "sub-1",
+      role: "research",
+      assignment: QUESTION_ASSIGNMENT,
+      state: "needs_input",
+      question: two,
+    }).question?.options.map((option) => option.label),
+    ["Kurz", "Ausführlich"],
+  );
+});
+
+test("question fixture streams one unanswered card and answers stay on that id", async () => {
+  const store = createTaskStore();
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `  ${QUESTION_PROMPT}  `);
+    const subagents = events.flatMap((event) => (event.type === "subagent" ? [event] : []));
+    const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+    const childId = subagents[0]?.id;
+    const questionId = subagents.at(-1)?.question?.id;
+    if (childId === undefined || questionId === undefined) throw new Error("expected a question card");
+
+    assert.equal(new Set(subagents.map((event) => event.id)).size, 1);
+    assert.deepEqual(
+      subagents.map((event) => event.state),
+      ["waiting", "working", "needs_input"],
+    );
+    assert.equal(subagents.at(-1)?.question?.prompt, QUESTION_TEXT);
+    assert.deepEqual(
+      subagents.at(-1)?.question?.options.map((option) => option.label),
+      ["Kurz", "Ausführlich"],
+    );
+    assert.equal("answer" in (subagents.at(-1)?.question ?? {}), false);
+    assert.equal(reply.includes("No model is connected yet"), false);
+    assert.equal(reply.includes("Blau"), false);
+    assert.deepEqual(events.at(-1), { type: "done" });
+
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks[0]?.state, "needs_input");
+    assert.equal(listed.tasks[0]?.question?.id, questionId);
+
+    const retry = await chatEvents(base, QUESTION_PROMPT);
+    const retryCards = retry.flatMap((event) => (event.type === "subagent" ? [event] : []));
+    assert.deepEqual(
+      retryCards.map((event) => ({ id: event.id, questionId: event.question?.id, state: event.state })),
+      [{ id: childId, questionId, state: "needs_input" }],
+    );
+
+    const answered = await fetch(`${base}/tasks/${childId}/answer`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ optionId: "short" }),
+    });
+    assert.equal(answered.status, 200);
+    const card = parseSubagentCard(await answered.json());
+    assert.equal(card.id, childId);
+    assert.equal(card.state, "completed");
+    assert.equal(card.result, "Kurz");
+    assert.deepEqual(card.question?.answer, { optionId: "short" });
+
+    const duplicate = await fetch(`${base}/tasks/${childId}/answer`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ optionId: "short" }),
+    });
+    assert.equal(duplicate.status, 200);
+    assert.deepEqual(parseSubagentCard(await duplicate.json()), card);
+    assert.equal(
+      [...store.tasks.values()].filter((task) => task.parentTaskId !== undefined).length,
+      1,
+    );
+
+    const conflict = await fetch(`${base}/tasks/${childId}/answer`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ optionId: "long" }),
+    });
+    assert.equal(conflict.status, 409);
+    assert.equal(await conflict.text(), "");
+    assert.deepEqual(store.tasks.get(childId)?.question?.answer, { optionId: "short" });
+    assert.equal(store.tasks.get(childId)?.result, "Kurz");
+  }, store);
+});
+
+test("question answer route is owner-scoped and fail-closed", async () => {
+  await withServer(async (base) => {
+    const childId = await questionChildId(base);
+    const missing = await Promise.all([
+      fetch(`${base}/tasks/${childId}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ optionId: "short" }),
+      }),
+      fetch(`${base}/tasks/missing/answer`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify({ optionId: "short" }),
+      }),
+    ]);
+    assert.equal(missing[0]?.status, 401);
+    assert.equal(await missing[0]?.text(), "");
+    assert.equal(missing[1]?.status, 404);
+    assert.equal(await missing[1]?.text(), "");
+
+    for (const body of [
+      JSON.stringify({ text: "" }),
+      JSON.stringify({ optionId: "short", text: "x" }),
+      JSON.stringify({ optionId: "nope" }),
+      JSON.stringify({ extra: true }),
+    ]) {
+      const response = await fetch(`${base}/tasks/${childId}/answer`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body,
+      });
+      assert.equal(response.status, 400);
+      assert.equal(await response.text(), "");
+    }
+
+    const holdId = await holdChildId(base);
+    const holdAnswer = await fetch(`${base}/tasks/${holdId}/answer`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ optionId: "short" }),
+    });
+    assert.equal(holdAnswer.status, 404);
+
+    const stopped = await fetch(`${base}/tasks/${childId}/stop`, { method: "POST", headers: AUTH });
+    assert.equal(stopped.status, 200);
+    const stoppedCard = parseSubagentCard(await stopped.json());
+    const afterStop = await fetch(`${base}/tasks/${childId}/answer`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ optionId: "short" }),
+    });
+    assert.equal(afterStop.status, 409);
+    assert.equal(await afterStop.text(), "");
+    assert.equal("result" in stoppedCard, false);
+  });
+});
+
+test("question cards reload from disk without running work", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-question-http-"));
+  const persistPath = join(dir, "state.json");
+  try {
+    const first = createTaskStore({ persistPath });
+    let childId = "";
+    let questionId = "";
+    await withServer(async (base) => {
+      const events = await chatEvents(base, QUESTION_PROMPT);
+      const card = events.find((event) => event.type === "subagent" && event.state === "needs_input");
+      if (card === undefined || card.type !== "subagent" || card.question === undefined) {
+        throw new Error("expected a question card");
+      }
+      childId = card.id;
+      questionId = card.question.id;
+    }, first);
+
+    const unanswered = createTaskStore({ persistPath });
+    await withServer(async (base) => {
+      const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+      assert.equal(listed.tasks[0]?.id, childId);
+      assert.equal(listed.tasks[0]?.state, "needs_input");
+      assert.equal(listed.tasks[0]?.question?.id, questionId);
+      assert.equal("answer" in (listed.tasks[0]?.question ?? {}), false);
+      const answered = await fetch(`${base}/tasks/${childId}/answer`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "  Nur Stichpunkte  " }),
+      });
+      assert.equal(answered.status, 200);
+      assert.equal(parseSubagentCard(await answered.json()).result, "Nur Stichpunkte");
+    }, unanswered);
+
+    const reloaded = createTaskStore({ persistPath });
+    await withServer(async (base) => {
+      const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+      assert.equal(listed.tasks[0]?.id, childId);
+      assert.equal(listed.tasks[0]?.state, "completed");
+      assert.equal(listed.tasks[0]?.result, "Nur Stichpunkte");
+      assert.deepEqual(listed.tasks[0]?.question?.answer, { text: "Nur Stichpunkte" });
+      assert.equal(listed.tasks[0]?.question?.id, questionId);
+    }, reloaded);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("HTTP persistence failure returns a controlled error and the server stays healthy", async () => {
   const dir = mkdtempSync(join(tmpdir(), "lilith-tasks-http-fail-"));
   const persistPath = join(dir, "state.json");
@@ -452,6 +721,13 @@ async function holdChildId(base: string): Promise<string> {
   const events = await chatEvents(base, HOLD_PROMPT);
   const id = events.find((event) => event.type === "subagent")?.id;
   if (id === undefined) throw new Error("expected a held subagent");
+  return id;
+}
+
+async function questionChildId(base: string): Promise<string> {
+  const events = await chatEvents(base, QUESTION_PROMPT);
+  const id = events.find((event) => event.type === "subagent")?.id;
+  if (id === undefined) throw new Error("expected a question subagent");
   return id;
 }
 

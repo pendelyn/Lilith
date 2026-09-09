@@ -6,11 +6,15 @@ import { test } from "node:test";
 import {
   HOLD_ASSIGNMENT,
   MAX_PARALLEL_SUBAGENTS,
+  QUESTION_ASSIGNMENT,
+  QUESTION_PROMPT,
+  QUESTION_TEXT,
   RESEARCH_ASSIGNMENT,
   TASK_MAX_COST_CENTS,
   TASK_MAX_RUNTIME_MS,
   acceptToolResult,
   applyLimits,
+  answerTask,
   assertApprovalOpen,
   createParentTask,
   createTaskStore,
@@ -19,6 +23,7 @@ import {
   resumeTask,
   runColorCompare,
   runHeldResearch,
+  runQuestionResearch,
   setTaskState,
   sharedColor,
   startSubagent,
@@ -438,6 +443,213 @@ test("held research reuses the owner's live execution for the same assignment", 
   );
 });
 
+test("question fixture writes one answer onto the same task id", () => {
+  const store = createTaskStore();
+  const first = runQuestionResearch(store, owner);
+  const childId = first.cards.at(-1)?.id;
+  const questionId = first.cards.at(-1)?.question?.id;
+  if (childId === undefined || questionId === undefined) throw new Error("expected a question subagent");
+  const parent = parentOf(store, childId);
+
+  assert.deepEqual(
+    first.cards.map((card) => card.state),
+    ["waiting", "working", "needs_input"],
+  );
+  assert.equal(first.cards.at(-1)?.question?.prompt, QUESTION_TEXT);
+  assert.deepEqual(
+    first.cards.at(-1)?.question?.options.map((option) => option.label),
+    ["Kurz", "Ausführlich"],
+  );
+  assert.equal("answer" in (first.cards.at(-1)?.question ?? {}), false);
+
+  const reused = runQuestionResearch(store, owner);
+  assert.deepEqual(
+    reused.cards.map((card) => ({ id: card.id, questionId: card.question?.id, state: card.state })),
+    [{ id: childId, questionId, state: "needs_input" }],
+  );
+
+  const answered = answerTask(store, owner, childId, { optionId: "short" });
+  assert.equal(answered.id, childId);
+  assert.equal(answered.state, "completed");
+  assert.equal(answered.result, "Kurz");
+  assert.deepEqual(answered.question?.answer, { optionId: "short" });
+  assert.equal(store.tasks.get(parent.id)?.state, "completed");
+  assert.equal(store.tasks.get(parent.id)?.result, "Kurz");
+
+  const snapshot = JSON.stringify(store.tasks.get(childId));
+  const duplicate = answerTask(store, owner, childId, { optionId: "short" });
+  assert.equal(duplicate.state, "completed");
+  assert.equal(JSON.stringify(store.tasks.get(childId)), snapshot);
+  assert.throws(() => answerTask(store, owner, childId, { optionId: "long" }), /Answer conflict/);
+  assert.throws(() => answerTask(store, owner, childId, { text: "Kurz" }), /Answer conflict/);
+  assert.deepEqual(store.tasks.get(childId)?.question?.answer, { optionId: "short" });
+
+  const textStore = createTaskStore();
+  const textId = questionChildId(textStore);
+  const textAnswer = answerTask(textStore, owner, textId, { text: "  Nur Stichpunkte  " });
+  assert.equal(textAnswer.id, textId);
+  assert.equal(textAnswer.state, "completed");
+  assert.equal(textAnswer.result, "Nur Stichpunkte");
+  assert.deepEqual(textAnswer.question?.answer, { text: "Nur Stichpunkte" });
+});
+
+test("question reuse poses on a live same-assignment task that has no question", () => {
+  const waitingStore = createTaskStore();
+  const waitingParent = createParentTask(waitingStore, owner, QUESTION_PROMPT);
+  const waiting = startSubagent(waitingStore, owner, {
+    parentTaskId: waitingParent.id,
+    assignment: QUESTION_ASSIGNMENT,
+    role: "research",
+  });
+  const waitingRetry = runQuestionResearch(waitingStore, owner);
+  assert.equal(waitingRetry.cards.at(-1)?.id, waiting.id);
+  assert.equal(waitingRetry.cards.at(-1)?.state, "needs_input");
+  assert.deepEqual(
+    waitingRetry.cards.at(-1)?.question?.options.map((option) => option.label),
+    ["Kurz", "Ausführlich"],
+  );
+  assert.equal(
+    [...waitingStore.tasks.values()].filter((task) => task.parentTaskId !== undefined).length,
+    1,
+  );
+
+  const dir = mkdtempSync(join(tmpdir(), "lilith-question-heal-"));
+  const persistPath = join(dir, "state.json");
+  try {
+    const first = createTaskStore({ persistPath });
+    const parent = createParentTask(first, owner, QUESTION_PROMPT);
+    const child = startSubagent(first, owner, {
+      parentTaskId: parent.id,
+      assignment: QUESTION_ASSIGNMENT,
+      role: "research",
+    });
+    setTaskState(first, owner, child.id, "working");
+    assert.equal(first.tasks.get(child.id)?.state, "working");
+    assert.equal("question" in (first.tasks.get(child.id) ?? {}), false);
+
+    const reloaded = createTaskStore({ persistPath });
+    assert.equal(reloaded.tasks.get(child.id)?.state, "working");
+    assert.equal("question" in (reloaded.tasks.get(child.id) ?? {}), false);
+    const disk = readFileSync(persistPath);
+
+    (reloaded as { persistPath?: string }).persistPath = join(persistPath, "blocked.json");
+    assert.throws(() => runQuestionResearch(reloaded, owner));
+    assert.equal(reloaded.tasks.get(child.id)?.state, "working");
+    assert.equal("question" in (reloaded.tasks.get(child.id) ?? {}), false);
+    assert.deepEqual(readFileSync(persistPath), disk);
+
+    (reloaded as { persistPath?: string }).persistPath = persistPath;
+    const retry = runQuestionResearch(reloaded, owner);
+    const posed = retry.cards.at(-1);
+    const questionId = posed?.question?.id;
+    if (posed === undefined || questionId === undefined) throw new Error("expected a question subagent");
+    assert.equal(retry.cards.length, 1);
+    assert.equal(posed.id, child.id);
+    assert.equal(posed.state, "needs_input");
+    assert.equal(posed.question?.prompt, QUESTION_TEXT);
+    assert.deepEqual(
+      posed.question?.options.map((option) => option.label),
+      ["Kurz", "Ausführlich"],
+    );
+    assert.equal("answer" in (posed.question ?? {}), false);
+    assert.equal(reloaded.tasks.get(child.id)?.parentTaskId, parent.id);
+    assert.equal(
+      [...reloaded.tasks.values()].filter((task) => task.parentTaskId !== undefined).length,
+      1,
+    );
+    assert.equal(
+      [...reloaded.tasks.values()].filter((task) => task.parentTaskId === undefined).length,
+      1,
+    );
+
+    const reused = runQuestionResearch(reloaded, owner);
+    assert.deepEqual(
+      reused.cards.map((card) => ({ id: card.id, questionId: card.question?.id, state: card.state })),
+      [{ id: child.id, questionId, state: "needs_input" }],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("question stop, pause, and foreign owners stay closed", () => {
+  const stoppedStore = createTaskStore();
+  const stoppedId = questionChildId(stoppedStore);
+  const questionId = stoppedStore.tasks.get(stoppedId)?.question?.id;
+  stopTask(stoppedStore, owner, stoppedId);
+  assert.equal(stoppedStore.tasks.get(stoppedId)?.state, "stopped");
+  assert.equal("result" in (stoppedStore.tasks.get(stoppedId) ?? {}), false);
+  assert.equal(stoppedStore.tasks.get(stoppedId)?.question?.id, questionId);
+  assert.throws(() => answerTask(stoppedStore, owner, stoppedId, { optionId: "short" }), /not waiting/);
+  assert.throws(() => startTool(stoppedStore, owner, stoppedId), /cannot start tools/);
+  assert.throws(() => acceptToolResult(stoppedStore, owner, stoppedId, "Kurz"), /cannot accept results/);
+  const afterStop = runQuestionResearch(stoppedStore, owner);
+  assert.notEqual(afterStop.cards.at(-1)?.id, stoppedId);
+
+  let now = 0;
+  const pausedStore = createTaskStore({ now: () => now });
+  const pausedId = questionChildId(pausedStore);
+  now = TASK_MAX_RUNTIME_MS;
+  assert.equal(applyLimits(pausedStore, owner, pausedId).state, "paused");
+  assert.throws(() => answerTask(pausedStore, owner, pausedId, { optionId: "short" }), /not waiting/);
+  const resumed = resumeTask(pausedStore, owner, pausedId, { consent: true });
+  assert.equal(resumed.state, "needs_input");
+  assert.equal(pausedStore.tasks.get(pausedId)?.question?.answer, undefined);
+  const afterResume = answerTask(pausedStore, owner, pausedId, { optionId: "short" });
+  assert.equal(afterResume.id, pausedId);
+  assert.equal(afterResume.state, "completed");
+  assert.equal(afterResume.result, "Kurz");
+
+  const foreignStore = createTaskStore();
+  const foreignId = questionChildId(foreignStore);
+  assert.throws(
+    () => answerTask(foreignStore, { ownerId: "foreign-owner" }, foreignId, { optionId: "short" }),
+    /access denied/,
+  );
+  assert.equal(foreignStore.tasks.get(foreignId)?.state, "needs_input");
+  assert.throws(() => answerTask(foreignStore, owner, foreignId, { optionId: "nope" }), /Invalid QuestionAnswer/);
+  assert.throws(
+    () => answerTask(foreignStore, owner, foreignId, { optionId: "short", text: "x" }),
+    /Invalid QuestionAnswer/,
+  );
+});
+
+test("question persist reloads unanswered and answered without running work", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-question-"));
+  const persistPath = join(dir, "state.json");
+  try {
+    const first = createTaskStore({ persistPath });
+    const childId = questionChildId(first);
+    const questionId = first.tasks.get(childId)?.question?.id;
+    const parentId = first.tasks.get(childId)?.parentTaskId;
+    assert.equal(first.tasks.get(childId)?.state, "needs_input");
+
+    const unanswered = createTaskStore({ persistPath });
+    assert.equal(unanswered.tasks.get(childId)?.state, "needs_input");
+    assert.equal(unanswered.tasks.get(childId)?.question?.id, questionId);
+    assert.equal("answer" in (unanswered.tasks.get(childId)?.question ?? {}), false);
+    assert.equal(
+      [...unanswered.tasks.values()].some((task) => task.state === "working" && task.id === childId),
+      false,
+    );
+
+    const answered = answerTask(unanswered, owner, childId, { optionId: "short" });
+    assert.equal(answered.state, "completed");
+
+    const reloaded = createTaskStore({ persistPath });
+    assert.equal(reloaded.tasks.get(childId)?.state, "completed");
+    assert.equal(reloaded.tasks.get(childId)?.result, "Kurz");
+    assert.deepEqual(reloaded.tasks.get(childId)?.question?.answer, { optionId: "short" });
+    assert.equal(reloaded.tasks.get(parentId ?? "")?.state, "completed");
+    assert.equal(
+      [...reloaded.tasks.values()].some((task) => task.state === "working"),
+      false,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("persistence failure preserves disk and in-memory state", () => {
   const dir = mkdtempSync(join(tmpdir(), "lilith-tasks-fail-"));
   const persistPath = join(dir, "state.json");
@@ -466,6 +678,12 @@ test("persistence failure preserves disk and in-memory state", () => {
 function heldChildId(store: TaskStore): string {
   const childId = runHeldResearch(store, owner).cards.at(-1)?.id;
   if (childId === undefined) throw new Error("expected a working subagent");
+  return childId;
+}
+
+function questionChildId(store: TaskStore): string {
+  const childId = runQuestionResearch(store, owner).cards.at(-1)?.id;
+  if (childId === undefined) throw new Error("expected a question subagent");
   return childId;
 }
 

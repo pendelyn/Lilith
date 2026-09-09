@@ -33,6 +33,23 @@ export type SubagentRole = (typeof SUBAGENT_ROLES)[number];
 export const PAUSE_REASONS = ["time", "cost"] as const;
 export type PauseReason = (typeof PAUSE_REASONS)[number];
 
+export const MAX_QUESTION_CHARS = 400;
+
+export type QuestionOption = {
+  id: string;
+  label: string;
+};
+
+export type QuestionAnswer = { optionId: string } | { text: string };
+
+export type QuestionCard = {
+  id: string;
+  taskId: string;
+  prompt: string;
+  options: QuestionOption[];
+  answer?: QuestionAnswer;
+};
+
 export type SubagentCard = {
   id: string;
   role: SubagentRole;
@@ -40,6 +57,7 @@ export type SubagentCard = {
   state: TaskState;
   result?: string;
   pauseReason?: PauseReason;
+  question?: QuestionCard;
 };
 
 export type ChatStreamEvent =
@@ -95,6 +113,86 @@ export function parseTaskState(value: unknown): TaskState {
   throw new Error("Invalid TaskState");
 }
 
+function boundedQuestionChars(value: unknown): string | undefined {
+  if (typeof value !== "string" || value === "" || [...value].length > MAX_QUESTION_CHARS) {
+    return undefined;
+  }
+  return value;
+}
+
+export function parseQuestionOption(value: unknown): QuestionOption {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid QuestionOption");
+  }
+  if (
+    Object.keys(value).length !== 2 ||
+    !("id" in value) ||
+    !("label" in value)
+  ) {
+    throw new Error("Invalid QuestionOption");
+  }
+  const id = boundedQuestionChars(value.id);
+  const label = boundedQuestionChars(value.label);
+  if (id === undefined || label === undefined) throw new Error("Invalid QuestionOption");
+  return { id, label };
+}
+
+export function parseQuestionAnswer(value: unknown): QuestionAnswer {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid QuestionAnswer");
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 1) throw new Error("Invalid QuestionAnswer");
+  if ("optionId" in value) {
+    const optionId = boundedQuestionChars(value.optionId);
+    if (optionId === undefined) throw new Error("Invalid QuestionAnswer");
+    return { optionId };
+  }
+  if ("text" in value) {
+    if (typeof value.text !== "string") throw new Error("Invalid QuestionAnswer");
+    const text = value.text.trim();
+    if (text === "" || [...text].length > MAX_QUESTION_CHARS) {
+      throw new Error("Invalid QuestionAnswer");
+    }
+    return { text };
+  }
+  throw new Error("Invalid QuestionAnswer");
+}
+
+export function parseQuestionCard(value: unknown): QuestionCard {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid QuestionCard");
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "id" && key !== "taskId" && key !== "prompt" && key !== "options" && key !== "answer") {
+      throw new Error("Invalid QuestionCard");
+    }
+  }
+  const id = "id" in value ? boundedQuestionChars(value.id) : undefined;
+  const taskId = "taskId" in value ? boundedQuestionChars(value.taskId) : undefined;
+  const prompt = "prompt" in value ? boundedQuestionChars(value.prompt) : undefined;
+  if (id === undefined || taskId === undefined || prompt === undefined) {
+    throw new Error("Invalid QuestionCard");
+  }
+  if (!("options" in value) || !Array.isArray(value.options) || value.options.length < 2 || value.options.length > 4) {
+    throw new Error("Invalid QuestionCard");
+  }
+  const options = value.options.map((entry) => parseQuestionOption(entry));
+  const optionIds = options.map((option) => option.id);
+  if (new Set(optionIds).size !== optionIds.length) throw new Error("Invalid QuestionCard");
+  const answer = "answer" in value ? parseQuestionAnswer(value.answer) : undefined;
+  if (answer !== undefined && "optionId" in answer && !optionIds.includes(answer.optionId)) {
+    throw new Error("Invalid QuestionCard");
+  }
+  return {
+    id,
+    taskId,
+    prompt,
+    options,
+    ...(answer === undefined ? {} : { answer }),
+  };
+}
+
 export function parseSubagentCard(value: unknown): SubagentCard {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("Invalid SubagentCard");
@@ -119,7 +217,8 @@ export function parseSubagentCard(value: unknown): SubagentCard {
       key !== "assignment" &&
       key !== "state" &&
       key !== "result" &&
-      key !== "pauseReason"
+      key !== "pauseReason" &&
+      key !== "question"
     ) {
       throw new Error("Invalid SubagentCard");
     }
@@ -132,6 +231,20 @@ export function parseSubagentCard(value: unknown): SubagentCard {
     throw new Error("Invalid SubagentCard");
   }
   const pauseReason = parsePauseReason(value, state);
+  const question = "question" in value ? parseQuestionCard(value.question) : undefined;
+  if (question !== undefined && question.taskId !== value.id) {
+    throw new Error("Invalid SubagentCard");
+  }
+  if (state === "needs_input" && (question === undefined || question.answer !== undefined)) {
+    throw new Error("Invalid SubagentCard");
+  }
+  if (state === "completed" && question !== undefined && question.answer === undefined) {
+    throw new Error("Invalid SubagentCard");
+  }
+  const extra = {
+    ...(pauseReason === undefined ? {} : { pauseReason }),
+    ...(question === undefined ? {} : { question }),
+  };
   if ("result" in value) {
     if (typeof value.result !== "string" || value.result === "") {
       throw new Error("Invalid SubagentCard");
@@ -142,7 +255,7 @@ export function parseSubagentCard(value: unknown): SubagentCard {
       assignment: value.assignment,
       state,
       result: value.result,
-      ...(pauseReason === undefined ? {} : { pauseReason }),
+      ...extra,
     };
   }
   return {
@@ -150,7 +263,7 @@ export function parseSubagentCard(value: unknown): SubagentCard {
     role: "research",
     assignment: value.assignment,
     state,
-    ...(pauseReason === undefined ? {} : { pauseReason }),
+    ...extra,
   };
 }
 
