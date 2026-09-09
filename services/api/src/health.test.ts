@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { parseChatStreamEvent } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer, loadConfig } from "./health.ts";
 
@@ -15,6 +16,46 @@ test("valid token returns exact HealthResponse JSON", async () => {
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
     assert.equal(await response.text(), '{"status":"ok"}');
+  });
+});
+
+test("chat replies stream as validated NDJSON without raw logs", async () => {
+  await withServer(async (base) => {
+    const response = await fetch(`${base}/chat`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer secret-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: "Hello\n🌙" }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/x-ndjson; charset=utf-8");
+    const events = (await response.text()).trim().split("\n").map((line) =>
+      parseChatStreamEvent(JSON.parse(line))
+    );
+    const deltas = events.filter((event) => event.type === "delta");
+    assert.ok(deltas.length > 1);
+    assert.equal(
+      deltas.map((event) => event.text).join(""),
+      "No model is connected yet. You said: Hello\n🌙",
+    );
+    assert.deepEqual(events.at(-1), { type: "done" });
+  });
+});
+
+test("invalid chat messages fail without echoing input", async () => {
+  await withServer(async (base) => {
+    const response = await fetch(`${base}/chat`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer secret-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: "" }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal(await response.text(), "");
   });
 });
 

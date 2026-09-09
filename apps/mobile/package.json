@@ -6,7 +6,7 @@
   "scripts": {
     "start": "expo start --lan",
     "typecheck": "tsc --noEmit",
-    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test identity.test.ts"
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test *.test.ts"
   },
   "dependencies": {
     "@lilith/contracts": "*",
