@@ -88,6 +88,15 @@ export function upsertSubagent(
   });
 }
 
+export function setTaskReply(messages: ChatMessage[], taskId: string, text: string): ChatMessage[] {
+  if (text === "") return messages;
+  return messages.map((message) =>
+    message.subagents?.some((card) => card.id === taskId)
+      ? { ...message, text: text.slice(0, MAX_MESSAGE_LENGTH * 4), status: "complete" }
+      : message,
+  );
+}
+
 const HYDRATE_STATES = new Set<TaskState>(["waiting", "working", "needs_input", "paused"]);
 
 export function applyServerCards(messages: ChatMessage[], cards: SubagentCard[]): ChatMessage[] {

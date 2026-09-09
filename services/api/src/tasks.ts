@@ -1,6 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { parseTaskState, type PauseReason, type SubagentCard, type TaskState } from "@lilith/contracts";
+import {
+  parseQuestionAnswer,
+  parseQuestionCard,
+  parseTaskState,
+  type PauseReason,
+  type QuestionAnswer,
+  type QuestionCard,
+  type QuestionOption,
+  type SubagentCard,
+  type TaskState,
+} from "@lilith/contracts";
 import { requireOwned, type OwnerContext } from "./auth.ts";
 
 export const MAX_PARALLEL_SUBAGENTS = 3;
@@ -13,6 +23,13 @@ export const RESEARCH_ASSIGNMENT =
 export const HOLD_PROMPT =
   "Halte den Recherche-Unteragenten, bis ich stoppe oder fortsetze";
 export const HOLD_ASSIGNMENT = "Hold research until the user stops or resumes.";
+export const QUESTION_PROMPT = "Frage mich, ob du kurz oder ausführlich antworten sollst";
+export const QUESTION_ASSIGNMENT = "Ask whether the reply should be short or detailed.";
+export const QUESTION_TEXT = "Soll das Ergebnis kurz oder ausführlich sein?";
+export const QUESTION_OPTIONS: QuestionOption[] = [
+  { id: "short", label: "Kurz" },
+  { id: "long", label: "Ausführlich" },
+];
 export const TEST_SOURCES = {
   A: ["Rot", "Blau"],
   B: ["Blau", "Grün"],
@@ -33,6 +50,7 @@ export type Task = {
   startedAt?: number;
   costCents: number;
   pauseReason?: PauseReason;
+  question?: QuestionCard;
 };
 
 export type TaskStore = {
@@ -65,6 +83,10 @@ export function isColorComparePrompt(message: string): boolean {
 
 export function isHoldPrompt(message: string): boolean {
   return message.trim() === HOLD_PROMPT;
+}
+
+export function isQuestionPrompt(message: string): boolean {
+  return message.trim() === QUESTION_PROMPT;
 }
 
 export function sharedColor(
@@ -177,7 +199,13 @@ export function resumeTask(
     const now = store.now();
     for (const member of executionSet(store, current)) {
       if (member.state !== "paused") continue;
-      const next: Task = { ...member, state: "working" };
+      const next: Task = {
+        ...member,
+        state:
+          member.question !== undefined && member.question.answer === undefined
+            ? "needs_input"
+            : "working",
+      };
       delete next.pauseReason;
       delete next.result;
       store.tasks.set(member.id, next);
@@ -294,6 +322,7 @@ export function subagentCard(task: Task): SubagentCard {
     ...(task.state === "paused" && task.pauseReason !== undefined
       ? { pauseReason: task.pauseReason }
       : {}),
+    ...(task.question === undefined ? {} : { question: task.question }),
   };
 }
 
@@ -334,12 +363,86 @@ export function runHeldResearch(
   };
 }
 
+export function runQuestionResearch(
+  store: TaskStore,
+  owner: OwnerContext,
+): { cards: SubagentCard[] } {
+  const existing = liveAssignedResearch(store, owner, QUESTION_ASSIGNMENT);
+  if (existing !== undefined) {
+    const live = applyLimits(store, owner, existing.id);
+    if (live.question === undefined && RUNNABLE_STATES.has(live.state)) {
+      return { cards: [subagentCard(poseQuestion(store, owner, live.id))] };
+    }
+    return { cards: [subagentCard(live)] };
+  }
+  const parent = createParentTask(store, owner, QUESTION_PROMPT);
+  const started = startSubagent(store, owner, {
+    parentTaskId: parent.id,
+    assignment: QUESTION_ASSIGNMENT,
+    role: "research",
+  });
+  const working = setTaskState(store, owner, started.id, "working");
+  return {
+    cards: [subagentCard(started), subagentCard(working), subagentCard(poseQuestion(store, owner, started.id))],
+  };
+}
+
+export function answerTask(
+  store: TaskStore,
+  owner: OwnerContext,
+  taskId: string,
+  input: unknown,
+): Task {
+  applyLimits(store, owner, taskId);
+  const current = ownedTask(store, owner, taskId);
+  if (current.role !== "research" || current.question === undefined) {
+    throw new Error("Task not found");
+  }
+  const answer = parseQuestionAnswer(input);
+  if ("optionId" in answer && current.question.options.every((option) => option.id !== answer.optionId)) {
+    throw new Error("Invalid QuestionAnswer");
+  }
+  if (current.question.answer !== undefined) {
+    if (answersEqual(current.question.answer, answer)) return current;
+    throw new Error("Answer conflict");
+  }
+  if (current.state !== "needs_input") {
+    throw new Error("Task is not waiting for input");
+  }
+  const result = questionResult(current.question, answer);
+  const question: QuestionCard = { ...current.question, answer };
+  const parentId = current.parentTaskId;
+  return transact(store, () => {
+    const completed = commitTask(store, {
+      ...ownedTask(store, owner, taskId),
+      state: "completed",
+      question,
+      result,
+    });
+    if (parentId !== undefined) {
+      const parent = ownedTask(store, owner, parentId);
+      if (RUNNABLE_STATES.has(parent.state)) {
+        commitTask(store, { ...parent, state: "completed", result });
+      }
+    }
+    return completed;
+  });
+}
+
 function liveHeldResearch(store: TaskStore, owner: OwnerContext): Task | undefined {
+  return liveAssignedResearch(store, owner, HOLD_ASSIGNMENT);
+}
+
+function liveAssignedResearch(
+  store: TaskStore,
+  owner: OwnerContext,
+  assignment: string,
+): Task | undefined {
   for (const task of store.tasks.values()) {
     if (
       task.ownerId === owner.ownerId &&
       task.role === "research" &&
-      task.assignment === HOLD_ASSIGNMENT &&
+      task.assignment === assignment &&
       task.parentTaskId !== undefined &&
       task.state !== "stopped" &&
       !TERMINAL_STATES.has(task.state)
@@ -348,6 +451,33 @@ function liveHeldResearch(store: TaskStore, owner: OwnerContext): Task | undefin
     }
   }
   return undefined;
+}
+
+function poseQuestion(store: TaskStore, owner: OwnerContext, taskId: string): Task {
+  applyLimits(store, owner, taskId);
+  const current = ownedTask(store, owner, taskId);
+  if (!RUNNABLE_STATES.has(current.state)) throw new Error("Task cannot change state");
+  const question: QuestionCard = {
+    id: randomUUID(),
+    taskId: current.id,
+    prompt: QUESTION_TEXT,
+    options: QUESTION_OPTIONS,
+  };
+  return transact(store, () =>
+    commitTask(store, { ...ownedTask(store, owner, taskId), state: "needs_input", question }),
+  );
+}
+
+function answersEqual(left: QuestionAnswer, right: QuestionAnswer): boolean {
+  if ("optionId" in left) return "optionId" in right && left.optionId === right.optionId;
+  return "text" in right && left.text === right.text;
+}
+
+function questionResult(question: QuestionCard, answer: QuestionAnswer): string {
+  if ("text" in answer) return answer.text;
+  const option = question.options.find((entry) => entry.id === answer.optionId);
+  if (option === undefined) throw new Error("Invalid QuestionAnswer");
+  return option.label;
 }
 
 function ownedTask(store: TaskStore, owner: OwnerContext, taskId: string): Task {
@@ -535,7 +665,8 @@ function parsePersistedTask(value: unknown): Task {
       key !== "result" &&
       key !== "startedAt" &&
       key !== "costCents" &&
-      key !== "pauseReason"
+      key !== "pauseReason" &&
+      key !== "question"
     ) {
       throw new Error("Invalid task store");
     }
@@ -583,6 +714,19 @@ function parsePersistedTask(value: unknown): Task {
   if ("pauseReason" in value && (pauseReason === undefined || state !== "paused")) {
     throw new Error("Invalid task store");
   }
+  let question: QuestionCard | undefined;
+  if ("question" in value) {
+    try {
+      question = parseQuestionCard(value.question);
+    } catch {
+      throw new Error("Invalid task store");
+    }
+    if (question.taskId !== value.id) throw new Error("Invalid task store");
+    if (state === "needs_input" && question.answer !== undefined) throw new Error("Invalid task store");
+    if (state === "completed" && question.answer === undefined) throw new Error("Invalid task store");
+  } else if (state === "needs_input") {
+    throw new Error("Invalid task store");
+  }
   return {
     id: value.id,
     ownerId: value.ownerId,
@@ -594,5 +738,6 @@ function parsePersistedTask(value: unknown): Task {
     ...(result === undefined ? {} : { result }),
     ...(startedAt === undefined ? {} : { startedAt }),
     ...(pauseReason === undefined ? {} : { pauseReason }),
+    ...(question === undefined ? {} : { question }),
   };
 }

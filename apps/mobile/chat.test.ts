@@ -8,6 +8,7 @@ import {
   parsePersistedChat,
   retryReply,
   serializeChat,
+  setTaskReply,
   upsertSubagent,
 } from "./chat.ts";
 
@@ -229,4 +230,90 @@ test("paused time reason round-trips and non-paused reasons fail closed", () => 
     ),
     [],
   );
+});
+
+test("question cards persist, hydrate, retry, and update the same row", () => {
+  const question = {
+    id: "q-1",
+    taskId: "sub-q",
+    prompt: "Soll das Ergebnis kurz oder ausführlich sein?",
+    options: [
+      { id: "short", label: "Kurz" },
+      { id: "long", label: "Ausführlich" },
+    ],
+  };
+  const unanswered = {
+    id: "sub-q",
+    role: "research" as const,
+    assignment: "Ask whether the reply should be short or detailed.",
+    state: "needs_input" as const,
+    question,
+  };
+  let messages = beginReply(
+    [],
+    "user-1",
+    "assistant-1",
+    "Frage mich, ob du kurz oder ausführlich antworten sollst",
+  );
+  messages = upsertSubagent(messages, "user-1", unanswered);
+  const restored = parsePersistedChat(serializeChat(messages));
+  assert.deepEqual(restored[1]?.subagents, [unanswered]);
+  assert.deepEqual(
+    parsePersistedChat(
+      JSON.stringify([
+        {
+          id: "assistant-1",
+          role: "assistant",
+          text: "x",
+          status: "complete",
+          replyTo: "user-1",
+          subagents: [{ ...unanswered, question: { ...question, extra: true } }],
+        },
+      ]),
+    ),
+    [],
+  );
+
+  messages = finishReply(messages, "user-1", "failed");
+  messages = retryReply(messages, "user-1");
+  assert.equal(messages.filter((message) => message.role === "user").length, 1);
+  assert.equal("subagents" in (messages.at(-1) ?? {}), false);
+
+  messages = upsertSubagent(messages, "user-1", unanswered);
+  messages = finishReply(messages, "user-1", "complete");
+  assert.deepEqual(messages.at(-1)?.subagents, [unanswered]);
+  assert.equal(messages.at(-1)?.id, "assistant-1");
+
+  const hydrated = applyServerCards(
+    [
+      { id: "user-1", role: "user", text: "q", status: "sent" },
+      {
+        id: "assistant-1",
+        role: "assistant",
+        text: "partial",
+        status: "failed",
+        replyTo: "user-1",
+        subagents: [unanswered],
+      },
+    ],
+    [unanswered],
+  );
+  assert.equal(hydrated[1]?.status, "failed");
+  assert.deepEqual(hydrated[1]?.subagents, [unanswered]);
+  const orphan = applyServerCards([], [unanswered]);
+  assert.equal(orphan[0]?.subagents?.[0]?.question?.id, "q-1");
+
+  const answered = {
+    ...unanswered,
+    state: "completed" as const,
+    result: "Kurz",
+    question: { ...question, answer: { optionId: "short" as const } },
+  };
+  const updated = setTaskReply(applyServerCards(hydrated, [answered]), "sub-q", "Kurz");
+  assert.equal(updated.length, hydrated.length);
+  assert.equal(updated.filter((message) => message.role === "user").length, 1);
+  assert.equal(updated[1]?.id, "assistant-1");
+  assert.equal(updated[1]?.text, "Kurz");
+  assert.equal(updated[1]?.status, "complete");
+  assert.deepEqual(updated[1]?.subagents, [answered]);
 });

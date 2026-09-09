@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { parseChatStreamEvent, parseHealthResponse, parseSubagentCard, parseTaskListResponse, type TaskState } from "@lilith/contracts";
+import { MAX_QUESTION_CHARS, parseChatStreamEvent, parseHealthResponse, parseSubagentCard, parseTaskListResponse, type QuestionAnswer, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -40,6 +40,7 @@ import {
   parsePersistedChat,
   retryReply,
   serializeChat,
+  setTaskReply,
   upsertSubagent,
   type ChatMessage,
   type SubagentCard,
@@ -218,6 +219,7 @@ function Home({
   const [hydrateError, setHydrateError] = useState(false);
   const [controlError, setControlError] = useState(false);
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
+  const pendingTaskLock = useRef<string | null>(null);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const saveRevision = useRef(0);
   const request = useRef<XMLHttpRequest | null>(null);
@@ -382,6 +384,7 @@ function Home({
                 state: event.state,
                 ...(event.result === undefined ? {} : { result: event.result }),
                 ...(event.pauseReason === undefined ? {} : { pauseReason: event.pauseReason }),
+                ...(event.question === undefined ? {} : { question: event.question }),
               }),
             );
           } else {
@@ -435,7 +438,8 @@ function Home({
   }
 
   async function controlTask(taskId: string, action: "stop" | "resume") {
-    if (pendingTaskId !== null || state !== "success") return;
+    if (pendingTaskLock.current !== null || state !== "success") return;
+    pendingTaskLock.current = taskId;
     setPendingTaskId(taskId);
     setControlError(false);
     const controller = new AbortController();
@@ -454,10 +458,47 @@ function Home({
       const card = parseSubagentCard(await response.json());
       setMessages((current) => applyServerCards(current, [card]));
     } catch {
-      setControlError(true);
+      if (pendingTaskLock.current === taskId) setControlError(true);
     } finally {
       clearTimeout(timer);
-      setPendingTaskId(null);
+      if (pendingTaskLock.current === taskId) {
+        pendingTaskLock.current = null;
+        setPendingTaskId(null);
+      }
+    }
+  }
+
+  async function answerQuestion(taskId: string, answer: QuestionAnswer) {
+    if (pendingTaskLock.current !== null || state !== "success") return;
+    pendingTaskLock.current = taskId;
+    setPendingTaskId(taskId);
+    setControlError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/tasks/${encodeURIComponent(taskId)}/answer`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token.trim()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(answer),
+        signal: controller.signal,
+      });
+      if (response.status !== 200) throw new Error("control");
+      const card = parseSubagentCard(await response.json());
+      setMessages((current) => {
+        const next = applyServerCards(current, [card]);
+        return card.result === undefined ? next : setTaskReply(next, card.id, card.result);
+      });
+    } catch {
+      if (pendingTaskLock.current === taskId) setControlError(true);
+    } finally {
+      clearTimeout(timer);
+      if (pendingTaskLock.current === taskId) {
+        pendingTaskLock.current = null;
+        setPendingTaskId(null);
+      }
     }
   }
 
@@ -561,6 +602,7 @@ function Home({
             onRetry={retry}
             onStop={(taskId) => void controlTask(taskId, "stop")}
             onResume={(taskId) => void controlTask(taskId, "resume")}
+            onAnswer={(taskId, answer) => void answerQuestion(taskId, answer)}
           />
         )}
         contentContainerStyle={messages.length === 0 ? styles.emptyChat : styles.messageList}
@@ -573,6 +615,7 @@ function Home({
         }
         keyboardDismissMode="interactive"
         keyboardShouldPersistTaps="handled"
+        automaticallyAdjustKeyboardInsets
         onScroll={({ nativeEvent }) => {
           const distanceFromEnd =
             nativeEvent.contentSize.height -
@@ -629,6 +672,7 @@ function MessageBubble({
   onRetry,
   onStop,
   onResume,
+  onAnswer,
 }: {
   message: ChatMessage;
   assistantName: string;
@@ -638,6 +682,7 @@ function MessageBubble({
   onRetry: (userId: string) => void;
   onStop: (taskId: string) => void;
   onResume: (taskId: string) => void;
+  onAnswer: (taskId: string, answer: QuestionAnswer) => void;
 }) {
   const assistant = message.role === "assistant";
   const spoken =
@@ -657,6 +702,7 @@ function MessageBubble({
             pending={pendingTaskId === card.id}
             onStop={onStop}
             onResume={onResume}
+            onAnswer={onAnswer}
           />
         ))}
         {visible !== "" ? (
@@ -687,13 +733,20 @@ function SubagentStatusCard({
   pending,
   onStop,
   onResume,
+  onAnswer,
 }: {
   card: SubagentCard;
   disabled: boolean;
   pending: boolean;
   onStop: (taskId: string) => void;
   onResume: (taskId: string) => void;
+  onAnswer: (taskId: string, answer: QuestionAnswer) => void;
 }) {
+  const question = card.question;
+  const lockedText = question?.answer !== undefined && "text" in question.answer ? question.answer.text : "";
+  const [draft, setDraft] = useState(lockedText);
+  const answerLocked = question?.answer !== undefined;
+  const answerDisabled = disabled || pending || card.state !== "needs_input" || answerLocked;
   const canStop =
     card.state === "waiting" ||
     card.state === "working" ||
@@ -712,6 +765,65 @@ function SubagentStatusCard({
       <Text style={styles.subagentRole}>Research</Text>
       <Text style={styles.subagentAssignment}>{card.assignment}</Text>
       <Text style={styles.subagentState}>{detail}</Text>
+      {question ? (
+        <>
+          <Text style={styles.questionPrompt}>{question.prompt}</Text>
+          {question.options.map((option) => {
+            const selected =
+              question.answer !== undefined &&
+              "optionId" in question.answer &&
+              question.answer.optionId === option.id;
+            return (
+              <Pressable
+                key={option.id}
+                onPress={() => onAnswer(card.id, { optionId: option.id })}
+                disabled={answerDisabled}
+                accessibilityRole="button"
+                accessibilityLabel={option.label}
+                accessibilityState={{ disabled: answerDisabled, selected }}
+                style={({ pressed }) => [
+                  styles.questionOption,
+                  selected && styles.questionOptionSelected,
+                  answerDisabled && styles.buttonDisabled,
+                  pressed && !answerDisabled && styles.buttonPressed,
+                ]}
+              >
+                <Text style={styles.questionOptionLabel}>{option.label}</Text>
+              </Pressable>
+            );
+          })}
+          {/* ponytail: RN maxLength is UTF-16; POST /answer rejects >400 Unicode code points. */}
+          <TextInput
+            value={answerLocked ? lockedText : draft}
+            onChangeText={setDraft}
+            maxLength={MAX_QUESTION_CHARS}
+            editable={!answerDisabled}
+            multiline
+            keyboardAppearance="dark"
+            accessibilityLabel="Other answer"
+            placeholder="Other answer"
+            placeholderTextColor="#8A8A8A"
+            style={styles.questionInput}
+          />
+          <Pressable
+            onPress={() => {
+              const text = draft.trim();
+              if (text !== "") onAnswer(card.id, { text });
+            }}
+            disabled={answerDisabled || draft.trim() === ""}
+            accessibilityRole="button"
+            accessibilityLabel="Send answer"
+            accessibilityState={{ disabled: answerDisabled || draft.trim() === "" }}
+            style={({ pressed }) => [
+              styles.questionSend,
+              (answerDisabled || draft.trim() === "") && styles.buttonDisabled,
+              pressed && !answerDisabled && styles.buttonPressed,
+            ]}
+          >
+            <Text style={styles.questionSendLabel}>Send</Text>
+          </Pressable>
+        </>
+      ) : null}
       {canStop ? (
         <Pressable
           onPress={() => onStop(card.id)}
@@ -956,6 +1068,51 @@ const styles = StyleSheet.create({
   subagentState: {
     color: "#A3A3A3",
     fontSize: 13,
+  },
+  questionPrompt: {
+    color: "#F5F5F5",
+    fontSize: 15,
+    lineHeight: 20,
+    marginTop: 6,
+  },
+  questionOption: {
+    alignSelf: "flex-start",
+    minHeight: 44,
+    minWidth: 44,
+    justifyContent: "center",
+    marginTop: 4,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+  },
+  questionOptionSelected: {
+    backgroundColor: "#3F3F3F",
+  },
+  questionOptionLabel: {
+    color: "#C4B5FD",
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  questionInput: {
+    minHeight: 44,
+    marginTop: 8,
+    borderRadius: 12,
+    backgroundColor: "#1E1E1E",
+    color: "#F5F5F5",
+    fontSize: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  questionSend: {
+    alignSelf: "flex-start",
+    minHeight: 44,
+    minWidth: 44,
+    justifyContent: "center",
+    marginTop: 4,
+  },
+  questionSendLabel: {
+    color: "#C4B5FD",
+    fontSize: 15,
+    fontWeight: "600",
   },
   taskControl: {
     alignSelf: "flex-start",
