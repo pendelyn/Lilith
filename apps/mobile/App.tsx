@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { parseChatStreamEvent, parseHealthResponse, type TaskState } from "@lilith/contracts";
+import { parseChatStreamEvent, parseHealthResponse, parseSubagentCard, parseTaskListResponse, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -34,6 +34,7 @@ import {
   CHAT_STORAGE_KEY,
   MAX_MESSAGE_LENGTH,
   appendReply,
+  applyServerCards,
   beginReply,
   finishReply,
   parsePersistedChat,
@@ -214,6 +215,9 @@ function Home({
   const [chatPersistError, setChatPersistError] = useState(false);
   const [activeUserId, setActiveUserId] = useState<string | null>(null);
   const [state, setState] = useState<ConnectionState>("idle");
+  const [hydrateError, setHydrateError] = useState(false);
+  const [controlError, setControlError] = useState(false);
+  const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const saveRevision = useRef(0);
   const request = useRef<XMLHttpRequest | null>(null);
@@ -269,8 +273,11 @@ function Home({
 
   async function checkConnection() {
     setState("loading");
+    setHydrateError(false);
+    setControlError(false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    let connected = false;
     try {
       const response = await fetch(`${API_URL}/health`, {
         method: "GET",
@@ -291,11 +298,31 @@ function Home({
         setState("unexpected");
         return;
       }
+      connected = true;
       setState("success");
     } catch {
       setState("unreachable");
+      return;
     } finally {
       clearTimeout(timer);
+    }
+    if (!connected) return;
+    const hydrateController = new AbortController();
+    const hydrateTimer = setTimeout(() => hydrateController.abort(), TIMEOUT_MS);
+    try {
+      const tasks = await fetch(`${API_URL}/tasks`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token.trim()}` },
+        signal: hydrateController.signal,
+      });
+      if (tasks.status !== 200) throw new Error("hydrate");
+      const list = parseTaskListResponse(await tasks.json());
+      setMessages((current) => applyServerCards(current, list.tasks));
+      setHydrateError(false);
+    } catch {
+      setHydrateError(true);
+    } finally {
+      clearTimeout(hydrateTimer);
     }
   }
 
@@ -354,6 +381,7 @@ function Home({
                 assignment: event.assignment,
                 state: event.state,
                 ...(event.result === undefined ? {} : { result: event.result }),
+                ...(event.pauseReason === undefined ? {} : { pauseReason: event.pauseReason }),
               }),
             );
           } else {
@@ -406,6 +434,33 @@ function Home({
     }
   }
 
+  async function controlTask(taskId: string, action: "stop" | "resume") {
+    if (pendingTaskId !== null || state !== "success") return;
+    setPendingTaskId(taskId);
+    setControlError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/tasks/${encodeURIComponent(taskId)}/${action}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token.trim()}`,
+          ...(action === "resume" ? { "Content-Type": "application/json" } : {}),
+        },
+        body: action === "resume" ? JSON.stringify({ consent: true }) : undefined,
+        signal: controller.signal,
+      });
+      if (response.status !== 200) throw new Error("control");
+      const card = parseSubagentCard(await response.json());
+      setMessages((current) => applyServerCards(current, [card]));
+    } catch {
+      setControlError(true);
+    } finally {
+      clearTimeout(timer);
+      setPendingTaskId(null);
+    }
+  }
+
   return (
     <KeyboardAvoidingView
       style={styles.chatScreen}
@@ -433,6 +488,8 @@ function Home({
           onChangeText={(value) => {
             setToken(value);
             setState("idle");
+            setHydrateError(false);
+            setControlError(false);
           }}
           placeholder="Local API token"
           placeholderTextColor="#8A8A8A"
@@ -480,6 +537,16 @@ function Home({
           Could not save locally. Try again.
         </Text>
       ) : null}
+      {hydrateError ? (
+        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
+          Could not load tasks. Try again.
+        </Text>
+      ) : null}
+      {controlError ? (
+        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
+          Could not update the task. Try again.
+        </Text>
+      ) : null}
       <FlatList
         ref={list}
         data={messages}
@@ -489,7 +556,11 @@ function Home({
             message={item}
             assistantName={identity.name}
             canRetry={state === "success" && activeUserId === null}
+            canControl={state === "success"}
+            pendingTaskId={pendingTaskId}
             onRetry={retry}
+            onStop={(taskId) => void controlTask(taskId, "stop")}
+            onResume={(taskId) => void controlTask(taskId, "resume")}
           />
         )}
         contentContainerStyle={messages.length === 0 ? styles.emptyChat : styles.messageList}
@@ -553,28 +624,46 @@ function MessageBubble({
   message,
   assistantName,
   canRetry,
+  canControl,
+  pendingTaskId,
   onRetry,
+  onStop,
+  onResume,
 }: {
   message: ChatMessage;
   assistantName: string;
   canRetry: boolean;
+  canControl: boolean;
+  pendingTaskId: string | null;
   onRetry: (userId: string) => void;
+  onStop: (taskId: string) => void;
+  onResume: (taskId: string) => void;
 }) {
   const assistant = message.role === "assistant";
+  const spoken =
+    message.text ||
+    (message.status === "streaming" ? "Reply streaming" : message.status === "failed" ? "Reply interrupted" : "");
+  const visible =
+    message.text ||
+    (message.status === "streaming" ? "…" : message.status === "failed" ? "Reply interrupted." : "");
   return (
     <View style={[styles.messageRow, !assistant && styles.userMessageRow]}>
       <View style={[styles.bubble, assistant ? styles.assistantBubble : styles.userBubble]}>
         {message.subagents?.map((card) => (
-          <SubagentStatusCard key={card.id} card={card} />
+          <SubagentStatusCard
+            key={card.id}
+            card={card}
+            disabled={!canControl || pendingTaskId !== null}
+            pending={pendingTaskId === card.id}
+            onStop={onStop}
+            onResume={onResume}
+          />
         ))}
-        <Text
-          accessibilityLabel={`${assistant ? assistantName : "You"}: ${
-            message.text || (message.status === "streaming" ? "Reply streaming" : "Reply interrupted")
-          }`}
-          style={styles.messageText}
-        >
-          {message.text || (message.status === "streaming" ? "…" : "Reply interrupted.")}
-        </Text>
+        {visible !== "" ? (
+          <Text accessibilityLabel={`${assistant ? assistantName : "You"}: ${spoken}`} style={styles.messageText}>
+            {visible}
+          </Text>
+        ) : null}
         {message.status === "failed" && message.replyTo ? (
           <Pressable
             onPress={() => onRetry(message.replyTo!)}
@@ -592,18 +681,70 @@ function MessageBubble({
   );
 }
 
-function SubagentStatusCard({ card }: { card: SubagentCard }) {
-  const status = TASK_STATE_LABEL[card.state];
-  const detail = card.result ? `${status}. ${card.result}` : status;
+function SubagentStatusCard({
+  card,
+  disabled,
+  pending,
+  onStop,
+  onResume,
+}: {
+  card: SubagentCard;
+  disabled: boolean;
+  pending: boolean;
+  onStop: (taskId: string) => void;
+  onResume: (taskId: string) => void;
+}) {
+  const canStop =
+    card.state === "waiting" ||
+    card.state === "working" ||
+    card.state === "needs_input" ||
+    card.state === "paused";
+  const detail =
+    card.state === "paused" && card.pauseReason === "time"
+      ? "Paused after 15 minutes"
+      : card.state === "paused" && card.pauseReason === "cost"
+        ? "Paused at $1.00"
+        : card.result
+          ? `${TASK_STATE_LABEL[card.state]}. ${card.result}`
+          : TASK_STATE_LABEL[card.state];
   return (
-    <View
-      accessible
-      accessibilityLabel={`Research subagent. ${card.assignment}. ${detail}.`}
-      style={styles.subagentCard}
-    >
+    <View style={styles.subagentCard}>
       <Text style={styles.subagentRole}>Research</Text>
       <Text style={styles.subagentAssignment}>{card.assignment}</Text>
       <Text style={styles.subagentState}>{detail}</Text>
+      {canStop ? (
+        <Pressable
+          onPress={() => onStop(card.id)}
+          disabled={disabled}
+          accessibilityRole="button"
+          accessibilityLabel="Stop task"
+          accessibilityState={{ disabled, busy: pending }}
+          style={({ pressed }) => [
+            styles.taskControl,
+            disabled && styles.buttonDisabled,
+            pressed && !disabled && styles.buttonPressed,
+          ]}
+        >
+          <Text style={styles.taskControlLabel}>Stop</Text>
+        </Pressable>
+      ) : null}
+      {card.state === "paused" ? (
+        <Pressable
+          onPress={() => onResume(card.id)}
+          disabled={disabled}
+          accessibilityRole="button"
+          accessibilityLabel="Resume task"
+          accessibilityHint="Continues with a new 15 minute and 1 dollar budget"
+          accessibilityState={{ disabled, busy: pending }}
+          style={({ pressed }) => [
+            styles.taskControl,
+            disabled && styles.buttonDisabled,
+            pressed && !disabled && styles.buttonPressed,
+          ]}
+        >
+          <Text style={styles.taskControlLabel}>Resume</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -815,6 +956,18 @@ const styles = StyleSheet.create({
   subagentState: {
     color: "#A3A3A3",
     fontSize: 13,
+  },
+  taskControl: {
+    alignSelf: "flex-start",
+    minHeight: 44,
+    minWidth: 44,
+    justifyContent: "center",
+    marginTop: 4,
+  },
+  taskControlLabel: {
+    color: "#C4B5FD",
+    fontSize: 15,
+    fontWeight: "600",
   },
   composer: {
     flexDirection: "row",

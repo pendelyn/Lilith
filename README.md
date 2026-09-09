@@ -67,7 +67,7 @@ cd D:\Projekte\Lilith\apps\mobile
 npx expo start --android
 ```
 
-In the app: paste `LOCAL_API_TOKEN`, tap **Connect**, then send a test message. Until gated Issue #8 is complete, the API streams an explicit “No model is connected yet” test reply. Chat history persists locally; the token does not.
+In the app: paste `LOCAL_API_TOKEN`, tap **Connect**, then send a test message. Until gated Issue #8 is complete, the API streams an explicit “No model is connected yet” test reply. Chat history persists locally; the token does not. To exercise Stop without a provider, send exactly `Halte den Recherche-Unteragenten, bis ich stoppe oder fortsetze`.
 
 ## Physical iPhone (Expo Go)
 
