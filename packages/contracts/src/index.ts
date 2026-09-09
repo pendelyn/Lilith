@@ -30,12 +30,16 @@ export type TaskState = (typeof TASK_STATES)[number];
 export const SUBAGENT_ROLES = ["research"] as const;
 export type SubagentRole = (typeof SUBAGENT_ROLES)[number];
 
+export const PAUSE_REASONS = ["time", "cost"] as const;
+export type PauseReason = (typeof PAUSE_REASONS)[number];
+
 export type SubagentCard = {
   id: string;
   role: SubagentRole;
   assignment: string;
   state: TaskState;
   result?: string;
+  pauseReason?: PauseReason;
 };
 
 export type ChatStreamEvent =
@@ -109,11 +113,25 @@ export function parseSubagentCard(value: unknown): SubagentCard {
     throw new Error("Invalid SubagentCard");
   }
   for (const key of Object.keys(value)) {
-    if (key !== "id" && key !== "role" && key !== "assignment" && key !== "state" && key !== "result") {
+    if (
+      key !== "id" &&
+      key !== "role" &&
+      key !== "assignment" &&
+      key !== "state" &&
+      key !== "result" &&
+      key !== "pauseReason"
+    ) {
       throw new Error("Invalid SubagentCard");
     }
   }
   const state = parseTaskState(value.state);
+  if (
+    (state === "paused" || state === "stopped") &&
+    "result" in value
+  ) {
+    throw new Error("Invalid SubagentCard");
+  }
+  const pauseReason = parsePauseReason(value, state);
   if ("result" in value) {
     if (typeof value.result !== "string" || value.result === "") {
       throw new Error("Invalid SubagentCard");
@@ -124,6 +142,7 @@ export function parseSubagentCard(value: unknown): SubagentCard {
       assignment: value.assignment,
       state,
       result: value.result,
+      ...(pauseReason === undefined ? {} : { pauseReason }),
     };
   }
   return {
@@ -131,7 +150,52 @@ export function parseSubagentCard(value: unknown): SubagentCard {
     role: "research",
     assignment: value.assignment,
     state,
+    ...(pauseReason === undefined ? {} : { pauseReason }),
   };
+}
+
+function parsePauseReason(value: object, state: TaskState): PauseReason | undefined {
+  if (!("pauseReason" in value)) return undefined;
+  if (state !== "paused" || (value.pauseReason !== "time" && value.pauseReason !== "cost")) {
+    throw new Error("Invalid SubagentCard");
+  }
+  return value.pauseReason;
+}
+
+export type TaskListResponse = {
+  tasks: SubagentCard[];
+};
+
+export function parseTaskListResponse(value: unknown): TaskListResponse {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 1 ||
+    !("tasks" in value) ||
+    !Array.isArray(value.tasks)
+  ) {
+    throw new Error("Invalid TaskListResponse");
+  }
+  return { tasks: value.tasks.map((entry) => parseSubagentCard(entry)) };
+}
+
+export type ResumeRequest = {
+  consent: true;
+};
+
+export function parseResumeRequest(value: unknown): ResumeRequest {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 1 ||
+    !("consent" in value) ||
+    value.consent !== true
+  ) {
+    throw new Error("Invalid ResumeRequest");
+  }
+  return { consent: true };
 }
 
 export const ACTION_CLASSES = ["internal", "external_effect", "data_disclosure"] as const;

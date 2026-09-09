@@ -1,19 +1,26 @@
 import { randomUUID } from "node:crypto";
-import type { SubagentCard, TaskState } from "@lilith/contracts";
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { parseTaskState, type PauseReason, type SubagentCard, type TaskState } from "@lilith/contracts";
 import { requireOwned, type OwnerContext } from "./auth.ts";
 
 export const MAX_PARALLEL_SUBAGENTS = 3;
+export const TASK_MAX_RUNTIME_MS = 15 * 60_000;
+export const TASK_MAX_COST_CENTS = 100;
 export const COLOR_COMPARE_PROMPT =
   "Vergleiche Testquelle A, B und C und lasse einen Recherche-Unteragenten die gemeinsame Farbe sammeln";
 export const RESEARCH_ASSIGNMENT =
   "Collect the shared color from test sources A, B, and C.";
+export const HOLD_PROMPT =
+  "Halte den Recherche-Unteragenten, bis ich stoppe oder fortsetze";
+export const HOLD_ASSIGNMENT = "Hold research until the user stops or resumes.";
 export const TEST_SOURCES = {
   A: ["Rot", "Blau"],
   B: ["Blau", "Grün"],
   C: ["Blau", "Gelb"],
 } as const;
 
-const ACTIVE_SUBAGENT_STATES = new Set<TaskState>(["waiting", "working", "needs_input"]);
+const RUNNABLE_STATES = new Set<TaskState>(["waiting", "working", "needs_input"]);
+const TERMINAL_STATES = new Set<TaskState>(["completed", "failed"]);
 
 export type Task = {
   id: string;
@@ -23,18 +30,41 @@ export type Task = {
   assignment: string;
   state: TaskState;
   result?: string;
+  startedAt?: number;
+  costCents: number;
+  pauseReason?: PauseReason;
 };
 
 export type TaskStore = {
   readonly tasks: Map<string, Task>;
+  // ponytail: process-local open ids; restart discards fail-closed. Persist ApprovalRequest in Issue #13.
+  readonly approvals: Map<string, string>;
+  readonly now: () => number;
+  readonly persistPath?: string;
 };
 
-export function createTaskStore(): TaskStore {
-  return { tasks: new Map() };
+export function createTaskStore(options?: {
+  now?: () => number;
+  persistPath?: string;
+}): TaskStore {
+  const store: TaskStore = {
+    tasks: new Map(),
+    approvals: new Map(),
+    now: options?.now ?? Date.now,
+    ...(options?.persistPath === undefined ? {} : { persistPath: options.persistPath }),
+  };
+  if (options?.persistPath !== undefined && persistPresent(options.persistPath)) {
+    loadStore(store, options.persistPath);
+  }
+  return store;
 }
 
 export function isColorComparePrompt(message: string): boolean {
   return message.trim() === COLOR_COMPARE_PROMPT;
+}
+
+export function isHoldPrompt(message: string): boolean {
+  return message.trim() === HOLD_PROMPT;
 }
 
 export function sharedColor(
@@ -58,9 +88,10 @@ export function createParentTask(
     ownerId: owner.ownerId,
     assignment,
     state: "working",
+    startedAt: store.now(),
+    costCents: 0,
   };
-  store.tasks.set(task.id, task);
-  return task;
+  return transact(store, () => commitTask(store, task));
 }
 
 export function startSubagent(
@@ -74,6 +105,9 @@ export function startSubagent(
   if (parent.parentTaskId !== undefined) {
     throw new Error("Nested delegation is not allowed");
   }
+  applyLimits(store, owner, parent.id);
+  const live = ownedTask(store, owner, parent.id);
+  if (!RUNNABLE_STATES.has(live.state)) throw new Error("Task cannot start subagents");
   if (activeSubagentCount(store, owner.ownerId) >= MAX_PARALLEL_SUBAGENTS) {
     throw new Error("Parallel subagent limit is 3");
   }
@@ -84,9 +118,9 @@ export function startSubagent(
     role: input.role,
     assignment: input.assignment,
     state: "waiting",
+    costCents: 0,
   };
-  store.tasks.set(task.id, task);
-  return task;
+  return transact(store, () => commitTask(store, task));
 }
 
 export function setTaskState(
@@ -96,16 +130,153 @@ export function setTaskState(
   state: TaskState,
   result?: string,
 ): Task {
-  const current = store.tasks.get(taskId);
-  if (current === undefined) throw new Error("Task not found");
-  requireOwned(current, owner);
-  const task: Task = {
-    ...current,
-    state,
-    ...(result === undefined ? {} : { result }),
-  };
-  store.tasks.set(taskId, task);
-  return task;
+  applyLimits(store, owner, taskId);
+  const current = ownedTask(store, owner, taskId);
+  if (!RUNNABLE_STATES.has(current.state)) {
+    throw new Error("Task cannot change state");
+  }
+  return transact(store, () =>
+    commitTask(store, {
+      ...ownedTask(store, owner, taskId),
+      state,
+      ...(result === undefined ? {} : { result }),
+    }),
+  );
+}
+
+export function stopTask(store: TaskStore, owner: OwnerContext, taskId: string): Task {
+  ownedTask(store, owner, taskId);
+  return transact(store, () => {
+    const current = ownedTask(store, owner, taskId);
+    const members = executionSet(store, current);
+    const memberIds = new Set(members.map((member) => member.id));
+    for (const member of members) {
+      if (TERMINAL_STATES.has(member.state)) continue;
+      const next: Task = { ...member, state: "stopped" };
+      delete next.result;
+      delete next.pauseReason;
+      store.tasks.set(member.id, next);
+    }
+    for (const [id, approvedTaskId] of store.approvals) {
+      if (memberIds.has(approvedTaskId)) store.approvals.delete(id);
+    }
+    return ownedTask(store, owner, taskId);
+  });
+}
+
+export function resumeTask(
+  store: TaskStore,
+  owner: OwnerContext,
+  taskId: string,
+  input: { consent: unknown },
+): Task {
+  const current = ownedTask(store, owner, taskId);
+  if (input.consent !== true) throw new Error("Consent is required");
+  if (current.state !== "paused") throw new Error("Task is not paused");
+  return transact(store, () => {
+    const now = store.now();
+    for (const member of executionSet(store, current)) {
+      if (member.state !== "paused") continue;
+      const next: Task = { ...member, state: "working" };
+      delete next.pauseReason;
+      delete next.result;
+      store.tasks.set(member.id, next);
+    }
+    const root = ownedTask(store, owner, current.parentTaskId ?? current.id);
+    store.tasks.set(root.id, { ...root, startedAt: now, costCents: 0 });
+    return applyLimitsUnpersisted(store, owner, taskId);
+  });
+}
+
+export function startTool(store: TaskStore, owner: OwnerContext, taskId: string): void {
+  applyLimits(store, owner, taskId);
+  const current = ownedTask(store, owner, taskId);
+  if (!RUNNABLE_STATES.has(current.state)) {
+    throw new Error("Task cannot start tools");
+  }
+}
+
+export function acceptToolResult(
+  store: TaskStore,
+  owner: OwnerContext,
+  taskId: string,
+  result: string,
+): Task {
+  applyLimits(store, owner, taskId);
+  const current = ownedTask(store, owner, taskId);
+  if (!RUNNABLE_STATES.has(current.state)) {
+    throw new Error("Task cannot accept results");
+  }
+  return transact(store, () =>
+    commitTask(store, { ...ownedTask(store, owner, taskId), state: "completed", result }),
+  );
+}
+
+export function openApproval(
+  store: TaskStore,
+  owner: OwnerContext,
+  taskId: string,
+): { id: string; taskId: string } {
+  applyLimits(store, owner, taskId);
+  const current = ownedTask(store, owner, taskId);
+  if (!RUNNABLE_STATES.has(current.state)) {
+    throw new Error("Task cannot open approvals");
+  }
+  const id = randomUUID();
+  store.approvals.set(id, taskId);
+  return { id, taskId };
+}
+
+export function assertApprovalOpen(
+  store: TaskStore,
+  owner: OwnerContext,
+  approvalId: string,
+): { id: string; taskId: string } {
+  const taskId = store.approvals.get(approvalId);
+  if (taskId === undefined) throw new Error("Approval not found");
+  ownedTask(store, owner, taskId);
+  return { id: approvalId, taskId };
+}
+
+export function recordCost(
+  store: TaskStore,
+  owner: OwnerContext,
+  taskId: string,
+  cents: number,
+): Task {
+  if (!Number.isInteger(cents) || cents < 0) {
+    throw new Error("Cost must be a non-negative integer");
+  }
+  applyLimits(store, owner, taskId);
+  const current = ownedTask(store, owner, taskId);
+  if (!RUNNABLE_STATES.has(current.state)) {
+    throw new Error("Task cannot record cost");
+  }
+  return transact(store, () => {
+    const live = ownedTask(store, owner, taskId);
+    const root = ownedTask(store, owner, live.parentTaskId ?? live.id);
+    commitTask(store, { ...root, costCents: root.costCents + cents });
+    return applyLimitsUnpersisted(store, owner, taskId);
+  });
+}
+
+export function applyLimits(store: TaskStore, owner: OwnerContext, taskId: string): Task {
+  const current = ownedTask(store, owner, taskId);
+  const reason = slicePauseReason(store, current);
+  if (reason === undefined) return current;
+  if (!executionSet(store, current).some((member) => RUNNABLE_STATES.has(member.state))) {
+    return current;
+  }
+  return transact(store, () => applyLimitsUnpersisted(store, owner, taskId));
+}
+
+export function listResearchCards(store: TaskStore, owner: OwnerContext): SubagentCard[] {
+  const cards: SubagentCard[] = [];
+  for (const task of store.tasks.values()) {
+    if (task.ownerId !== owner.ownerId || task.role !== "research") continue;
+    cards.push(subagentCard(applyLimits(store, owner, task.id)));
+  }
+  return cards;
 }
 
 export function subagentCard(task: Task): SubagentCard {
@@ -117,7 +288,12 @@ export function subagentCard(task: Task): SubagentCard {
     role: "research",
     assignment: task.assignment,
     state: task.state,
-    ...(task.result === undefined ? {} : { result: task.result }),
+    ...(task.result === undefined || task.state === "paused" || task.state === "stopped"
+      ? {}
+      : { result: task.result }),
+    ...(task.state === "paused" && task.pauseReason !== undefined
+      ? { pauseReason: task.pauseReason }
+      : {}),
   };
 }
 
@@ -139,16 +315,284 @@ export function runColorCompare(
   return { cards, result };
 }
 
+export function runHeldResearch(
+  store: TaskStore,
+  owner: OwnerContext,
+): { cards: SubagentCard[] } {
+  const existing = liveHeldResearch(store, owner);
+  if (existing !== undefined) {
+    return { cards: [subagentCard(applyLimits(store, owner, existing.id))] };
+  }
+  const parent = createParentTask(store, owner, HOLD_PROMPT);
+  const started = startSubagent(store, owner, {
+    parentTaskId: parent.id,
+    assignment: HOLD_ASSIGNMENT,
+    role: "research",
+  });
+  return {
+    cards: [subagentCard(started), subagentCard(setTaskState(store, owner, started.id, "working"))],
+  };
+}
+
+function liveHeldResearch(store: TaskStore, owner: OwnerContext): Task | undefined {
+  for (const task of store.tasks.values()) {
+    if (
+      task.ownerId === owner.ownerId &&
+      task.role === "research" &&
+      task.assignment === HOLD_ASSIGNMENT &&
+      task.parentTaskId !== undefined &&
+      task.state !== "stopped" &&
+      !TERMINAL_STATES.has(task.state)
+    ) {
+      return task;
+    }
+  }
+  return undefined;
+}
+
+function ownedTask(store: TaskStore, owner: OwnerContext, taskId: string): Task {
+  const task = store.tasks.get(taskId);
+  if (task === undefined) throw new Error("Task not found");
+  requireOwned(task, owner);
+  return task;
+}
+
+function commitTask(store: TaskStore, task: Task): Task {
+  store.tasks.set(task.id, task);
+  return task;
+}
+
+function executionSet(store: TaskStore, task: Task): Task[] {
+  const rootId = task.parentTaskId ?? task.id;
+  const members: Task[] = [];
+  for (const candidate of store.tasks.values()) {
+    if (candidate.id === rootId || candidate.parentTaskId === rootId) members.push(candidate);
+  }
+  return members;
+}
+
+function rootTask(store: TaskStore, task: Task): Task {
+  const root = store.tasks.get(task.parentTaskId ?? task.id);
+  if (root === undefined) throw new Error("Task not found");
+  return root;
+}
+
+function slicePauseReason(store: TaskStore, task: Task): PauseReason | undefined {
+  const root = rootTask(store, task);
+  if (root.startedAt !== undefined && store.now() - root.startedAt >= TASK_MAX_RUNTIME_MS) return "time";
+  if (root.costCents >= TASK_MAX_COST_CENTS) return "cost";
+  return undefined;
+}
+
+function pauseTree(store: TaskStore, task: Task, reason: PauseReason): void {
+  for (const member of executionSet(store, task)) {
+    if (!RUNNABLE_STATES.has(member.state)) continue;
+    const next: Task = { ...member, state: "paused", pauseReason: reason };
+    delete next.result;
+    store.tasks.set(member.id, next);
+  }
+}
+
+function applyLimitsUnpersisted(store: TaskStore, owner: OwnerContext, taskId: string): Task {
+  const current = ownedTask(store, owner, taskId);
+  const reason = slicePauseReason(store, current);
+  if (reason !== undefined) pauseTree(store, current, reason);
+  return ownedTask(store, owner, taskId);
+}
+
+function snapshotStore(store: TaskStore): { tasks: Task[]; approvals: [string, string][] } {
+  return {
+    tasks: [...store.tasks.values()].map((task) => ({ ...task })),
+    approvals: [...store.approvals.entries()],
+  };
+}
+
+function restoreStore(
+  store: TaskStore,
+  snapshot: { tasks: Task[]; approvals: [string, string][] },
+): void {
+  store.tasks.clear();
+  store.approvals.clear();
+  for (const task of snapshot.tasks) store.tasks.set(task.id, { ...task });
+  for (const [id, taskId] of snapshot.approvals) store.approvals.set(id, taskId);
+}
+
+function transact<T>(store: TaskStore, fn: () => T): T {
+  const snapshot = snapshotStore(store);
+  try {
+    const result = fn();
+    persistStore(store);
+    return result;
+  } catch (error) {
+    restoreStore(store, snapshot);
+    throw error;
+  }
+}
+
 function activeSubagentCount(store: TaskStore, ownerId: string): number {
   let count = 0;
   for (const task of store.tasks.values()) {
-    if (
-      task.ownerId === ownerId &&
-      task.parentTaskId !== undefined &&
-      ACTIVE_SUBAGENT_STATES.has(task.state)
-    ) {
+    if (task.ownerId === ownerId && task.parentTaskId !== undefined && RUNNABLE_STATES.has(task.state)) {
       count += 1;
     }
   }
   return count;
+}
+
+function persistPresent(persistPath: string): boolean {
+  return existsSync(persistPath) || existsSync(`${persistPath}.bak`);
+}
+
+function persistStore(store: TaskStore): void {
+  if (store.persistPath === undefined) return;
+  const dest = store.persistPath;
+  const tmp = `${dest}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({
+      v: 1,
+      tasks: [...store.tasks.values()],
+    }));
+    replacePersistFile(tmp, dest);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // tmp may already have been renamed or never created
+    }
+    throw error;
+  }
+  try {
+    unlinkSync(tmp);
+  } catch {
+    // tmp already renamed onto dest
+  }
+}
+
+function replacePersistFile(tmp: string, dest: string): void {
+  try {
+    renameSync(tmp, dest);
+    return;
+  } catch (error) {
+    if (!existsSync(dest)) throw error;
+  }
+  const bak = `${dest}.bak`;
+  if (existsSync(bak)) unlinkSync(bak);
+  renameSync(dest, bak);
+  try {
+    renameSync(tmp, dest);
+  } catch (error) {
+    renameSync(bak, dest);
+    throw error;
+  }
+  try {
+    unlinkSync(bak);
+  } catch {
+    // dest already holds the new snapshot
+  }
+}
+
+function loadStore(store: TaskStore, persistPath: string): void {
+  const bak = `${persistPath}.bak`;
+  if (!existsSync(persistPath) && existsSync(bak)) {
+    renameSync(bak, persistPath);
+  }
+  const value: unknown = JSON.parse(readFileSync(persistPath, "utf8"));
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    !("v" in value) ||
+    value.v !== 1 ||
+    !("tasks" in value) ||
+    !Array.isArray(value.tasks)
+  ) {
+    throw new Error("Invalid task store");
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "v" && key !== "tasks" && key !== "approvals") {
+      throw new Error("Invalid task store");
+    }
+  }
+  // leftover `approvals` arrays are ignored; restart discards stubs fail-closed.
+  for (const entry of value.tasks) {
+    const task = parsePersistedTask(entry);
+    store.tasks.set(task.id, task);
+  }
+}
+
+function parsePersistedTask(value: unknown): Task {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid task store");
+  }
+  for (const key of Object.keys(value)) {
+    if (
+      key !== "id" &&
+      key !== "ownerId" &&
+      key !== "parentTaskId" &&
+      key !== "role" &&
+      key !== "assignment" &&
+      key !== "state" &&
+      key !== "result" &&
+      key !== "startedAt" &&
+      key !== "costCents" &&
+      key !== "pauseReason"
+    ) {
+      throw new Error("Invalid task store");
+    }
+  }
+  if (
+    !("id" in value) ||
+    typeof value.id !== "string" ||
+    value.id === "" ||
+    !("ownerId" in value) ||
+    typeof value.ownerId !== "string" ||
+    value.ownerId === "" ||
+    !("assignment" in value) ||
+    typeof value.assignment !== "string" ||
+    value.assignment === "" ||
+    !("state" in value) ||
+    !("costCents" in value) ||
+    typeof value.costCents !== "number" ||
+    !Number.isInteger(value.costCents) ||
+    value.costCents < 0
+  ) {
+    throw new Error("Invalid task store");
+  }
+  const state = parseTaskState(value.state);
+  const parentTaskId =
+    "parentTaskId" in value && typeof value.parentTaskId === "string" && value.parentTaskId !== ""
+      ? value.parentTaskId
+      : undefined;
+  if ("parentTaskId" in value && parentTaskId === undefined) throw new Error("Invalid task store");
+  const role = "role" in value && value.role === "research" ? "research" as const : undefined;
+  if ("role" in value && role === undefined) throw new Error("Invalid task store");
+  const result =
+    "result" in value && typeof value.result === "string" && value.result !== ""
+      ? value.result
+      : undefined;
+  if ("result" in value && result === undefined) throw new Error("Invalid task store");
+  const startedAt =
+    "startedAt" in value && typeof value.startedAt === "number" && Number.isInteger(value.startedAt)
+      ? value.startedAt
+      : undefined;
+  if ("startedAt" in value && startedAt === undefined) throw new Error("Invalid task store");
+  const pauseReason =
+    "pauseReason" in value && (value.pauseReason === "time" || value.pauseReason === "cost")
+      ? value.pauseReason
+      : undefined;
+  if ("pauseReason" in value && (pauseReason === undefined || state !== "paused")) {
+    throw new Error("Invalid task store");
+  }
+  return {
+    id: value.id,
+    ownerId: value.ownerId,
+    assignment: value.assignment,
+    state,
+    costCents: value.costCents,
+    ...(parentTaskId === undefined ? {} : { parentTaskId }),
+    ...(role === undefined ? {} : { role }),
+    ...(result === undefined ? {} : { result }),
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(pauseReason === undefined ? {} : { pauseReason }),
+  };
 }

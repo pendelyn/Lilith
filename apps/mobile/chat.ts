@@ -1,4 +1,4 @@
-import { parseSubagentCard, type SubagentCard } from "@lilith/contracts";
+import { parseSubagentCard, type SubagentCard, type TaskState } from "@lilith/contracts";
 
 export const CHAT_STORAGE_KEY = "lilith.chat";
 export const MAX_MESSAGE_LENGTH = 4_000;
@@ -86,6 +86,33 @@ export function upsertSubagent(
     else subagents[index] = card;
     return { ...message, subagents };
   });
+}
+
+const HYDRATE_STATES = new Set<TaskState>(["waiting", "working", "needs_input", "paused"]);
+
+export function applyServerCards(messages: ChatMessage[], cards: SubagentCard[]): ChatMessage[] {
+  const next = messages.map((message) => {
+    if (message.subagents === undefined) return message;
+    return {
+      ...message,
+      subagents: message.subagents.map((card) => cards.find((incoming) => incoming.id === card.id) ?? card),
+    };
+  });
+  const known = new Set(next.flatMap((message) => message.subagents?.map((card) => card.id) ?? []));
+  const appended = [...next];
+  for (const card of cards) {
+    if (known.has(card.id) || !HYDRATE_STATES.has(card.state)) continue;
+    appended.push({
+      id: `server-${card.id}`,
+      role: "assistant",
+      text: "",
+      status: "complete",
+      replyTo: `server:${card.id}`,
+      subagents: [card],
+    });
+    known.add(card.id);
+  }
+  return appended.slice(-200);
 }
 
 export function parsePersistedChat(raw: string | null): ChatMessage[] {

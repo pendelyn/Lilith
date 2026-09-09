@@ -1,8 +1,29 @@
 import assert from "node:assert/strict";
-import { parseChatStreamEvent } from "@lilith/contracts";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  parseChatStreamEvent,
+  parseResumeRequest,
+  parseSubagentCard,
+  parseTaskListResponse,
+} from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer, loadConfig } from "./health.ts";
-import { COLOR_COMPARE_PROMPT, RESEARCH_ASSIGNMENT } from "./tasks.ts";
+import {
+  COLOR_COMPARE_PROMPT,
+  HOLD_ASSIGNMENT,
+  HOLD_PROMPT,
+  RESEARCH_ASSIGNMENT,
+  TASK_MAX_COST_CENTS,
+  TASK_MAX_RUNTIME_MS,
+  acceptToolResult,
+  createTaskStore,
+  recordCost,
+  type TaskStore,
+} from "./tasks.ts";
+
+const AUTH = { Authorization: "Bearer secret-token" };
 
 test("missing authentication config fails closed", () => {
   assert.throws(() => loadConfig({ ALPHA_OWNER_ID: "alpha-owner" }), /LOCAL_API_TOKEN/);
@@ -12,7 +33,7 @@ test("missing authentication config fails closed", () => {
 test("valid token returns exact HealthResponse JSON", async () => {
   await withServer(async (base) => {
     const response = await fetch(`${base}/health`, {
-      headers: { Authorization: "Bearer secret-token" },
+      headers: AUTH,
     });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
@@ -25,7 +46,7 @@ test("chat replies stream as validated NDJSON without raw logs", async () => {
     const response = await fetch(`${base}/chat`, {
       method: "POST",
       headers: {
-        Authorization: "Bearer secret-token",
+        ...AUTH,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ message: "Hello\n🌙" }),
@@ -51,7 +72,7 @@ test("color compare test task streams one research subagent and Blau", async () 
     const response = await fetch(`${base}/chat`, {
       method: "POST",
       headers: {
-        Authorization: "Bearer secret-token",
+        ...AUTH,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ message: `  ${COLOR_COMPARE_PROMPT}  ` }),
@@ -95,12 +116,30 @@ test("subagent events reject extra fields", () => {
   );
 });
 
+test("strict parsers reject extra keys and non-consent resume bodies", () => {
+  assert.throws(() => parseTaskListResponse({ tasks: [], log: "secret" }), /Invalid/);
+  assert.throws(
+    () => parseSubagentCard({
+      id: "sub-1",
+      role: "research",
+      assignment: "task",
+      state: "stopped",
+      result: "Blau",
+    }),
+    /Invalid/,
+  );
+  assert.throws(() => parseResumeRequest({}), /Invalid/);
+  assert.throws(() => parseResumeRequest({ consent: false }), /Invalid/);
+  assert.throws(() => parseResumeRequest({ consent: true, extra: true }), /Invalid/);
+  assert.deepEqual(parseResumeRequest({ consent: true }), { consent: true });
+});
+
 test("invalid chat messages fail without echoing input", async () => {
   await withServer(async (base) => {
     const response = await fetch(`${base}/chat`, {
       method: "POST",
       headers: {
-        Authorization: "Bearer secret-token",
+        ...AUTH,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ message: "" }),
@@ -131,7 +170,7 @@ test("wrong credentials return 401", async () => {
 test("unknown authenticated route returns 404", async () => {
   await withServer(async (base) => {
     const response = await fetch(`${base}/nope`, {
-      headers: { Authorization: "Bearer secret-token" },
+      headers: AUTH,
     });
     assert.equal(response.status, 404);
     assert.equal(await response.text(), "");
@@ -149,7 +188,7 @@ test("authenticated unsupported health method returns 405", async () => {
   await withServer(async (base) => {
     const response = await fetch(`${base}/health`, {
       method: "POST",
-      headers: { Authorization: "Bearer secret-token" },
+      headers: AUTH,
     });
     assert.equal(response.status, 405);
     assert.equal(response.headers.get("allow"), "GET");
@@ -157,8 +196,273 @@ test("authenticated unsupported health method returns 405", async () => {
   });
 });
 
-async function withServer(run: (base: string) => Promise<void>): Promise<void> {
-  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" });
+test("repeating the hold prompt reuses one tree and stop ends that tree", async () => {
+  const store = createTaskStore();
+  await withServer(async (base) => {
+    const first = await chatEvents(base, HOLD_PROMPT);
+    const second = await chatEvents(base, HOLD_PROMPT);
+    const firstId = first.find((event) => event.type === "subagent")?.id;
+    const secondCards = second.flatMap((event) => (event.type === "subagent" ? [event] : []));
+    if (firstId === undefined) throw new Error("expected a held subagent");
+
+    assert.deepEqual(
+      secondCards.map((event) => ({ id: event.id, state: event.state })),
+      [{ id: firstId, state: "working" }],
+    );
+    assert.equal(
+      [...store.tasks.values()].filter((task) => task.parentTaskId === undefined).length,
+      1,
+    );
+    assert.equal(
+      [...store.tasks.values()].filter((task) => task.parentTaskId !== undefined).length,
+      1,
+    );
+
+    const hello = await chatEvents(base, "Hello");
+    assert.equal(hello.some((event) => event.type === "subagent"), false);
+    assert.equal(store.tasks.get(firstId)?.state, "working");
+
+    const stopped = await fetch(`${base}/tasks/${firstId}/stop`, { method: "POST", headers: AUTH });
+    assert.equal(stopped.status, 200);
+    assert.equal(parseSubagentCard(await stopped.json()).state, "stopped");
+    assert.equal(
+      [...store.tasks.values()].some((task) => task.state === "working" || task.state === "waiting"),
+      false,
+    );
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks.length, 1);
+    assert.equal(listed.tasks[0]?.id, firstId);
+    assert.equal(listed.tasks[0]?.state, "stopped");
+
+    const third = await chatEvents(base, HOLD_PROMPT);
+    const thirdId = third.find((event) => event.type === "subagent")?.id;
+    if (thirdId === undefined) throw new Error("expected a new held subagent");
+    assert.notEqual(thirdId, firstId);
+    assert.equal(
+      [...store.tasks.values()].filter((task) => task.parentTaskId === undefined).length,
+      2,
+    );
+  }, store);
+});
+
+test("hold fixture leaves one research child working after chat done", async () => {
+  await withServer(async (base) => {
+    const events = await chatEvents(base, HOLD_PROMPT);
+    const subagents = events.flatMap((event) => (event.type === "subagent" ? [event] : []));
+    const reply = events
+      .flatMap((event) => (event.type === "delta" ? [event.text] : []))
+      .join("");
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+
+    assert.equal(new Set(subagents.map((event) => event.id)).size, 1);
+    assert.deepEqual(
+      subagents.map((event) => event.state),
+      ["waiting", "working"],
+    );
+    assert.equal(subagents[0]?.assignment, HOLD_ASSIGNMENT);
+    assert.equal(subagents.some((event) => event.state === "completed"), false);
+    assert.equal(reply.includes("Blau"), false);
+    assert.deepEqual(events.at(-1), { type: "done" });
+    assert.equal(listed.tasks.length, 1);
+    assert.equal(listed.tasks[0]?.state, "working");
+    assert.equal(listed.tasks[0]?.id, subagents[0]?.id);
+  });
+});
+
+test("stop blocks late in-process results and does not present them as chat success", async () => {
+  const store = createTaskStore();
+  await withServer(async (base) => {
+    const childId = await holdChildId(base);
+    const stopped = await fetch(`${base}/tasks/${childId}/stop`, { method: "POST", headers: AUTH });
+    assert.equal(stopped.status, 200);
+    assert.deepEqual(parseSubagentCard(await stopped.json()), {
+      id: childId,
+      role: "research",
+      assignment: HOLD_ASSIGNMENT,
+      state: "stopped",
+    });
+
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks[0]?.state, "stopped");
+    assert.equal("result" in (listed.tasks[0] ?? {}), false);
+    assert.throws(() => acceptToolResult(store, { ownerId: "alpha-owner" }, childId, "Blau"), /cannot accept results/);
+    assert.equal(store.tasks.get(childId)?.state, "stopped");
+
+    const followUp = await chatEvents(base, "Hello");
+    const reply = followUp
+      .flatMap((event) => (event.type === "delta" ? [event.text] : []))
+      .join("");
+    assert.equal(reply, "No model is connected yet. You said: Hello");
+    assert.equal(reply.includes("Blau"), false);
+  }, store);
+});
+
+test("GET /tasks pauses after 15 minutes and resume requires consent true", async () => {
+  let now = 0;
+  const store = createTaskStore({ now: () => now });
+  await withServer(async (base) => {
+    const childId = await holdChildId(base);
+    now = TASK_MAX_RUNTIME_MS;
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks[0]?.state, "paused");
+    assert.equal(listed.tasks[0]?.pauseReason, "time");
+    assert.equal("result" in (listed.tasks[0] ?? {}), false);
+
+    const empty = await fetch(`${base}/tasks/${childId}/resume`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const denied = await fetch(`${base}/tasks/${childId}/resume`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ consent: false }),
+    });
+    assert.equal(empty.status, 400);
+    assert.equal(await empty.text(), "");
+    assert.equal(denied.status, 400);
+    assert.equal(
+      parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH }))).tasks[0]?.state,
+      "paused",
+    );
+
+    const resumed = await fetch(`${base}/tasks/${childId}/resume`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ consent: true }),
+    });
+    assert.equal(resumed.status, 200);
+    assert.equal(parseSubagentCard(await resumed.json()).state, "working");
+    const after = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(after.tasks[0]?.state, "working");
+    assert.equal("pauseReason" in (after.tasks[0] ?? {}), false);
+  }, store);
+});
+
+test("GET /tasks pauses at measurable USD 1 cost", async () => {
+  const store = createTaskStore();
+  await withServer(async (base) => {
+    const childId = await holdChildId(base);
+    recordCost(store, { ownerId: "alpha-owner" }, childId, TASK_MAX_COST_CENTS);
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks[0]?.state, "paused");
+    assert.equal(listed.tasks[0]?.pauseReason, "cost");
+  }, store);
+});
+
+test("task routes require the owner token and reject unknown ids", async () => {
+  await withServer(async (base) => {
+    const childId = await holdChildId(base);
+    const missing = await Promise.all([
+      fetch(`${base}/tasks`),
+      fetch(`${base}/tasks/${childId}/stop`, { method: "POST" }),
+      fetch(`${base}/tasks/${childId}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ consent: true }),
+      }),
+    ]);
+    for (const response of missing) {
+      assert.equal(response.status, 401);
+      assert.equal(await response.text(), "");
+    }
+
+    const unknown = await fetch(`${base}/tasks/missing/stop`, { method: "POST", headers: AUTH });
+    assert.equal(unknown.status, 404);
+    assert.equal(await unknown.text(), "");
+
+    const extra = await fetch(`${base}/tasks/${childId}/stop`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ extra: true }),
+    });
+    assert.equal(extra.status, 400);
+
+    const workingResume = await fetch(`${base}/tasks/${childId}/resume`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ consent: true }),
+    });
+    assert.equal(workingResume.status, 409);
+    assert.equal(await workingResume.text(), "");
+  });
+});
+
+test("task store file reload keeps working status after a new server boots", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-tasks-http-"));
+  const persistPath = join(dir, "state.json");
+  try {
+    const first = createTaskStore({ persistPath });
+    let childId = "";
+    await withServer(async (base) => {
+      childId = await holdChildId(base);
+    }, first);
+
+    const reloaded = createTaskStore({ persistPath });
+    await withServer(async (base) => {
+      const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+      assert.equal(listed.tasks.length, 1);
+      assert.equal(listed.tasks[0]?.id, childId);
+      assert.equal(listed.tasks[0]?.state, "working");
+    }, reloaded);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("HTTP persistence failure returns a controlled error and the server stays healthy", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-tasks-http-fail-"));
+  const persistPath = join(dir, "state.json");
+  let now = 0;
+  try {
+    const store = createTaskStore({ persistPath, now: () => now });
+    await withServer(async (base) => {
+      const childId = await holdChildId(base);
+      const disk = readFileSync(persistPath);
+      now = TASK_MAX_RUNTIME_MS;
+      (store as { persistPath?: string }).persistPath = join(persistPath, "blocked.json");
+      const listed = await fetch(`${base}/tasks`, { headers: AUTH });
+      assert.equal(listed.status, 500);
+      assert.equal(await listed.text(), "");
+      assert.equal(store.tasks.get(childId)?.state, "working");
+      assert.deepEqual(readFileSync(persistPath), disk);
+      const health = await fetch(`${base}/health`, { headers: AUTH });
+      assert.equal(health.status, 200);
+      assert.equal(await health.text(), '{"status":"ok"}');
+    }, store);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+async function chatEvents(base: string, message: string) {
+  const response = await fetch(`${base}/chat`, {
+    method: "POST",
+    headers: {
+      ...AUTH,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ message }),
+  });
+  assert.equal(response.status, 200);
+  return (await response.text()).trim().split("\n").map((line) => parseChatStreamEvent(JSON.parse(line)));
+}
+
+async function holdChildId(base: string): Promise<string> {
+  const events = await chatEvents(base, HOLD_PROMPT);
+  const id = events.find((event) => event.type === "subagent")?.id;
+  if (id === undefined) throw new Error("expected a held subagent");
+  return id;
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8");
+  return response.json();
+}
+
+async function withServer(run: (base: string) => Promise<void>, store?: TaskStore): Promise<void> {
+  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" }, store);
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());
   });

@@ -1,10 +1,22 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { parseHealthResponse, type ChatStreamEvent } from "@lilith/contracts";
+import {
+  parseHealthResponse,
+  parseResumeRequest,
+  parseSubagentCard,
+  parseTaskListResponse,
+  type ChatStreamEvent,
+} from "@lilith/contracts";
 import { authenticateOwner, type OwnerContext } from "./auth.ts";
 import {
   createTaskStore,
   isColorComparePrompt,
+  isHoldPrompt,
+  listResearchCards,
+  resumeTask,
   runColorCompare,
+  runHeldResearch,
+  stopTask,
+  subagentCard,
   type TaskStore,
 } from "./tasks.ts";
 
@@ -51,39 +63,67 @@ function handleRequest(
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore,
 ): void {
-  const owner = authenticateOwner(req.headers.authorization, auth);
-  if (owner === null) {
-    res.writeHead(401);
+  try {
+    const owner = authenticateOwner(req.headers.authorization, auth);
+    if (owner === null) {
+      res.writeHead(401);
+      res.end();
+      return;
+    }
+
+    const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (pathname === "/health") {
+      if (req.method !== "GET") {
+        res.writeHead(405, { Allow: "GET" });
+        res.end();
+        return;
+      }
+
+      const body = JSON.stringify(parseHealthResponse({ status: "ok" }));
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(body);
+      return;
+    }
+
+    if (pathname === "/chat") {
+      if (req.method !== "POST") {
+        res.writeHead(405, { Allow: "POST" });
+        res.end();
+        return;
+      }
+      void streamChatReply(req, res, owner, store);
+      return;
+    }
+
+    if (pathname === "/tasks") {
+      if (req.method !== "GET") {
+        res.writeHead(405, { Allow: "GET" });
+        res.end();
+        return;
+      }
+      writeJson(res, parseTaskListResponse({ tasks: listResearchCards(store, owner) }));
+      return;
+    }
+
+    const action = taskAction(pathname);
+    if (action !== undefined) {
+      if (req.method !== "POST") {
+        res.writeHead(405, { Allow: "POST" });
+        res.end();
+        return;
+      }
+      void handleTaskAction(req, res, owner, store, action);
+      return;
+    }
+
+    res.writeHead(404);
     res.end();
-    return;
-  }
-
-  const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
-  if (pathname === "/health") {
-    if (req.method !== "GET") {
-      res.writeHead(405, { Allow: "GET" });
+  } catch {
+    if (!res.headersSent) {
+      res.writeHead(500);
       res.end();
-      return;
     }
-
-    const body = JSON.stringify(parseHealthResponse({ status: "ok" }));
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(body);
-    return;
   }
-
-  if (pathname === "/chat") {
-    if (req.method !== "POST") {
-      res.writeHead(405, { Allow: "POST" });
-      res.end();
-      return;
-    }
-    void streamChatReply(req, res, owner, store);
-    return;
-  }
-
-  res.writeHead(404);
-  res.end();
 }
 
 async function streamChatReply(
@@ -93,13 +133,7 @@ async function streamChatReply(
   store: TaskStore,
 ): Promise<void> {
   try {
-    req.setEncoding("utf8");
-    let raw = "";
-    for await (const chunk of req) {
-      raw += chunk;
-      if (raw.length > 8_192) throw new Error("Request too large");
-    }
-    const value: unknown = JSON.parse(raw);
+    const value = await readJsonBody(req);
     if (
       typeof value !== "object" ||
       value === null ||
@@ -119,12 +153,51 @@ async function streamChatReply(
   }
 }
 
+async function handleTaskAction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  store: TaskStore,
+  action: { id: string; kind: "stop" | "resume" },
+): Promise<void> {
+  try {
+    const body = await readJsonBody(req);
+    const task = store.tasks.get(action.id);
+    if (task === undefined || task.ownerId !== owner.ownerId || task.role !== "research") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    if (action.kind === "stop") {
+      if (body !== undefined && !isEmptyObject(body)) throw new Error("Invalid body");
+      writeJson(res, parseSubagentCard(subagentCard(stopTask(store, owner, action.id))));
+      return;
+    }
+    writeJson(res, parseSubagentCard(subagentCard(resumeTask(store, owner, action.id, parseResumeRequest(body)))));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const status =
+      message === "Task is not paused" ? 409 : message === "Resource access denied" || message === "Task not found" ? 404 : 400;
+    if (!res.headersSent) res.writeHead(status);
+    res.end();
+  }
+}
+
 function chatEvents(message: string, owner: OwnerContext, store: TaskStore): ChatStreamEvent[] {
   if (isColorComparePrompt(message)) {
     const run = runColorCompare(store, owner);
     return [
       ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
       ...deltaEvents(`A research subagent compared test sources A, B, and C. Shared color: ${run.result}.`),
+      { type: "done" },
+    ];
+  }
+
+  if (isHoldPrompt(message)) {
+    const run = runHeldResearch(store, owner);
+    return [
+      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+      ...deltaEvents("A research subagent is working."),
       { type: "done" },
     ];
   }
@@ -157,4 +230,30 @@ function streamNdjson(res: ServerResponse, events: ChatStreamEvent[]): void {
     }
   }, 40);
   res.on("close", () => clearInterval(timer));
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  req.setEncoding("utf8");
+  let raw = "";
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > 8_192) throw new Error("Request too large");
+  }
+  if (raw.trim() === "") return undefined;
+  return JSON.parse(raw);
+}
+
+function taskAction(pathname: string): { id: string; kind: "stop" | "resume" } | undefined {
+  const match = /^\/tasks\/([^/]+)\/(stop|resume)$/.exec(pathname);
+  if (match?.[1] === undefined || (match[2] !== "stop" && match[2] !== "resume")) return undefined;
+  return { id: decodeURIComponent(match[1]), kind: match[2] };
+}
+
+function isEmptyObject(value: unknown): boolean {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).length === 0;
+}
+
+function writeJson(res: ServerResponse, value: unknown): void {
+  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(value));
 }
