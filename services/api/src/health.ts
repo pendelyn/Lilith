@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { parseHealthResponse } from "@lilith/contracts";
+import { parseHealthResponse, type ChatStreamEvent } from "@lilith/contracts";
 import { authenticateOwner } from "./auth.ts";
 
 export type ApiConfig = {
@@ -61,6 +61,65 @@ function handleRequest(
     return;
   }
 
+  if (pathname === "/chat") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST" });
+      res.end();
+      return;
+    }
+    void streamPlaceholderReply(req, res);
+    return;
+  }
+
   res.writeHead(404);
   res.end();
+}
+
+async function streamPlaceholderReply(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  try {
+    req.setEncoding("utf8");
+    let raw = "";
+    for await (const chunk of req) {
+      raw += chunk;
+      if (raw.length > 8_192) throw new Error("Request too large");
+    }
+    const value: unknown = JSON.parse(raw);
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      !("message" in value) ||
+      typeof value.message !== "string" ||
+      value.message.trim() === "" ||
+      value.message.length > 4_000
+    ) {
+      throw new Error("Invalid message");
+    }
+
+    // ponytail: deterministic bridge until the gated provider adapter in Issue #8 is activated.
+    const reply = `No model is connected yet. You said: ${value.message.trim()}`;
+    const chunks = reply.match(/[\s\S]{1,12}/g) ?? [];
+    res.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+    });
+    let index = 0;
+    const timer = setInterval(() => {
+      const event: ChatStreamEvent = index < chunks.length
+        ? { type: "delta", text: chunks[index++]! }
+        : { type: "done" };
+      res.write(`${JSON.stringify(event)}\n`);
+      if (event.type === "done") {
+        clearInterval(timer);
+        res.end();
+      }
+    }, 40);
+    res.on("close", () => clearInterval(timer));
+  } catch {
+    if (!res.headersSent) res.writeHead(400);
+    res.end();
+  }
 }

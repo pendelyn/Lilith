@@ -16,6 +16,27 @@ export function parseHealthResponse(value: unknown): HealthResponse {
   throw new Error("Invalid HealthResponse");
 }
 
+export type ChatStreamEvent =
+  | { type: "delta"; text: string }
+  | { type: "done" };
+
+export function parseChatStreamEvent(value: unknown): ChatStreamEvent {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || !("type" in value)) {
+    throw new Error("Invalid ChatStreamEvent");
+  }
+  if (value.type === "done" && Object.keys(value).length === 1) return { type: "done" };
+  if (
+    value.type === "delta" &&
+    "text" in value &&
+    typeof value.text === "string" &&
+    value.text !== "" &&
+    Object.keys(value).length === 2
+  ) {
+    return { type: "delta", text: value.text };
+  }
+  throw new Error("Invalid ChatStreamEvent");
+}
+
 export type ProviderCapabilities = {
   questions: boolean;
   approvals: boolean;
