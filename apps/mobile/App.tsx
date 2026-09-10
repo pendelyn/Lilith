@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { MAX_QUESTION_CHARS, parseChatStreamEvent, parseHealthResponse, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type QuestionAnswer, type TaskState } from "@lilith/contracts";
+import { MAX_QUESTION_CHARS, parseChatStreamEvent, parseHealthResponse, parseProviderConnection, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type ProviderConnection, type QuestionAnswer, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   FlatList,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -45,9 +46,11 @@ import {
   type ChatMessage,
   type SubagentCard,
 } from "./chat";
+import { deviceCodeLabel, providerStatusText } from "./provider";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
+const SETUP_TIMEOUT_MS = 20_000;
 
 const TOOL_LABELS: Record<OptionalTool, string> = {
   webResearch: "Web research",
@@ -218,11 +221,14 @@ function Home({
   const [state, setState] = useState<ConnectionState>("idle");
   const [hydrateError, setHydrateError] = useState(false);
   const [controlError, setControlError] = useState(false);
+  const [provider, setProvider] = useState<ProviderConnection | null>(null);
+  const [providerError, setProviderError] = useState(false);
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const pendingTaskLock = useRef<string | null>(null);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const saveRevision = useRef(0);
   const request = useRef<XMLHttpRequest | null>(null);
+  const cancelRequested = useRef(false);
   const list = useRef<FlatList<ChatMessage> | null>(null);
   const idSequence = useRef(0);
   const shouldAutoScroll = useRef(true);
@@ -277,6 +283,7 @@ function Home({
     setState("loading");
     setHydrateError(false);
     setControlError(false);
+    setProviderError(false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     let connected = false;
@@ -326,6 +333,33 @@ function Home({
     } finally {
       clearTimeout(hydrateTimer);
     }
+    await refreshProvider();
+  }
+
+  async function refreshProvider(action?: "setup" | "check" | "revoke") {
+    if (state === "streaming") return;
+    setProviderError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      action === "setup" ? SETUP_TIMEOUT_MS : TIMEOUT_MS,
+    );
+    try {
+      const response = await fetch(
+        `${API_URL}/provider${action === undefined ? "" : `/${action}`}`,
+        {
+          method: action === undefined ? "GET" : "POST",
+          headers: { Authorization: `Bearer ${token.trim()}` },
+          signal: controller.signal,
+        },
+      );
+      if (response.status !== 200) throw new Error("provider");
+      setProvider(parseProviderConnection(await response.json()));
+    } catch {
+      setProviderError(true);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function nextId(prefix: string) {
@@ -342,6 +376,7 @@ function Home({
     );
     setActiveUserId(userId);
     setState("streaming");
+    cancelRequested.current = false;
     if (Platform.OS === "ios") {
       AccessibilityInfo.announceForAccessibility(`${identity.name} is replying`);
     }
@@ -415,11 +450,17 @@ function Home({
         }
       };
       xhr.onerror = () => settle("unreachable", "failed");
-      xhr.onabort = () => settle("unreachable", "failed");
+      xhr.onabort = () => settle(cancelRequested.current ? "success" : "unreachable", "failed");
       xhr.send(JSON.stringify({ message: text }));
     } catch {
       settle("unreachable", "failed");
     }
+  }
+
+  function cancelReply() {
+    if (request.current === null || state !== "streaming") return;
+    cancelRequested.current = true;
+    request.current.abort();
   }
 
   function sendMessage() {
@@ -532,6 +573,8 @@ function Home({
             setState("idle");
             setHydrateError(false);
             setControlError(false);
+            setProvider(null);
+            setProviderError(false);
           }}
           placeholder="Local API token"
           placeholderTextColor="#8A8A8A"
@@ -589,6 +632,83 @@ function Home({
           Could not update the task. Try again.
         </Text>
       ) : null}
+      {state === "success" ? (
+        <View style={styles.providerBox}>
+          <Text
+            accessibilityLiveRegion="polite"
+            accessibilityLabel={providerStatusText(provider)}
+            style={styles.headerMeta}
+          >
+            {providerStatusText(provider)}
+          </Text>
+          {provider?.state === "pending" ? (
+            <>
+              <Pressable
+                onPress={() => void Linking.openURL(provider.verificationUrl)}
+                accessibilityRole="link"
+                accessibilityLabel="Open Codex device login"
+                style={styles.taskControl}
+              >
+                <Text style={styles.taskControlLabel}>{provider.verificationUrl}</Text>
+              </Pressable>
+              <Text
+                selectable
+                accessibilityLiveRegion="polite"
+                accessibilityLabel={deviceCodeLabel(provider.userCode)}
+                style={styles.subagentState}
+              >
+                Code: {provider.userCode}
+              </Text>
+            </>
+          ) : null}
+          <View style={styles.providerActions}>
+            {provider?.state !== "connected" && provider?.state !== "pending" ? (
+              <Pressable
+                onPress={() => void refreshProvider("setup")}
+                disabled={busy}
+                accessibilityRole="button"
+                accessibilityLabel="Set up Codex"
+                accessibilityState={{ disabled: busy }}
+                style={({ pressed }) => [styles.taskControl, busy && styles.buttonDisabled, pressed && styles.buttonPressed]}
+              >
+                <Text style={styles.taskControlLabel}>Set up Codex</Text>
+              </Pressable>
+            ) : null}
+            <Pressable
+              onPress={() => void refreshProvider("check")}
+              disabled={busy || provider === null}
+              accessibilityRole="button"
+              accessibilityLabel="Check Codex"
+              accessibilityState={{ disabled: busy || provider === null }}
+              style={({ pressed }) => [
+                styles.taskControl,
+                (busy || provider === null) && styles.buttonDisabled,
+                pressed && styles.buttonPressed,
+              ]}
+            >
+              <Text style={styles.taskControlLabel}>Check</Text>
+            </Pressable>
+            {provider?.state !== "disconnected" && provider !== null ? (
+              <Pressable
+                onPress={() => void refreshProvider("revoke")}
+                disabled={busy}
+                accessibilityRole="button"
+                accessibilityLabel="Disconnect Codex locally"
+                accessibilityHint="Clears the local Codex login. This does not revoke the token at OpenAI."
+                accessibilityState={{ disabled: busy }}
+                style={({ pressed }) => [styles.taskControl, busy && styles.buttonDisabled, pressed && styles.buttonPressed]}
+              >
+                <Text style={styles.taskControlLabel}>Revoke</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        </View>
+      ) : null}
+      {providerError ? (
+        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
+          Could not update Codex. Try again.
+        </Text>
+      ) : null}
       <FlatList
         ref={list}
         data={messages}
@@ -643,23 +763,35 @@ function Home({
           accessibilityLabel="Message"
           style={styles.composerInput}
         />
-        <Pressable
-          onPress={sendMessage}
-          disabled={draft.trim() === "" || state !== "success" || activeUserId !== null}
-          accessibilityRole="button"
-          accessibilityLabel="Send message"
-          accessibilityState={{
-            disabled: draft.trim() === "" || state !== "success" || activeUserId !== null,
-          }}
-          style={({ pressed }) => [
-            styles.sendButton,
-            (draft.trim() === "" || state !== "success" || activeUserId !== null) &&
-              styles.buttonDisabled,
-            pressed && styles.buttonPressed,
-          ]}
-        >
-          <Text allowFontScaling={false} style={styles.sendLabel}>↑</Text>
-        </Pressable>
+        {state === "streaming" ? (
+          <Pressable
+            onPress={cancelReply}
+            accessibilityRole="button"
+            accessibilityLabel="Stop reply"
+            accessibilityHint="Aborts the in-flight reply"
+            style={({ pressed }) => [styles.sendButton, pressed && styles.buttonPressed]}
+          >
+            <Text allowFontScaling={false} style={styles.sendLabel}>■</Text>
+          </Pressable>
+        ) : (
+          <Pressable
+            onPress={sendMessage}
+            disabled={draft.trim() === "" || state !== "success" || activeUserId !== null}
+            accessibilityRole="button"
+            accessibilityLabel="Send message"
+            accessibilityState={{
+              disabled: draft.trim() === "" || state !== "success" || activeUserId !== null,
+            }}
+            style={({ pressed }) => [
+              styles.sendButton,
+              (draft.trim() === "" || state !== "success" || activeUserId !== null) &&
+                styles.buttonDisabled,
+              pressed && styles.buttonPressed,
+            ]}
+          >
+            <Text allowFontScaling={false} style={styles.sendLabel}>↑</Text>
+          </Pressable>
+        )}
       </View>
     </KeyboardAvoidingView>
   );
@@ -1172,6 +1304,16 @@ const styles = StyleSheet.create({
     color: "#C4B5FD",
     fontSize: 15,
     fontWeight: "600",
+  },
+  providerBox: {
+    paddingHorizontal: 14,
+    paddingBottom: 8,
+    gap: 4,
+  },
+  providerActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
   },
   composer: {
     flexDirection: "row",

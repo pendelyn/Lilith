@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseChatStreamEvent,
+  parseProviderConnection,
   parseQuestionAnswer,
   parseQuestionCard,
   parseResumeRequest,
@@ -13,6 +14,8 @@ import {
 } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer, loadConfig } from "./health.ts";
+import { CODEX_CAPABILITIES, createScriptedCodexHost, defaultScriptedAuth } from "./codex.ts";
+import { createProviderStore, type ProviderStore } from "./provider.ts";
 import {
   APPROVAL_PROMPT,
   COLOR_COMPARE_PROMPT,
@@ -777,6 +780,111 @@ test("approval HTTP bindings survive process reload and still dispatch once", as
   }
 });
 
+test("provider setup check revoke and streamed chat never leak secrets", async () => {
+  const host = createScriptedCodexHost({
+    replyText: `Hello ${JSON.parse(defaultScriptedAuth()).tokens.access_token}`,
+  });
+  const provider = createProviderStore({ ownerId: "alpha-owner", host });
+  await withServer(async (base) => {
+    const listed = parseProviderConnection(await readJson(await fetch(`${base}/provider`, { headers: AUTH })));
+    assert.equal(listed.state, "disconnected");
+    assert.deepEqual(listed.capabilities, CODEX_CAPABILITIES);
+
+    const setup = await fetch(`${base}/provider/setup`, { method: "POST", headers: AUTH });
+    const pending = parseProviderConnection(await readJson(setup));
+    assert.equal(pending.state, "pending");
+    assert.equal(pending.userCode, "ABCD-EFGH");
+    assert.equal(JSON.stringify(pending).includes("sk-test-access-secret"), false);
+
+    host.completeLogin(defaultScriptedAuth());
+    const checked = parseProviderConnection(
+      await readJson(await fetch(`${base}/provider/check`, { method: "POST", headers: AUTH })),
+    );
+    assert.equal(checked.state, "connected");
+    assert.equal(checked.capabilities.toolEvents, false);
+    assert.equal(checked.capabilities.questions, false);
+    assert.equal(checked.capabilities.approvals, false);
+    assert.equal(checked.capabilities.modelSwitching, false);
+    assert.equal(JSON.stringify(checked).includes("sk-test"), false);
+
+    const events = await chatEvents(base, "Hello");
+    const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+    assert.equal(reply, "Hello [REDACTED]");
+    assert.deepEqual(events.at(-1), { type: "done" });
+    assert.equal(JSON.stringify(events).includes("sk-test-access-secret"), false);
+
+    const conflict = await fetch(`${base}/provider/setup`, { method: "POST", headers: AUTH });
+    assert.equal(conflict.status, 409);
+
+    const revoked = parseProviderConnection(
+      await readJson(await fetch(`${base}/provider/revoke`, { method: "POST", headers: AUTH })),
+    );
+    assert.equal(revoked.state, "disconnected");
+    const after = await chatEvents(base, "Hello");
+    assert.equal(
+      after.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join(""),
+      "No model is connected yet. You said: Hello",
+    );
+  }, undefined, provider);
+});
+
+test("cancelling a Codex chat aborts the adapter run without done", async () => {
+  const host = createScriptedCodexHost({
+    chunkDelayMs: 80,
+    replyText: "Hello from Codex",
+  });
+  const provider = createProviderStore({ ownerId: "alpha-owner", host });
+  await provider.setup({ ownerId: "alpha-owner" });
+  host.completeLogin(defaultScriptedAuth());
+  await provider.check({ ownerId: "alpha-owner" });
+  await withServer(async (base) => {
+    const ac = new AbortController();
+    const response = await fetch(`${base}/chat`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Hello" }),
+      signal: ac.signal,
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body?.getReader();
+    if (reader === undefined) throw new Error("expected a stream");
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        if (buf.includes('"type":"delta"')) {
+          ac.abort();
+          break;
+        }
+      }
+    } catch {
+      // client abort rejects the reader
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(host.aborted, true);
+    assert.equal(buf.includes('"type":"done"'), false);
+    assert.equal(buf.includes("sk-test-access-secret"), false);
+  }, undefined, provider);
+});
+
+test("aborting provider setup cancels the pending login job", async () => {
+  const host = createScriptedCodexHost({ loginDelayMs: 400 });
+  const provider = createProviderStore({ ownerId: "alpha-owner", host });
+  await withServer(async (base) => {
+    const ac = new AbortController();
+    const pending = fetch(`${base}/provider/setup`, { method: "POST", headers: AUTH, signal: ac.signal });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    ac.abort();
+    await pending.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(host.aborted, true);
+    assert.equal(provider.view({ ownerId: "alpha-owner" }).state, "disconnected");
+  }, undefined, provider);
+});
+
 async function chatEvents(base: string, message: string) {
   const response = await fetch(`${base}/chat`, {
     method: "POST",
@@ -810,8 +918,12 @@ async function readJson(response: Response): Promise<unknown> {
   return response.json();
 }
 
-async function withServer(run: (base: string) => Promise<void>, store?: TaskStore): Promise<void> {
-  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" }, store);
+async function withServer(
+  run: (base: string) => Promise<void>,
+  store?: TaskStore,
+  provider?: ProviderStore,
+): Promise<void> {
+  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" }, store, provider);
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());
   });

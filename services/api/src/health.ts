@@ -1,12 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   parseHealthResponse,
+  parseProviderConnection,
   parseResumeRequest,
   parseSubagentCard,
   parseTaskListResponse,
   type ChatStreamEvent,
 } from "@lilith/contracts";
 import { authenticateOwner, type OwnerContext } from "./auth.ts";
+import { createProviderStore, type ProviderStore } from "./provider.ts";
 import {
   APPROVAL_ASSIGNMENT,
   decideApproval,
@@ -60,9 +62,10 @@ export function loadConfig(env: NodeJS.Dict<string | undefined> = process.env): 
 export function createHealthServer(
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore = createTaskStore(),
+  provider: ProviderStore = createProviderStore({ ownerId: auth.ownerId }),
 ): Server {
   return createServer((req, res) => {
-    handleRequest(req, res, auth, store);
+    handleRequest(req, res, auth, store, provider);
   });
 }
 
@@ -71,6 +74,7 @@ function handleRequest(
   res: ServerResponse,
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore,
+  provider: ProviderStore,
 ): void {
   try {
     const owner = authenticateOwner(req.headers.authorization, auth);
@@ -100,7 +104,28 @@ function handleRequest(
         res.end();
         return;
       }
-      void streamChatReply(req, res, owner, store);
+      void streamChatReply(req, res, owner, store, provider);
+      return;
+    }
+
+    if (pathname === "/provider") {
+      if (req.method !== "GET") {
+        res.writeHead(405, { Allow: "GET" });
+        res.end();
+        return;
+      }
+      writeJson(res, parseProviderConnection(provider.view(owner)));
+      return;
+    }
+
+    const providerAction = providerRoute(pathname);
+    if (providerAction !== undefined) {
+      if (req.method !== "POST") {
+        res.writeHead(405, { Allow: "POST" });
+        res.end();
+        return;
+      }
+      void handleProviderAction(req, res, owner, provider, providerAction);
       return;
     }
 
@@ -140,7 +165,13 @@ async function streamChatReply(
   res: ServerResponse,
   owner: OwnerContext,
   store: TaskStore,
+  provider: ProviderStore,
 ): Promise<void> {
+  const ac = new AbortController();
+  req.on("aborted", () => ac.abort());
+  res.on("close", () => {
+    if (!res.writableEnded) ac.abort();
+  });
   try {
     const value = await readJsonBody(req);
     if (
@@ -155,9 +186,52 @@ async function streamChatReply(
       throw new Error("Invalid message");
     }
 
-    streamNdjson(res, chatEvents(value.message.trim(), owner, store));
+    await streamNdjson(res, chatEvents(value.message.trim(), owner, store, provider, ac.signal));
   } catch {
     if (!res.headersSent) res.writeHead(400);
+    if (!res.writableEnded) res.end();
+  }
+}
+
+async function handleProviderAction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  provider: ProviderStore,
+  action: "setup" | "check" | "revoke",
+): Promise<void> {
+  const ac = new AbortController();
+  req.on("aborted", () => ac.abort());
+  res.on("close", () => {
+    if (!res.writableEnded) ac.abort();
+  });
+  try {
+    const body = await readJsonBody(req);
+    if (body !== undefined && !isEmptyObject(body)) throw new Error("Invalid body");
+    if (ac.signal.aborted) throw new Error("Codex login aborted");
+    const connection =
+      action === "setup"
+        ? await provider.setup(owner, ac.signal)
+        : action === "check"
+          ? await provider.check(owner)
+          : await provider.revoke(owner);
+    writeJson(res, parseProviderConnection(connection));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (ac.signal.aborted || message === "Codex login aborted") {
+      if (!res.headersSent) res.writeHead(499);
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    const status =
+      message === "Provider already connected"
+        ? 409
+        : message === "Resource access denied"
+          ? 404
+          : message === "Invalid body"
+            ? 400
+            : 500;
+    if (!res.headersSent) res.writeHead(status);
     res.end();
   }
 }
@@ -209,71 +283,108 @@ async function handleTaskAction(
   }
 }
 
-function chatEvents(message: string, owner: OwnerContext, store: TaskStore): ChatStreamEvent[] {
+async function* chatEvents(
+  message: string,
+  owner: OwnerContext,
+  store: TaskStore,
+  provider: ProviderStore,
+  signal: AbortSignal,
+): AsyncIterable<ChatStreamEvent> {
   if (isApprovalPrompt(message)) {
     const run = runApprovalResearch(store, owner);
-    return [
-      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-      ...deltaEvents("Review the mock action before approving. No external call has been made."),
-      { type: "done" },
-    ];
+    yield* paced(
+      [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents("Review the mock action before approving. No external call has been made."),
+        { type: "done" },
+      ],
+      signal,
+    );
+    return;
   }
 
   if (isColorComparePrompt(message)) {
     const run = runColorCompare(store, owner);
-    return [
-      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-      ...deltaEvents(`A research subagent compared test sources A, B, and C. Shared color: ${run.result}.`),
-      { type: "done" },
-    ];
+    yield* paced(
+      [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents(`A research subagent compared test sources A, B, and C. Shared color: ${run.result}.`),
+        { type: "done" },
+      ],
+      signal,
+    );
+    return;
   }
 
   if (isHoldPrompt(message)) {
     const run = runHeldResearch(store, owner);
-    return [
-      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-      ...deltaEvents("A research subagent is working."),
-      { type: "done" },
-    ];
+    yield* paced(
+      [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents("A research subagent is working."),
+        { type: "done" },
+      ],
+      signal,
+    );
+    return;
   }
 
   if (isQuestionPrompt(message)) {
     const run = runQuestionResearch(store, owner);
-    return [
-      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-      ...deltaEvents("A research subagent needs a choice."),
-      { type: "done" },
-    ];
+    yield* paced(
+      [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents("A research subagent needs a choice."),
+        { type: "done" },
+      ],
+      signal,
+    );
+    return;
   }
 
-  // ponytail: deterministic bridge until the gated provider adapter in Issue #8 is activated.
-  return [...deltaEvents(`No model is connected yet. You said: ${message}`), { type: "done" }];
+  if (provider.view(owner).state === "connected") {
+    yield* provider.streamChat(owner, message, signal);
+    return;
+  }
+
+  yield* paced([...deltaEvents(`No model is connected yet. You said: ${message}`), { type: "done" }], signal);
 }
 
 function deltaEvents(reply: string): ChatStreamEvent[] {
   return (reply.match(/[\s\S]{1,12}/g) ?? []).map((text) => ({ type: "delta", text }));
 }
 
-function streamNdjson(res: ServerResponse, events: ChatStreamEvent[]): void {
+async function* paced(events: ChatStreamEvent[], signal: AbortSignal): AsyncIterable<ChatStreamEvent> {
+  for (const event of events) {
+    if (signal.aborted) return;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    if (signal.aborted) return;
+    yield event;
+  }
+}
+
+async function streamNdjson(res: ServerResponse, events: AsyncIterable<ChatStreamEvent>): Promise<void> {
   res.writeHead(200, {
     "Cache-Control": "no-store",
     "Content-Type": "application/x-ndjson; charset=utf-8",
   });
-  let index = 0;
-  const timer = setInterval(() => {
-    const event = events[index++];
-    if (event === undefined) {
-      clearInterval(timer);
-      res.end();
-      return;
+  try {
+    for await (const event of events) {
+      if (res.destroyed) break;
+      if (!res.writableEnded) res.write(`${JSON.stringify(event)}\n`);
     }
-    res.write(`${JSON.stringify(event)}\n`);
-    if (event.type === "done") {
-      clearInterval(timer);
-      res.end();
-    }
-  }, 40);
-  res.on("close", () => clearInterval(timer));
+  } catch {
+    // headers already sent; omit further events so the client fails closed
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
+}
+
+function providerRoute(pathname: string): "setup" | "check" | "revoke" | undefined {
+  if (pathname === "/provider/setup") return "setup";
+  if (pathname === "/provider/check") return "check";
+  if (pathname === "/provider/revoke") return "revoke";
+  return undefined;
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {

@@ -15,6 +15,7 @@
 
 - Rollenregel (dauerhaft, ausdrücklich vom Nutzer verlangt): Der Orchestrator koordiniert, weist Arbeit zu, synthetisiert Ergebnisse und verwaltet Abnahme sowie GitHub-Lebenszyklus. Er implementiert keinen Code und behebt keine Fehler selbst.
 - Orchestrator: GPT-6 Astra mit Thinking-Level `medium`.
+- Einfache Git- und Hilfsagenten laufen immer als Luna mit `xhigh`. Recherche, Implementierung, Tests und frisches Review bleiben Grok mit `xhigh`.
 - Delegierte Cursor-Worker: Cursor Grok 4.6 mit `xhigh` über `scripts/cursor-grok.ps1`. Grok übernimmt Recherche, Implementierung, Tests, Review und Fixes.
 - Review ist ein frischer, separater Grok-Lauf.
 - Bei Grok-Ausfall kein stilles Selbstimplementieren und kein Modell-Fallback; den Blocker melden.

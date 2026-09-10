@@ -1,6 +1,10 @@
 # CLI job isolation
 
-`runIsolatedJob` is Lilith's CLI isolation boundary. Issue #8 will wire the first provider to it; the P0 controls are intentionally fixed rather than configurable.
+`runIsolatedJob` is Lilith's CLI isolation boundary. The Codex adapter in Issue #8 starts jobs through `startIsolatedJob` so chat can stream and abort without relaxing the P0 controls.
+
+Generic jobs keep `--network=none`. Provider jobs do not switch to `bridge` or `host`. They attach to a dedicated Docker network with IP masquerade disabled and reach the provider only through a host CONNECT proxy that allowlists `auth.openai.com`, `api.openai.com`, and `chatgpt.com` on ports 80/443. The proxy binds an ephemeral port on `0.0.0.0` so Linux `host-gateway` traffic can reach it; it still allowlists destinations and never opens `bridge` or `host` to the job. Auth export uses `docker exec` while the job still lingers (`sleep infinity` after the entrypoint) and polls the tmpfs path even after stdout goes quiet, because `/tmp` disappears when the container stops.
+
+The pinned image remains Alpine `alpine:3.22@sha256:14358309…` until a reviewed Codex entrypoint digest exists. That image is fail-closed: `/usr/local/bin/lilith-codex` is absent, so production setup/check cannot complete. Third-party or unpinned Codex images are not used. `codex logout` and secret-store deletion are local only; they are not provider-side token revocation.
 
 ## Container boundary
 
@@ -10,11 +14,11 @@ Every job uses a digest-pinned Alpine image and:
 - the API process's non-root UID/GID (`65532:65532` fallback on Docker Desktop)
 - a read-only root filesystem and a writable 64 MiB, `noexec`, `nosuid` `/tmp`
 - all Linux capabilities dropped and `no-new-privileges`
-- no Docker log driver, network, host/container socket, or host mount beyond one dedicated workspace
+- no Docker log driver, host/container socket, or host mount beyond one dedicated workspace
 - one CPU, 512 MiB RAM, 64 processes, and a non-disableable 15-minute maximum
 - at most 1 MiB each of captured stdout and stderr
 
-The API refuses to load the runner as host UID/GID `0`. Every canonical workspace must be one direct child of the dedicated, ignored `.lilith-jobs` root; project source, shared directories, nested substitutes, and escaping symlinks are rejected. Issue #8 may replace the pinned image, but only with a reviewed digest and dedicated entrypoint. Provider access must use a dedicated allowlisted route; it must not replace `--network=none` with unrestricted networking.
+The API refuses to load the runner as host UID/GID `0`. Every canonical workspace must be one direct child of the dedicated, ignored `.lilith-jobs` root; project source, shared directories, nested substitutes, and escaping symlinks are rejected. Issue #8 may replace the pinned image, but only with a reviewed digest and dedicated entrypoint. Provider jobs copy tmpfs auth out while still running, then abort the linger. They must not use `bridge`, `host`, or other unrestricted networking.
 
 ## Credential boundary
 
