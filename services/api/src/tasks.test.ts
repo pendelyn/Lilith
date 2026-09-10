@@ -19,6 +19,7 @@ import {
   createParentTask,
   createTaskStore,
   openApproval,
+  mockApprovalAction,
   recordCost,
   resumeTask,
   runColorCompare,
@@ -133,7 +134,7 @@ test("stop discards approvals, freezes the root tree, and ignores late results",
   const input = { parentTaskId: parent.id, assignment: "after-stop", role: "research" as const };
 
   startTool(store, owner, childId);
-  const approval = openApproval(store, owner, childId);
+  const approval = openApproval(store, owner, childId, mockApprovalAction());
   assertApprovalOpen(store, owner, approval.id);
   assert.throws(
     () => assertApprovalOpen(store, { ownerId: "foreign-owner" }, approval.id),
@@ -148,14 +149,15 @@ test("stop discards approvals, freezes the root tree, and ignores late results",
     role: "research",
     assignment: HOLD_ASSIGNMENT,
     state: "stopped",
+    approval,
   });
   assert.equal(store.tasks.get(parent.id)?.state, "stopped");
   assert.equal(store.approvals.has(approval.id), false);
   assert.throws(() => assertApprovalOpen(store, owner, approval.id), /not found/);
   assert.throws(() => startTool(store, owner, childId), /cannot start tools/);
   assert.throws(() => startTool(store, owner, parent.id), /cannot start tools/);
-  assert.throws(() => openApproval(store, owner, childId), /cannot open approvals/);
-  assert.throws(() => openApproval(store, owner, parent.id), /cannot open approvals/);
+  assert.throws(() => openApproval(store, owner, childId, mockApprovalAction()), /cannot open approvals/);
+  assert.throws(() => openApproval(store, owner, parent.id, mockApprovalAction()), /cannot open approvals/);
   assert.throws(() => acceptToolResult(store, owner, childId, "Blau"), /cannot accept results/);
   assert.throws(() => setTaskState(store, owner, childId, "working"), /cannot change state/);
   assert.throws(() => setTaskState(store, owner, childId, "completed", "Blau"), /cannot change state/);
@@ -290,7 +292,7 @@ test("measurable cost pauses at 100 cents and ignores unmeasured work", () => {
   assert.equal(TASK_MAX_COST_CENTS, 100);
 });
 
-test("persisted working tasks reload without running tools and can pause later", () => {
+test("persisted approval tasks reload without running tools and can pause later", () => {
   const dir = mkdtempSync(join(tmpdir(), "lilith-tasks-"));
   const persistPath = join(dir, "state.json");
   let now = 0;
@@ -299,18 +301,18 @@ test("persisted working tasks reload without running tools and can pause later",
     const childId = heldChildId(first);
     const parent = parentOf(first, childId);
     startTool(first, owner, childId);
-    const approval = openApproval(first, owner, childId);
+    const approval = openApproval(first, owner, childId, mockApprovalAction());
     assertApprovalOpen(first, owner, approval.id);
     const persisted = JSON.parse(readFileSync(persistPath, "utf8")) as { approvals?: unknown };
     assert.equal("approvals" in persisted, false);
 
     const reloaded = createTaskStore({ persistPath, now: () => now });
     const restored = reloaded.tasks.get(childId);
-    assert.equal(restored?.state, "working");
+    assert.equal(restored?.state, "needs_input");
     assert.equal(restored?.startedAt, undefined);
     assert.equal(reloaded.tasks.get(parent.id)?.startedAt, 0);
-    assert.equal(reloaded.approvals.size, 0);
-    assert.throws(() => assertApprovalOpen(reloaded, owner, approval.id), /not found/);
+    assert.equal(reloaded.approvals.size, 1);
+    assert.deepEqual(assertApprovalOpen(reloaded, owner, approval.id), approval);
     assertApprovalOpen(first, owner, approval.id);
     assert.equal(
       [...reloaded.tasks.values()].some((task) => task.state === "completed"),
@@ -325,9 +327,9 @@ test("persisted working tasks reload without running tools and can pause later",
       }),
     );
     const fromOld = createTaskStore({ persistPath, now: () => now });
-    assert.equal(fromOld.tasks.get(childId)?.state, "working");
-    assert.equal(fromOld.approvals.size, 0);
-    assert.throws(() => assertApprovalOpen(fromOld, owner, approval.id), /not found/);
+    assert.equal(fromOld.tasks.get(childId)?.state, "needs_input");
+    assert.equal(fromOld.approvals.size, 1);
+    assert.deepEqual(assertApprovalOpen(fromOld, owner, approval.id), approval);
 
     now = TASK_MAX_RUNTIME_MS;
     assert.equal(applyLimits(reloaded, owner, childId).state, "paused");
@@ -657,7 +659,7 @@ test("persistence failure preserves disk and in-memory state", () => {
     const store = createTaskStore({ persistPath });
     const childId = heldChildId(store);
     const parent = parentOf(store, childId);
-    const approval = openApproval(store, owner, childId);
+    const approval = openApproval(store, owner, childId, mockApprovalAction());
     assertApprovalOpen(store, owner, approval.id);
     const disk = readFileSync(persistPath);
     const childState = store.tasks.get(childId)?.state;

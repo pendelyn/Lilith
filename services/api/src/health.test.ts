@@ -9,10 +9,12 @@ import {
   parseResumeRequest,
   parseSubagentCard,
   parseTaskListResponse,
+  type ApprovalRequest,
 } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer, loadConfig } from "./health.ts";
 import {
+  APPROVAL_PROMPT,
   COLOR_COMPARE_PROMPT,
   HOLD_ASSIGNMENT,
   HOLD_PROMPT,
@@ -699,6 +701,77 @@ test("HTTP persistence failure returns a controlled error and the server stays h
       assert.equal(health.status, 200);
       assert.equal(await health.text(), '{"status":"ok"}');
     }, store);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("approval HTTP flow previews, validates, authenticates and consumes once", async () => {
+  await withServer(async (base) => {
+    for (const consent of [false, true]) {
+      const events = await chatEvents(base, APPROVAL_PROMPT);
+      const card = events.find((event) => event.type === "subagent");
+      assert.ok(card?.approval);
+      assert.equal(card.state, "needs_input");
+      assert.equal(
+        events.filter((event) => event.type === "delta").map((event) => event.text).join("").includes("No model is connected yet"),
+        false,
+      );
+      const approval = card.approval;
+      assert.equal(approval.origin, "https://mock.example");
+      assert.equal(approval.operation, "POST /notes");
+      assert.equal(approval.payload, "Test note: Blau");
+      assert.deepEqual(approval.files, [{ path: "test-note.txt", content: "Blau" }]);
+      assert.equal(approval.maxCostCents, 0);
+      assert.match(approval.payloadDigest, /^[a-f0-9]{64}$/);
+      const url = `${base}/tasks/${card.id}/approve`;
+      const post = (body: unknown, headers = AUTH) => fetch(url, {
+        method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      assert.equal((await post({ approval, consent }, { Authorization: "Bearer wrong" })).status, 401);
+      assert.equal((await fetch(url, { headers: AUTH })).status, 405);
+      assert.equal((await post({ consent })).status, 400);
+      assert.equal((await post({ approval: { ...approval, payload: "tampered" }, consent: true })).status, 409);
+      const listed = parseTaskListResponse(await (await fetch(`${base}/tasks`, { headers: AUTH })).json());
+      assert.deepEqual(listed.tasks.find((task) => task.id === card.id)?.approval, approval);
+      const updated = parseSubagentCard(await readJson(await post({ approval, consent })));
+      assert.equal(updated.approval?.state, consent ? "consumed" : "rejected");
+      assert.equal(updated.state, "completed");
+      assert.match(updated.result!, consent ? /executed once/ : /No call/);
+      assert.equal((await post({ approval, consent })).status, 409);
+    }
+  });
+});
+
+test("approval HTTP bindings survive process reload and still dispatch once", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-approval-http-"));
+  const persistPath = join(dir, "state.json");
+  try {
+    let childId = "";
+    let binding: ApprovalRequest | undefined;
+    await withServer(async (base) => {
+      const events = await chatEvents(base, APPROVAL_PROMPT);
+      const card = events.find((event) => event.type === "subagent");
+      assert.ok(card?.approval);
+      childId = card.id;
+      binding = card.approval;
+    }, createTaskStore({ persistPath }));
+
+    await withServer(async (base) => {
+      assert.ok(binding);
+      const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+      assert.deepEqual(listed.tasks.find((task) => task.id === childId)?.approval, binding);
+      const url = `${base}/tasks/${childId}/approve`;
+      const post = (body: unknown) => fetch(url, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const updated = parseSubagentCard(await readJson(await post({ approval: binding, consent: true })));
+      assert.equal(updated.state, "completed");
+      assert.equal(updated.approval?.state, "consumed");
+      assert.equal((await post({ approval: binding, consent: true })).status, 409);
+    }, createTaskStore({ persistPath }));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

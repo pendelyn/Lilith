@@ -317,3 +317,25 @@ test("question cards persist, hydrate, retry, and update the same row", () => {
   assert.equal(updated[1]?.status, "complete");
   assert.deepEqual(updated[1]?.subagents, [answered]);
 });
+
+test("approval binding survives chat persistence and server decisions replace the same card", () => {
+  const approval = {
+    id: "approval-1", taskId: "sub-a", actionId: "action-1",
+    actionClass: "external_effect" as const, origin: "https://mock.example", operation: "POST /notes",
+    payload: "Test note", files: [{ path: "note.txt", content: "Blau" }],
+    maxCostCents: 0, payloadDigest: "a".repeat(64), expiresAt: 2_000_000_000_000, state: "pending" as const,
+  };
+  const card = { id: "sub-a", role: "research" as const, assignment: "Mock write", state: "needs_input" as const, approval };
+  let messages = beginReply([], "user-a", "assistant-a", "simulate");
+  messages = upsertSubagent(messages, "user-a", card);
+  const restored = parsePersistedChat(serializeChat(messages));
+  assert.deepEqual(restored[1]?.subagents, [card]);
+  assert.deepEqual(applyServerCards([], [card])[0]?.subagents, [card]);
+  for (const state of ["consumed", "rejected"] as const) {
+    const updated = { ...card, state: "completed" as const, result: state, approval: { ...approval, state } };
+    const next = setTaskReply(applyServerCards(restored, [updated]), card.id, state);
+    assert.equal(next.length, 2);
+    assert.equal(next[1]?.text, state);
+    assert.deepEqual(parsePersistedChat(serializeChat(next))[1]?.subagents, [updated]);
+  }
+});

@@ -1,6 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
+  parseApprovalAction,
+  parseApprovalDecision,
+  parseApprovalRequest,
+  type ApprovalAction,
+  type ApprovalRequest,
   parseQuestionAnswer,
   parseQuestionCard,
   parseTaskState,
@@ -30,6 +35,9 @@ export const QUESTION_OPTIONS: QuestionOption[] = [
   { id: "short", label: "Kurz" },
   { id: "long", label: "Ausführlich" },
 ];
+export const APPROVAL_PROMPT = "Simuliere eine externe Schreibaktion mit Einmalfreigabe";
+export const APPROVAL_ASSIGNMENT = "Simulate an external write; wait for one-time approval.";
+export const APPROVAL_TTL_MS = 5 * 60_000;
 export const TEST_SOURCES = {
   A: ["Rot", "Blau"],
   B: ["Blau", "Grün"],
@@ -51,11 +59,12 @@ export type Task = {
   costCents: number;
   pauseReason?: PauseReason;
   question?: QuestionCard;
+  approval?: ApprovalRequest;
 };
 
 export type TaskStore = {
   readonly tasks: Map<string, Task>;
-  // ponytail: process-local open ids; restart discards fail-closed. Persist ApprovalRequest in Issue #13.
+  // Index of pending approvals; the full binding is persisted on its task.
   readonly approvals: Map<string, string>;
   readonly now: () => number;
   readonly persistPath?: string;
@@ -87,6 +96,10 @@ export function isHoldPrompt(message: string): boolean {
 
 export function isQuestionPrompt(message: string): boolean {
   return message.trim() === QUESTION_PROMPT;
+}
+
+export function isApprovalPrompt(message: string): boolean {
+  return message.trim() === APPROVAL_PROMPT;
 }
 
 export function sharedColor(
@@ -202,7 +215,7 @@ export function resumeTask(
       const next: Task = {
         ...member,
         state:
-          member.question !== undefined && member.question.answer === undefined
+          (member.question !== undefined && member.question.answer === undefined) || member.approval?.state === "pending"
             ? "needs_input"
             : "working",
       };
@@ -244,26 +257,159 @@ export function openApproval(
   store: TaskStore,
   owner: OwnerContext,
   taskId: string,
-): { id: string; taskId: string } {
+  input: ApprovalAction,
+): ApprovalRequest {
   applyLimits(store, owner, taskId);
   const current = ownedTask(store, owner, taskId);
-  if (!RUNNABLE_STATES.has(current.state)) {
-    throw new Error("Task cannot open approvals");
-  }
-  const id = randomUUID();
-  store.approvals.set(id, taskId);
-  return { id, taskId };
+  if (!RUNNABLE_STATES.has(current.state)) throw new Error("Task cannot open approvals");
+  if (current.question !== undefined || current.approval?.state === "consumed") throw new Error("Approval conflict");
+  const action = parseApprovalAction(input);
+  const approval = parseApprovalRequest({
+    ...action,
+    id: randomUUID(),
+    taskId,
+    payloadDigest: payloadDigest(action),
+    expiresAt: store.now() + APPROVAL_TTL_MS,
+    state: "pending",
+  });
+  transact(store, () => {
+    if (current.approval !== undefined) store.approvals.delete(current.approval.id);
+    store.approvals.set(approval.id, taskId);
+    commitTask(store, { ...current, state: "needs_input", approval });
+  });
+  return structuredClone(approval);
 }
 
 export function assertApprovalOpen(
   store: TaskStore,
   owner: OwnerContext,
   approvalId: string,
-): { id: string; taskId: string } {
+): ApprovalRequest {
   const taskId = store.approvals.get(approvalId);
   if (taskId === undefined) throw new Error("Approval not found");
+  const task = applyLimits(store, owner, taskId);
+  if (!RUNNABLE_STATES.has(task.state)) throw new Error("Approval conflict");
+  const approval = task.approval;
+  if (approval?.id !== approvalId || approval.state !== "pending") throw new Error("Approval not found");
+  if (store.now() >= approval.expiresAt) throw new Error("Approval expired; request new consent");
+  return structuredClone(approval);
+}
+
+function payloadDigest(action: ApprovalAction): string {
+  return createHash("sha256")
+    .update(JSON.stringify([action.payload, action.files.map((file) => [file.path, file.content])]))
+    .digest("hex");
+}
+
+// The caller supplies the actual tool arguments, never arguments taken from the consent POST.
+export async function decideApproval(
+  store: TaskStore,
+  owner: OwnerContext,
+  taskId: string,
+  input: unknown,
+  actualAction: ApprovalAction,
+  invoke: (action: ApprovalAction, idempotencyKey: string) => string | Promise<string>,
+): Promise<Task> {
   ownedTask(store, owner, taskId);
-  return { id: approvalId, taskId };
+  const decision = parseApprovalDecision(input);
+  const approval = parseApprovalRequest(assertApprovalOpen(store, owner, decision.approval.id));
+  const action = parseApprovalAction(actualAction);
+  const expected = parseApprovalRequest({ ...approval, ...action, payloadDigest: payloadDigest(action) });
+  if (
+    approval.taskId !== taskId ||
+    JSON.stringify(approval) !== JSON.stringify(decision.approval) ||
+    JSON.stringify(approval) !== JSON.stringify(expected)
+  ) {
+    throw new Error("Approval changed; request new consent");
+  }
+  const root = rootTask(store, ownedTask(store, owner, taskId));
+  if (decision.consent && root.costCents + action.maxCostCents > TASK_MAX_COST_CENTS) {
+    throw new Error("Approval exceeds task budget");
+  }
+  if (
+    decision.consent &&
+    [...store.tasks.values()].some(
+      (task) =>
+        task.ownerId === owner.ownerId &&
+        task.approval?.actionId === action.actionId &&
+        task.approval.state === "consumed",
+    )
+  ) {
+    throw new Error("Action already consumed");
+  }
+  // ponytail: single-process store. Persist consumption BEFORE dispatch; uncertain outcomes
+  // stay consumed after a crash. Multi-process dispatch needs a DB compare-and-set.
+  transact(store, () => {
+    store.approvals.delete(approval.id);
+    const current = ownedTask(store, owner, taskId);
+    if (!decision.consent) {
+      finishRelatedParent(
+        store,
+        owner,
+        commitTask(store, {
+          ...current,
+          state: "completed",
+          approval: { ...approval, state: "rejected" },
+          result: "External action rejected. No call made.",
+        }),
+      );
+      return;
+    }
+    commitTask(store, {
+      ...current,
+      state: "working",
+      approval: { ...approval, state: "consumed" },
+    });
+  });
+  if (!decision.consent) return ownedTask(store, owner, taskId);
+  try {
+    const result = await invoke(action, action.actionId);
+    return transact(store, () => {
+      applyLimitsUnpersisted(store, owner, taskId);
+      const current = ownedTask(store, owner, taskId);
+      if (!RUNNABLE_STATES.has(current.state)) throw new Error("Task cannot accept results");
+      const completed = commitTask(store, { ...current, state: "completed", result });
+      finishRelatedParent(store, owner, completed);
+      return completed;
+    });
+  } catch (error) {
+    try {
+      sealUnsuccessfulDispatch(store, owner, taskId);
+    } catch {
+      // consume already persisted; a later load fail-closes this dispatch
+    }
+    throw error;
+  }
+}
+
+export function mockApprovalAction(actionId: string = randomUUID()): ApprovalAction {
+  return {
+    actionId,
+    actionClass: "external_effect",
+    origin: "https://mock.example",
+    operation: "POST /notes",
+    payload: "Test note: Blau",
+    files: [{ path: "test-note.txt", content: "Blau" }],
+    maxCostCents: 0,
+  };
+}
+
+export function mockExternalWrite(_action: ApprovalAction, _idempotencyKey: string): string {
+  // No network or filesystem effect: this is the P0 approval fixture, not a live tool.
+  return "Mock external write executed once. No external data was sent.";
+}
+
+export function runApprovalResearch(store: TaskStore, owner: OwnerContext): { cards: SubagentCard[] } {
+  let task = liveAssignedResearch(store, owner, APPROVAL_ASSIGNMENT);
+  if (task === undefined) {
+    const parent = createParentTask(store, owner, APPROVAL_PROMPT);
+    task = startSubagent(store, owner, { parentTaskId: parent.id, role: "research", assignment: APPROVAL_ASSIGNMENT });
+  }
+  task = applyLimits(store, owner, task.id);
+  if (RUNNABLE_STATES.has(task.state) && (task.approval === undefined || (task.approval.state === "pending" && store.now() >= task.approval.expiresAt))) {
+    openApproval(store, owner, task.id, mockApprovalAction());
+  }
+  return { cards: [subagentCard(ownedTask(store, owner, task.id))] };
 }
 
 export function recordCost(
@@ -323,6 +469,7 @@ export function subagentCard(task: Task): SubagentCard {
       ? { pauseReason: task.pauseReason }
       : {}),
     ...(task.question === undefined ? {} : { question: task.question }),
+    ...(task.approval === undefined ? {} : { approval: structuredClone(task.approval) }),
   };
 }
 
@@ -530,6 +677,56 @@ function applyLimitsUnpersisted(store: TaskStore, owner: OwnerContext, taskId: s
   return ownedTask(store, owner, taskId);
 }
 
+function finishRelatedParent(store: TaskStore, owner: OwnerContext, child: Task): void {
+  if (child.parentTaskId === undefined) return;
+  const parent = ownedTask(store, owner, child.parentTaskId);
+  if (!RUNNABLE_STATES.has(parent.state)) return;
+  const next: Task = { ...parent, state: child.state };
+  if (child.state === "completed" && child.result !== undefined) next.result = child.result;
+  else delete next.result;
+  commitTask(store, next);
+}
+
+function preservedDispatchState(state: TaskState): boolean {
+  return state === "stopped" || TERMINAL_STATES.has(state);
+}
+
+function failedConsumedTask(task: Task): Task {
+  const failed: Task = { ...task, state: "failed" };
+  delete failed.result;
+  delete failed.pauseReason;
+  return failed;
+}
+
+function sealUnsuccessfulDispatch(store: TaskStore, owner: OwnerContext, taskId: string): void {
+  const current = store.tasks.get(taskId);
+  if (current === undefined || current.approval?.state !== "consumed") return;
+  requireOwned(current, owner);
+  if (preservedDispatchState(current.state)) return;
+  transact(store, () => {
+    const live = ownedTask(store, owner, taskId);
+    if (preservedDispatchState(live.state) || live.approval?.state !== "consumed") {
+      return;
+    }
+    commitTask(store, failedConsumedTask(live));
+    if (live.parentTaskId === undefined) return;
+    const parent = ownedTask(store, owner, live.parentTaskId);
+    if (preservedDispatchState(parent.state)) return;
+    commitTask(store, failedConsumedTask(parent));
+  });
+}
+
+function failClosedConsumedDispatch(store: TaskStore, task: Task): void {
+  if (task.approval?.state !== "consumed" || preservedDispatchState(task.state) || task.result !== undefined) {
+    return;
+  }
+  store.tasks.set(task.id, failedConsumedTask(task));
+  if (task.parentTaskId === undefined) return;
+  const parent = store.tasks.get(task.parentTaskId);
+  if (parent === undefined || preservedDispatchState(parent.state)) return;
+  store.tasks.set(parent.id, failedConsumedTask(parent));
+}
+
 function snapshotStore(store: TaskStore): { tasks: Task[]; approvals: [string, string][] } {
   return {
     tasks: [...store.tasks.values()].map((task) => ({ ...task })),
@@ -643,11 +840,15 @@ function loadStore(store: TaskStore, persistPath: string): void {
       throw new Error("Invalid task store");
     }
   }
-  // leftover `approvals` arrays are ignored; restart discards stubs fail-closed.
+  // Legacy top-level approval stubs are ignored; only full task bindings are restored.
   for (const entry of value.tasks) {
     const task = parsePersistedTask(entry);
     store.tasks.set(task.id, task);
+    if (task.approval?.state === "pending" && (RUNNABLE_STATES.has(task.state) || task.state === "paused")) {
+      store.approvals.set(task.approval.id, task.id);
+    }
   }
+  for (const task of [...store.tasks.values()]) failClosedConsumedDispatch(store, task);
 }
 
 function parsePersistedTask(value: unknown): Task {
@@ -666,7 +867,8 @@ function parsePersistedTask(value: unknown): Task {
       key !== "startedAt" &&
       key !== "costCents" &&
       key !== "pauseReason" &&
-      key !== "question"
+      key !== "question" &&
+      key !== "approval"
     ) {
       throw new Error("Invalid task store");
     }
@@ -724,9 +926,10 @@ function parsePersistedTask(value: unknown): Task {
     if (question.taskId !== value.id) throw new Error("Invalid task store");
     if (state === "needs_input" && question.answer !== undefined) throw new Error("Invalid task store");
     if (state === "completed" && question.answer === undefined) throw new Error("Invalid task store");
-  } else if (state === "needs_input") {
-    throw new Error("Invalid task store");
   }
+  const approval = "approval" in value ? parseApprovalRequest(value.approval) : undefined;
+  if (approval !== undefined && (approval.taskId !== value.id || question !== undefined || payloadDigest(approval) !== approval.payloadDigest)) throw new Error("Invalid task store");
+  if (state === "needs_input" && question === undefined && approval?.state !== "pending") throw new Error("Invalid task store");
   return {
     id: value.id,
     ownerId: value.ownerId,
@@ -739,5 +942,6 @@ function parsePersistedTask(value: unknown): Task {
     ...(startedAt === undefined ? {} : { startedAt }),
     ...(pauseReason === undefined ? {} : { pauseReason }),
     ...(question === undefined ? {} : { question }),
+    ...(approval === undefined ? {} : { approval }),
   };
 }

@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { MAX_QUESTION_CHARS, parseChatStreamEvent, parseHealthResponse, parseSubagentCard, parseTaskListResponse, type QuestionAnswer, type TaskState } from "@lilith/contracts";
+import { MAX_QUESTION_CHARS, parseChatStreamEvent, parseHealthResponse, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type QuestionAnswer, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -385,6 +385,7 @@ function Home({
                 ...(event.result === undefined ? {} : { result: event.result }),
                 ...(event.pauseReason === undefined ? {} : { pauseReason: event.pauseReason }),
                 ...(event.question === undefined ? {} : { question: event.question }),
+                ...(event.approval === undefined ? {} : { approval: event.approval }),
               }),
             );
           } else {
@@ -468,7 +469,7 @@ function Home({
     }
   }
 
-  async function answerQuestion(taskId: string, answer: QuestionAnswer) {
+  async function submitTaskDecision(taskId: string, answer: QuestionAnswer | { approval: ApprovalRequest; consent: boolean }) {
     if (pendingTaskLock.current !== null || state !== "success") return;
     pendingTaskLock.current = taskId;
     setPendingTaskId(taskId);
@@ -476,7 +477,7 @@ function Home({
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const response = await fetch(`${API_URL}/tasks/${encodeURIComponent(taskId)}/answer`, {
+      const response = await fetch(`${API_URL}/tasks/${encodeURIComponent(taskId)}/${"approval" in answer ? "approve" : "answer"}`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token.trim()}`,
@@ -602,7 +603,8 @@ function Home({
             onRetry={retry}
             onStop={(taskId) => void controlTask(taskId, "stop")}
             onResume={(taskId) => void controlTask(taskId, "resume")}
-            onAnswer={(taskId, answer) => void answerQuestion(taskId, answer)}
+            onAnswer={(taskId, answer) => void submitTaskDecision(taskId, answer)}
+            onApproval={(approval, consent) => void submitTaskDecision(approval.taskId, { approval, consent })}
           />
         )}
         contentContainerStyle={messages.length === 0 ? styles.emptyChat : styles.messageList}
@@ -673,6 +675,7 @@ function MessageBubble({
   onStop,
   onResume,
   onAnswer,
+  onApproval,
 }: {
   message: ChatMessage;
   assistantName: string;
@@ -683,6 +686,7 @@ function MessageBubble({
   onStop: (taskId: string) => void;
   onResume: (taskId: string) => void;
   onAnswer: (taskId: string, answer: QuestionAnswer) => void;
+  onApproval: (approval: ApprovalRequest, consent: boolean) => void;
 }) {
   const assistant = message.role === "assistant";
   const spoken =
@@ -703,6 +707,7 @@ function MessageBubble({
             onStop={onStop}
             onResume={onResume}
             onAnswer={onAnswer}
+            onApproval={onApproval}
           />
         ))}
         {visible !== "" ? (
@@ -734,6 +739,7 @@ function SubagentStatusCard({
   onStop,
   onResume,
   onAnswer,
+  onApproval,
 }: {
   card: SubagentCard;
   disabled: boolean;
@@ -741,6 +747,7 @@ function SubagentStatusCard({
   onStop: (taskId: string) => void;
   onResume: (taskId: string) => void;
   onAnswer: (taskId: string, answer: QuestionAnswer) => void;
+  onApproval: (approval: ApprovalRequest, consent: boolean) => void;
 }) {
   const question = card.question;
   const lockedText = question?.answer !== undefined && "text" in question.answer ? question.answer.text : "";
@@ -765,6 +772,46 @@ function SubagentStatusCard({
       <Text style={styles.subagentRole}>Research</Text>
       <Text style={styles.subagentAssignment}>{card.assignment}</Text>
       <Text style={styles.subagentState}>{detail}</Text>
+      {card.approval ? (
+        <View style={styles.subagentCard}>
+          <Text style={styles.questionPrompt}>One-time approval (mock)</Text>
+          <Text style={styles.subagentAssignment}>Origin: {card.approval.origin}</Text>
+          <Text style={styles.subagentAssignment}>Operation: {card.approval.operation}</Text>
+          <Text style={styles.subagentAssignment}>Class: {card.approval.actionClass}</Text>
+          <Text style={styles.subagentAssignment}>Data: {card.approval.payload || "None"}</Text>
+          {card.approval.files.map((file) => (
+            <Text key={file.path} style={styles.subagentAssignment}>File: {file.path}{"\n"}{file.content}</Text>
+          ))}
+          <Text style={styles.subagentAssignment}>Maximum cost: ${(card.approval.maxCostCents / 100).toFixed(2)}</Text>
+          <Text style={styles.subagentState}>Expires: {new Date(card.approval.expiresAt).toLocaleString()}</Text>
+          <Text selectable style={styles.subagentState}>SHA-256: {card.approval.payloadDigest}</Text>
+          <Text accessibilityLiveRegion="polite" style={styles.subagentState}>
+            {card.approval.state === "consumed" ? "Consumed — cannot run again." : card.approval.state}
+          </Text>
+          {card.approval.state === "pending" ? (
+            <>
+              <Text style={styles.subagentState}>If expired, send the simulation prompt again for a new preview.</Text>
+              {[true, false].map((consent) => {
+                const locked = disabled || card.state !== "needs_input" || Date.now() >= card.approval!.expiresAt;
+                return (
+                  <Pressable
+                    key={String(consent)}
+                    onPress={() => onApproval(card.approval!, consent)}
+                    disabled={locked}
+                    accessibilityRole="button"
+                    accessibilityLabel={consent ? "Approve once" : "Reject action"}
+                    accessibilityHint={consent ? "Runs the mocked write once. Nothing is sent externally." : "Makes no call."}
+                    accessibilityState={{ disabled: locked, busy: pending }}
+                    style={[styles.taskControl, locked && styles.buttonDisabled]}
+                  >
+                    <Text style={styles.taskControlLabel}>{consent ? "Approve once" : "Reject"}</Text>
+                  </Pressable>
+                );
+              })}
+            </>
+          ) : null}
+        </View>
+      ) : null}
       {question ? (
         <>
           <Text style={styles.questionPrompt}>{question.prompt}</Text>
