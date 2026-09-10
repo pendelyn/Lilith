@@ -1,3 +1,6 @@
+import { parseApprovalRequest, type ApprovalRequest } from "./approvals.ts";
+export { parseApprovalAction, parseApprovalRequest, parseApprovalDecision, type ApprovalAction, type ApprovalRequest } from "./approvals.ts";
+
 export type HealthResponse = {
   status: "ok";
 };
@@ -58,6 +61,7 @@ export type SubagentCard = {
   result?: string;
   pauseReason?: PauseReason;
   question?: QuestionCard;
+  approval?: ApprovalRequest;
 };
 
 export type ChatStreamEvent =
@@ -218,7 +222,8 @@ export function parseSubagentCard(value: unknown): SubagentCard {
       key !== "state" &&
       key !== "result" &&
       key !== "pauseReason" &&
-      key !== "question"
+      key !== "question" &&
+      key !== "approval"
     ) {
       throw new Error("Invalid SubagentCard");
     }
@@ -235,7 +240,11 @@ export function parseSubagentCard(value: unknown): SubagentCard {
   if (question !== undefined && question.taskId !== value.id) {
     throw new Error("Invalid SubagentCard");
   }
-  if (state === "needs_input" && (question === undefined || question.answer !== undefined)) {
+  const approval = "approval" in value ? parseApprovalRequest(value.approval) : undefined;
+  if (approval !== undefined && (approval.taskId !== value.id || question !== undefined)) {
+    throw new Error("Invalid SubagentCard");
+  }
+  if (state === "needs_input" && !((question !== undefined && question.answer === undefined) || approval?.state === "pending")) {
     throw new Error("Invalid SubagentCard");
   }
   if (state === "completed" && question !== undefined && question.answer === undefined) {
@@ -244,6 +253,7 @@ export function parseSubagentCard(value: unknown): SubagentCard {
   const extra = {
     ...(pauseReason === undefined ? {} : { pauseReason }),
     ...(question === undefined ? {} : { question }),
+    ...(approval === undefined ? {} : { approval }),
   };
   if ("result" in value) {
     if (typeof value.result !== "string" || value.result === "") {

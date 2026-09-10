@@ -13,8 +13,12 @@
 
 ## Agenten
 
+- Rollenregel (dauerhaft, ausdrücklich vom Nutzer verlangt): Der Orchestrator koordiniert, weist Arbeit zu, synthetisiert Ergebnisse und verwaltet Abnahme sowie GitHub-Lebenszyklus. Er implementiert keinen Code und behebt keine Fehler selbst.
 - Orchestrator: GPT-6 Astra mit Thinking-Level `medium`.
-- Delegierte Cursor-Worker: Cursor Grok 4.6 mit `xhigh` über `scripts/cursor-grok.ps1`.
+- Delegierte Cursor-Worker: Cursor Grok 4.6 mit `xhigh` über `scripts/cursor-grok.ps1`. Grok übernimmt Recherche, Implementierung, Tests, Review und Fixes.
+- Review ist ein frischer, separater Grok-Lauf.
+- Bei Grok-Ausfall kein stilles Selbstimplementieren und kein Modell-Fallback; den Blocker melden.
+- Writer besitzen ihre Issue-Branches und Worktrees.
 - Grok läuft standardmäßig read-only (`ask` oder `plan`). Schreibende Läufe verwenden einen Issue-Branch; parallele schreibende Läufe zusätzlich einen eigenen Worktree.
 
 ## Implementierung

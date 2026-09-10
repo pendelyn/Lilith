@@ -69,6 +69,14 @@ npx expo start --android
 
 In the app: paste `LOCAL_API_TOKEN`, tap **Connect**, then send a test message. Until gated Issue #8 is complete, the API streams an explicit “No model is connected yet” test reply. Chat history persists locally; the token does not. To exercise Stop without a provider, send exactly `Halte den Recherche-Unteragenten, bis ich stoppe oder fortsetze`. To exercise a question card, send exactly `Frage mich, ob du kurz oder ausführlich antworten sollst`.
 
+## One-time approval test (Issue #13)
+
+Send exactly `Simuliere eine externe Schreibaktion mit Einmalfreigabe`. The chat previews the mock origin, operation, data, file contents, SHA-256 digest, maximum USD cost and five-minute expiry. **Reject** makes no call; **Approve once** dispatches one mock call. Neither path sends data externally. Reconnect to reload the server state; after expiry, send the prompt again for a fresh preview and consent.
+
+The authenticated `POST /tasks/:id/approve` accepts only `{ approval: <the displayed binding>, consent: true | false }`. The server compares it with its stored binding and actual tool arguments, checks ownership, task limits and expiry, and persists consumption before dispatch. Stop invalidates pending consent. Changed bindings, repeated submissions and consumed action IDs cannot dispatch. A crash or uncertain tool outcome leaves consent consumed, not retryable; the task reloads as failed and does not treat a late result as success. The action ID is passed as the downstream idempotency key.
+
+This is a single-process mock gateway, not an activated provider or general network tool. Future external-write and data-disclosure tools must dispatch through this gate and enforce their own destination and actual-cost limits; multiple API writers require a transactional database claim instead of the current JSON task store.
+
 ## Physical iPhone (Expo Go)
 
 Expo's tunnel does **not** carry this API. Phone and PC must share Wi-Fi, and the API must listen on the LAN.

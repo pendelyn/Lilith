@@ -32,6 +32,7 @@ if ($Mode -ne 'agent') {
     if ($LASTEXITCODE -ne 0 -or $branch -notmatch '^issue/\d+-') {
         throw 'Writing Grok runs require an issue/<number>-... branch.'
     }
+    $args += '--force' # authorized unattended shell; Cursor CLI alias --yolo
 }
 if ($Worktree) {
     $args += '--worktree'

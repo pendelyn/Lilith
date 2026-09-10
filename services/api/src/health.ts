@@ -8,8 +8,14 @@ import {
 } from "@lilith/contracts";
 import { authenticateOwner, type OwnerContext } from "./auth.ts";
 import {
+  APPROVAL_ASSIGNMENT,
+  decideApproval,
+  mockApprovalAction,
+  mockExternalWrite,
+  runApprovalResearch,
   createTaskStore,
   answerTask,
+  isApprovalPrompt,
   isColorComparePrompt,
   isHoldPrompt,
   isQuestionPrompt,
@@ -161,7 +167,7 @@ async function handleTaskAction(
   res: ServerResponse,
   owner: OwnerContext,
   store: TaskStore,
-  action: { id: string; kind: "stop" | "resume" | "answer" },
+  action: { id: string; kind: "stop" | "resume" | "answer" | "approve" },
 ): Promise<void> {
   try {
     const body = await readJsonBody(req);
@@ -176,6 +182,12 @@ async function handleTaskAction(
       writeJson(res, parseSubagentCard(subagentCard(stopTask(store, owner, action.id))));
       return;
     }
+    if (action.kind === "approve") {
+      if (task.assignment !== APPROVAL_ASSIGNMENT || task.approval === undefined) throw new Error("Task not found");
+      const updated = await decideApproval(store, owner, task.id, body, mockApprovalAction(task.approval.actionId), mockExternalWrite);
+      writeJson(res, parseSubagentCard(subagentCard(updated)));
+      return;
+    }
     if (action.kind === "answer") {
       writeJson(res, parseSubagentCard(subagentCard(answerTask(store, owner, action.id, body))));
       return;
@@ -186,7 +198,8 @@ async function handleTaskAction(
     const status =
       message === "Task is not paused" ||
       message === "Answer conflict" ||
-      message === "Task is not waiting for input"
+      message === "Task is not waiting for input" ||
+      message.startsWith("Approval ") || message === "Action already consumed"
         ? 409
         : message === "Resource access denied" || message === "Task not found"
           ? 404
@@ -197,6 +210,15 @@ async function handleTaskAction(
 }
 
 function chatEvents(message: string, owner: OwnerContext, store: TaskStore): ChatStreamEvent[] {
+  if (isApprovalPrompt(message)) {
+    const run = runApprovalResearch(store, owner);
+    return [
+      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+      ...deltaEvents("Review the mock action before approving. No external call has been made."),
+      { type: "done" },
+    ];
+  }
+
   if (isColorComparePrompt(message)) {
     const run = runColorCompare(store, owner);
     return [
@@ -265,9 +287,9 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(raw);
 }
 
-function taskAction(pathname: string): { id: string; kind: "stop" | "resume" | "answer" } | undefined {
-  const match = /^\/tasks\/([^/]+)\/(stop|resume|answer)$/.exec(pathname);
-  if (match?.[1] === undefined || (match[2] !== "stop" && match[2] !== "resume" && match[2] !== "answer")) {
+function taskAction(pathname: string): { id: string; kind: "stop" | "resume" | "answer" | "approve" } | undefined {
+  const match = /^\/tasks\/([^/]+)\/(stop|resume|answer|approve)$/.exec(pathname);
+  if (match?.[1] === undefined || (match[2] !== "stop" && match[2] !== "resume" && match[2] !== "answer" && match[2] !== "approve")) {
     return undefined;
   }
   return { id: decodeURIComponent(match[1]), kind: match[2] };
