@@ -2,14 +2,20 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
   dockerArgs,
   JobCredentialBroker,
+  parsePinnedImage,
+  PROVIDER_EGRESS_HOST,
+  RUNNER_IMAGE,
   RUNNER_WORKSPACES_ROOT,
   runIsolatedJob,
+  startAllowlistProxy,
+  startIsolatedJob,
 } from "./runner.ts";
 
 const expectedUid = process.getuid?.() ?? 65532;
@@ -50,6 +56,8 @@ test("Docker jobs use the required isolation controls", async () => {
     }
     assert.equal(args.includes("--rm"), false);
     assert.equal(args.includes("/var/run/docker.sock"), false);
+    assert.equal(args.includes("host"), false);
+    assert.equal(args.includes("bridge"), false);
     assert.throws(
       () => dockerArgs({ workspace: process.cwd(), command: ["true"] }, "lilith-job-test"),
       /dedicated workspace/,
@@ -59,9 +67,75 @@ test("Docker jobs use the required isolation controls", async () => {
       /dedicated workspace/,
     );
     assert.match(args.at(-2) ?? "", /^alpine:3\.22@sha256:[a-f0-9]{64}$/);
+    assert.equal(args.at(-2), RUNNER_IMAGE);
     assert.equal(args.at(-1), "true");
+    assert.equal(parsePinnedImage(RUNNER_IMAGE), RUNNER_IMAGE);
+    assert.throws(() => parsePinnedImage("alpine:3.22"), /digest-pinned/);
+    assert.throws(() => parsePinnedImage("ghcr.io/example/codex:latest"), /digest-pinned/);
   } finally {
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("provider jobs linger for copyOut and use an allowlisted route, not bridge or host", async () => {
+  await mkdir(RUNNER_WORKSPACES_ROOT, { recursive: true });
+  const workspace = await mkdtemp(join(RUNNER_WORKSPACES_ROOT, "unit-"));
+  try {
+    const args = dockerArgs(
+      {
+        workspace,
+        command: ["/usr/local/bin/lilith-codex", "exec", "--json", "hi"],
+        linger: true,
+        seedCodexHome: true,
+        network: { allowlist: ["auth.openai.com", "api.openai.com"] },
+      },
+      "lilith-job-codex",
+      { networkName: "lilith-net-lilith-job-codex", proxyPort: 18765 },
+    );
+    assert.equal(args.includes("--network=none"), false);
+    assert.equal(args.includes("bridge"), false);
+    assert.equal(args.includes("host"), false);
+    assert.equal(args.includes("--network=lilith-net-lilith-job-codex"), true);
+    assert.equal(args.includes(`--add-host=${PROVIDER_EGRESS_HOST}:host-gateway`), true);
+    assert.equal(args.includes("--env=CODEX_HOME=/tmp/codex-home"), true);
+    assert.equal(args.includes("--env=HTTPS_PROXY=http://lilith-egress:18765"), true);
+    assert.equal(args.includes("/bin/sh"), true);
+    assert.equal(args.some((arg) => arg.includes("sleep infinity")), true);
+    assert.equal(args.some((arg) => arg.includes("/workspace/.codex/config.toml")), true);
+  assert.equal(args.includes("/usr/local/bin/lilith-codex"), true);
+  assert.equal(args.at(-4), "/usr/local/bin/lilith-codex");
+    assert.throws(
+      () =>
+        dockerArgs(
+          { workspace, command: ["true"], network: { allowlist: ["api.openai.com"] } },
+          "lilith-job-codex",
+        ),
+      /allowlisted network/,
+    );
+    assert.throws(
+      () =>
+        dockerArgs(
+          { workspace, command: ["true"], network: { allowlist: ["api.openai.com"] } },
+          "lilith-job-codex",
+          { networkName: "bridge", proxyPort: 1 },
+        ),
+      /unrestricted/,
+    );
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("allowlist proxy denies hosts and ports outside the provider list", async () => {
+  const proxy = await startAllowlistProxy(["auth.openai.com"]);
+  try {
+    assert.equal(await proxyResponse(proxy.port, "CONNECT evil.example:443 HTTP/1.1\r\n\r\n"), 403);
+    assert.equal(await proxyResponse(proxy.port, "CONNECT auth.openai.com:22 HTTP/1.1\r\n\r\n"), 403);
+    assert.equal(await proxyResponse(proxy.port, "GET http://auth.openai.com/ HTTP/1.1\r\n\r\n"), 403);
+    await assert.rejects(startAllowlistProxy(["*"]), /invalid/);
+    await assert.rejects(startAllowlistProxy(["10.0.0.1"]), /invalid/);
+  } finally {
+    await proxy.close();
   }
 });
 
@@ -151,3 +225,48 @@ test(
     }
   },
 );
+
+test(
+  "copyOut reads tmpfs auth while a lingered job is still running",
+  { skip: process.env.RUN_DOCKER_TESTS !== "1" },
+  async () => {
+    await mkdir(RUNNER_WORKSPACES_ROOT, { recursive: true });
+    const workspace = await mkdtemp(join(RUNNER_WORKSPACES_ROOT, "copyout-"));
+    try {
+      const handle = await startIsolatedJob({
+        id: "copy-out",
+        workspace,
+        linger: true,
+        command: ["/bin/sh", "-c", "printf 'auth-export-secret' >/tmp/codex-auth-export; printf ready\\n"],
+        timeoutMs: 20_000,
+      });
+      try {
+        let buf = "";
+        for await (const chunk of handle.chunks()) {
+          buf += chunk;
+          if (buf.includes("ready")) break;
+        }
+        assert.equal(await handle.copyOut("/tmp/codex-auth-export"), "auth-export-secret");
+        handle.abort();
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  },
+);
+
+function proxyResponse(port: number, request: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1");
+    socket.once("error", reject);
+    socket.once("data", (chunk) => {
+      const match = /^HTTP\/1\.[01] (\d+)/.exec(chunk.toString("utf8"));
+      socket.destroy();
+      if (match?.[1] === undefined) reject(new Error("invalid proxy response"));
+      else resolve(Number(match[1]));
+    });
+    socket.end(request);
+  });
+}

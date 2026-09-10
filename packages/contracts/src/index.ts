@@ -100,6 +100,90 @@ export type ProviderCapabilities = {
   modelSwitching: boolean;
 };
 
+export function parseProviderCapabilities(value: unknown): ProviderCapabilities {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid ProviderCapabilities");
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 4 ||
+    !("questions" in value) ||
+    !("approvals" in value) ||
+    !("toolEvents" in value) ||
+    !("modelSwitching" in value) ||
+    typeof value.questions !== "boolean" ||
+    typeof value.approvals !== "boolean" ||
+    typeof value.toolEvents !== "boolean" ||
+    typeof value.modelSwitching !== "boolean"
+  ) {
+    throw new Error("Invalid ProviderCapabilities");
+  }
+  return {
+    questions: value.questions,
+    approvals: value.approvals,
+    toolEvents: value.toolEvents,
+    modelSwitching: value.modelSwitching,
+  };
+}
+
+export const PROVIDER_IDS = ["codex"] as const;
+export type ProviderId = (typeof PROVIDER_IDS)[number];
+
+export const PROVIDER_CONNECTION_STATES = ["disconnected", "pending", "connected"] as const;
+export type ProviderConnectionState = (typeof PROVIDER_CONNECTION_STATES)[number];
+
+export const CODEX_DEVICE_LOGIN_URL = "https://auth.openai.com/codex/device";
+
+export type ProviderConnection =
+  | {
+      provider: "codex";
+      state: "disconnected" | "connected";
+      capabilities: ProviderCapabilities;
+    }
+  | {
+      provider: "codex";
+      state: "pending";
+      capabilities: ProviderCapabilities;
+      verificationUrl: typeof CODEX_DEVICE_LOGIN_URL;
+      userCode: string;
+    };
+
+export function parseProviderConnection(value: unknown): ProviderConnection {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid ProviderConnection");
+  }
+  if (!("provider" in value) || value.provider !== "codex" || !("state" in value) || !("capabilities" in value)) {
+    throw new Error("Invalid ProviderConnection");
+  }
+  const capabilities = parseProviderCapabilities(value.capabilities);
+  if (value.state === "pending") {
+    if (
+      Object.keys(value).length !== 5 ||
+      !("verificationUrl" in value) ||
+      value.verificationUrl !== CODEX_DEVICE_LOGIN_URL ||
+      !("userCode" in value) ||
+      typeof value.userCode !== "string" ||
+      !/^[A-Z0-9]{3,8}-[A-Z0-9]{3,8}$/.test(value.userCode)
+    ) {
+      throw new Error("Invalid ProviderConnection");
+    }
+    return {
+      provider: "codex",
+      state: "pending",
+      capabilities,
+      verificationUrl: CODEX_DEVICE_LOGIN_URL,
+      userCode: value.userCode,
+    };
+  }
+  if (
+    (value.state !== "disconnected" && value.state !== "connected") ||
+    Object.keys(value).length !== 3
+  ) {
+    throw new Error("Invalid ProviderConnection");
+  }
+  return { provider: "codex", state: value.state, capabilities };
+}
+
 export interface ProviderAdapter<Session, Input, Event> {
   readonly capabilities: ProviderCapabilities;
   start(input: Input): Promise<Session>;

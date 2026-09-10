@@ -67,7 +67,7 @@ cd D:\Projekte\Lilith\apps\mobile
 npx expo start --android
 ```
 
-In the app: paste `LOCAL_API_TOKEN`, tap **Connect**, then send a test message. Until gated Issue #8 is complete, the API streams an explicit “No model is connected yet” test reply. Chat history persists locally; the token does not. To exercise Stop without a provider, send exactly `Halte den Recherche-Unteragenten, bis ich stoppe oder fortsetze`. To exercise a question card, send exactly `Frage mich, ob du kurz oder ausführlich antworten sollst`.
+In the app: paste `LOCAL_API_TOKEN`, tap **Connect**, then **Set up Codex**. The app shows the device-login URL and one-time code; tokens stay on the server. **Check** after you authorize. **Revoke** clears the local Codex login and runs `codex logout` in the job when a Codex image is present; it does not revoke the ChatGPT refresh token at OpenAI. While a reply is streaming, **Stop** aborts the run. Ordinary chat streams through the Codex adapter once connected; fixture prompts for subagents, questions, and approvals still work without a live model. Until a reviewed Codex runner image is activated, setup uses the isolated job entrypoint and fails closed if that image is missing. Chat history persists locally; the API token and provider secrets do not. To exercise Stop without a provider, send exactly `Halte den Recherche-Unteragenten, bis ich stoppe oder fortsetze`. To exercise a question card, send exactly `Frage mich, ob du kurz oder ausführlich antworten sollst`.
 
 ## One-time approval test (Issue #13)
 
