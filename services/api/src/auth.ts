@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 export type OwnerContext = Readonly<{ ownerId: string }>;
 
-export const OWNED_RESOURCE_KINDS = ["conversation", "task", "provider_connection"] as const;
+export const OWNED_RESOURCE_KINDS = ["conversation", "task", "provider_connection", "memory"] as const;
 export type OwnedResourceKind = (typeof OWNED_RESOURCE_KINDS)[number];
 export type OwnedResource = {
   id: string;

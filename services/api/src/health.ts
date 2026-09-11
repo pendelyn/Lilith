@@ -1,12 +1,32 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   parseHealthResponse,
+  parseMemoryConfirmRequest,
+  parseMemoryConfirmResponse,
+  parseMemoryItem,
+  parseMemoryListResponse,
+  parseMemoryPauseRequest,
+  parseMemoryRetrieveRequest,
+  parseMemoryRetrieveResponse,
+  parseMemoryUpdateRequest,
   parseResumeRequest,
   parseSubagentCard,
   parseTaskListResponse,
   type ChatStreamEvent,
 } from "@lilith/contracts";
 import { authenticateOwner, type OwnerContext } from "./auth.ts";
+import {
+  captureExplicitMemory,
+  confirmMemory,
+  createMemoryStore,
+  deleteMemory,
+  isMemoryPaused,
+  listMemories,
+  memoriesForProvider,
+  setMemoryPaused,
+  updateMemory,
+  type MemoryStore,
+} from "./memory.ts";
 import {
   APPROVAL_ASSIGNMENT,
   decideApproval,
@@ -60,9 +80,10 @@ export function loadConfig(env: NodeJS.Dict<string | undefined> = process.env): 
 export function createHealthServer(
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore = createTaskStore(),
+  memories: MemoryStore = createMemoryStore(),
 ): Server {
   return createServer((req, res) => {
-    handleRequest(req, res, auth, store);
+    handleRequest(req, res, auth, store, memories);
   });
 }
 
@@ -71,6 +92,7 @@ function handleRequest(
   res: ServerResponse,
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore,
+  memories: MemoryStore,
 ): void {
   try {
     const owner = authenticateOwner(req.headers.authorization, auth);
@@ -100,7 +122,11 @@ function handleRequest(
         res.end();
         return;
       }
-      void streamChatReply(req, res, owner, store);
+      void streamChatReply(req, res, owner, store, memories);
+      return;
+    }
+
+    if (handleMemoryRoute(req, res, owner, memories, pathname)) {
       return;
     }
 
@@ -140,6 +166,7 @@ async function streamChatReply(
   res: ServerResponse,
   owner: OwnerContext,
   store: TaskStore,
+  memories: MemoryStore,
 ): Promise<void> {
   try {
     const value = await readJsonBody(req);
@@ -154,8 +181,20 @@ async function streamChatReply(
     ) {
       throw new Error("Invalid message");
     }
+    if ("memoryEnabled" in value && typeof value.memoryEnabled !== "boolean") {
+      throw new Error("Invalid message");
+    }
 
-    streamNdjson(res, chatEvents(value.message.trim(), owner, store));
+    streamNdjson(
+      res,
+      chatEvents(
+        value.message.trim(),
+        owner,
+        store,
+        memories,
+        "memoryEnabled" in value && value.memoryEnabled === true,
+      ),
+    );
   } catch {
     if (!res.headersSent) res.writeHead(400);
     res.end();
@@ -209,7 +248,18 @@ async function handleTaskAction(
   }
 }
 
-function chatEvents(message: string, owner: OwnerContext, store: TaskStore): ChatStreamEvent[] {
+function chatEvents(
+  message: string,
+  owner: OwnerContext,
+  store: TaskStore,
+  memories: MemoryStore,
+  memoryEnabled: boolean,
+): ChatStreamEvent[] {
+  const remembered = captureExplicitMemory(memories, owner, message, memoryEnabled);
+  if (remembered !== undefined) {
+    return [...deltaEvents(remembered), { type: "done" }];
+  }
+
   if (isApprovalPrompt(message)) {
     const run = runApprovalResearch(store, owner);
     return [
@@ -293,6 +343,174 @@ function taskAction(pathname: string): { id: string; kind: "stop" | "resume" | "
     return undefined;
   }
   return { id: decodeURIComponent(match[1]), kind: match[2] };
+}
+
+function handleMemoryRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  memories: MemoryStore,
+  pathname: string,
+): boolean {
+  if (pathname === "/memories") {
+    if (req.method !== "GET") {
+      res.writeHead(405, { Allow: "GET" });
+      res.end();
+      return true;
+    }
+    writeJson(
+      res,
+      parseMemoryListResponse({
+        memories: listMemories(memories, owner),
+        paused: isMemoryPaused(memories, owner),
+      }),
+    );
+    return true;
+  }
+
+  if (pathname === "/memories/retrieve") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST" });
+      res.end();
+      return true;
+    }
+    void handleMemoryRetrieve(req, res, owner, memories);
+    return true;
+  }
+
+  if (pathname === "/memories/pause") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST" });
+      res.end();
+      return true;
+    }
+    void handleMemoryPause(req, res, owner, memories);
+    return true;
+  }
+
+  if (pathname === "/memories/confirm") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST" });
+      res.end();
+      return true;
+    }
+    void handleMemoryConfirm(req, res, owner, memories);
+    return true;
+  }
+
+  const item = /^\/memories\/([^/]+)$/.exec(pathname);
+  if (item?.[1] === undefined) return false;
+  if (req.method !== "PATCH" && req.method !== "DELETE") {
+    res.writeHead(405, { Allow: "PATCH, DELETE" });
+    res.end();
+    return true;
+  }
+  void handleMemoryItem(req, res, owner, memories, decodeURIComponent(item[1]), req.method);
+  return true;
+}
+
+async function handleMemoryRetrieve(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  memories: MemoryStore,
+): Promise<void> {
+  try {
+    const input = parseMemoryRetrieveRequest(await readJsonBody(req));
+    writeJson(
+      res,
+      parseMemoryRetrieveResponse({ memories: memoriesForProvider(memories, owner, input) }),
+    );
+  } catch (error) {
+    writeMemoryError(res, error);
+  }
+}
+
+async function handleMemoryPause(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  memories: MemoryStore,
+): Promise<void> {
+  try {
+    const input = parseMemoryPauseRequest(await readJsonBody(req));
+    writeJson(res, parseMemoryPauseRequest({ paused: setMemoryPaused(memories, owner, input.paused) }));
+  } catch (error) {
+    writeMemoryError(res, error);
+  }
+}
+
+async function handleMemoryConfirm(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  memories: MemoryStore,
+): Promise<void> {
+  try {
+    writeJson(
+      res,
+      parseMemoryConfirmResponse(confirmMemory(memories, owner, parseMemoryConfirmRequest(await readJsonBody(req)))),
+    );
+  } catch (error) {
+    writeMemoryError(res, error);
+  }
+}
+
+async function handleMemoryItem(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  memories: MemoryStore,
+  id: string,
+  method: string,
+): Promise<void> {
+  try {
+    if (method === "DELETE") {
+      const body = await readJsonBody(req);
+      if (body !== undefined && !isEmptyObject(body)) throw new Error("Invalid memory");
+      deleteMemory(memories, owner, id);
+      writeJson(
+        res,
+        parseMemoryListResponse({
+          memories: listMemories(memories, owner),
+          paused: isMemoryPaused(memories, owner),
+        }),
+      );
+      return;
+    }
+    const updated = updateMemory(
+      memories,
+      owner,
+      id,
+      parseMemoryUpdateRequest(await readJsonBody(req)).content,
+    );
+    writeJson(res, parseMemoryItem(updated));
+  } catch (error) {
+    writeMemoryError(res, error);
+  }
+}
+
+function writeMemoryError(res: ServerResponse, error: unknown): void {
+  const message = error instanceof Error ? error.message : "";
+  const status =
+    message === "Resource access denied" || message === "Memory not found"
+      ? 404
+      : message === "Memory confirmation required" ||
+          message === "Memory confirmation not found" ||
+          message === "Memory confirmation expired" ||
+          message === "Memory confirmation changed" ||
+          message === "Memory is off" ||
+          message === "Memory is paused"
+        ? 409
+        : message === "Invalid memory" ||
+            message === "Forbidden memory" ||
+            message === "Request too large" ||
+            message.startsWith("Invalid") ||
+            error instanceof SyntaxError
+          ? 400
+          : 500;
+  if (!res.headersSent) res.writeHead(status);
+  res.end();
 }
 
 function isEmptyObject(value: unknown): boolean {

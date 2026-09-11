@@ -1,3 +1,7 @@
+import {
+  MEMORY_REDACTED_USER_TEXT,
+  MEMORY_SECRET_REPLY,
+} from "@lilith/contracts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
@@ -6,11 +10,40 @@ import {
   beginReply,
   finishReply,
   parsePersistedChat,
+  redactRefusedSecrets,
   retryReply,
   serializeChat,
   setTaskReply,
   upsertSubagent,
 } from "./chat.ts";
+
+test("forbidden Merk dir is redacted from bubbles and serialized chat", () => {
+  const messages = beginReply([], "user-1", "assistant-1", "Merk dir: password: hunter2");
+  assert.equal(messages[0]?.text, MEMORY_REDACTED_USER_TEXT);
+  assert.equal(serializeChat(messages).toLowerCase().includes("hunter2"), false);
+
+  const leaked = [
+    { id: "user-1", role: "user" as const, text: "Merk dir: password: hunter2", status: "sent" as const },
+    {
+      id: "assistant-1",
+      role: "assistant" as const,
+      text: MEMORY_SECRET_REPLY,
+      status: "complete" as const,
+      replyTo: "user-1",
+    },
+  ];
+  assert.equal(redactRefusedSecrets(leaked)[0]?.text, MEMORY_REDACTED_USER_TEXT);
+  assert.equal(serializeChat(leaked).toLowerCase().includes("hunter2"), false);
+  assert.equal(parsePersistedChat(JSON.stringify(leaked))[0]?.text, MEMORY_REDACTED_USER_TEXT);
+  assert.equal(
+    parsePersistedChat(JSON.stringify(leaked)).some((message) => message.text.toLowerCase().includes("hunter2")),
+    false,
+  );
+
+  const multiline = beginReply([], "user-2", "assistant-2", "Merk dir: password: hunter2\nbitte merken");
+  assert.equal(multiline[0]?.text, MEMORY_REDACTED_USER_TEXT);
+  assert.equal(serializeChat(multiline).toLowerCase().includes("hunter2"), false);
+});
 
 test("chat survives restart and interrupted streams become retryable", () => {
   let messages = beginReply([], "user-1", "assistant-1", " Hello ");
