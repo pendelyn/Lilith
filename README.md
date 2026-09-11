@@ -77,6 +77,18 @@ The authenticated `POST /tasks/:id/approve` accepts only `{ approval: <the displ
 
 This is a single-process mock gateway, not an activated provider or general network tool. Future external-write and data-disclosure tools must dispatch through this gate and enforce their own destination and actual-cost limits; multiple API writers require a transactional database claim instead of the current JSON task store.
 
+## Memories (Issue #14)
+
+Recommended setup enables Memory; Blank leaves it off. After connect, **Memories** lists server-stored items (content, chat origin, timestamp) with edit, delete, and global pause. Pause and Blank both block capture and retrieval; list/edit/delete still work when paused.
+
+Send `Merk dir: Antwortsprache Deutsch` in chat. The API stores that content before any reply and does not fall through to the “You said: …” test echo. Passwords, tokens, and payment-authentication data — including German **Kennwort** and **Geheimzahl** labels — are rejected on create and on edit, even with confirmation. A refused `Merk dir` is stored locally as `Merk dir: [redacted]`; the secret is not kept in the user bubble or AsyncStorage. Multiline `Merk dir` is still treated as remember and never falls through to the echo fixture.
+
+Other sensitive content (email, phone, IBAN, address/health/ID cues) is not stored until the user confirms. The server binds that consent to the pending content digest, expires it, and ignores stale or replayed confirmation. Pause and a disabled Memory flag still block capture; confirming while paused or disabled does not persist.
+
+`POST /memories/retrieve` is the provider boundary: it returns only task-relevant memories for the query, nothing when paused or disabled, the new value after edit, and no id after delete. There is **no live provider**. Issue #8 stays deactivated; chat does not inject memories into a model. Retrieval is tested against the existing color-compare fixture so an unrelated language memory is not selected.
+
+Memories persist in `.lilith-memories.json` with the same atomic replace/rollback pattern as tasks. The file is gitignored. Reconnect reloads the owner-scoped list; a stale Blank identity cannot enable Memory from a tampered tools array.
+
 ## Physical iPhone (Expo Go)
 
 Expo's tunnel does **not** carry this API. Phone and PC must share Wi-Fi, and the API must listen on the LAN.

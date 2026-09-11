@@ -1,5 +1,34 @@
 import { parseApprovalRequest, type ApprovalRequest } from "./approvals.ts";
 export { parseApprovalAction, parseApprovalRequest, parseApprovalDecision, type ApprovalAction, type ApprovalRequest } from "./approvals.ts";
+export {
+  MAX_MEMORY_CONTENT,
+  MEMORY_CONFIRM_REPLY,
+  MEMORY_ORIGIN,
+  MEMORY_REDACTED_USER_TEXT,
+  MEMORY_SECRET_REPLY,
+  isForbiddenMemoryContent,
+  isForbiddenRememberMessage,
+  isRememberCommand,
+  isSensitiveMemoryContent,
+  parseMemoryConfirmRequest,
+  parseMemoryConfirmResponse,
+  parseMemoryContent,
+  parseMemoryItem,
+  parseMemoryListResponse,
+  parseMemoryPauseRequest,
+  parseMemoryRetrieveRequest,
+  parseMemoryRetrieveResponse,
+  parseMemoryUpdateRequest,
+  parseRememberContent,
+  type MemoryConfirmRequest,
+  type MemoryConfirmResponse,
+  type MemoryItem,
+  type MemoryListResponse,
+  type MemoryOrigin,
+  type MemoryPauseRequest,
+  type MemoryRetrieveRequest,
+  type MemoryRetrieveResponse,
+} from "./memory.ts";
 
 export type HealthResponse = {
   status: "ok";

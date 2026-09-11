@@ -1,4 +1,11 @@
-import { parseSubagentCard, type SubagentCard, type TaskState } from "@lilith/contracts";
+import {
+  MEMORY_REDACTED_USER_TEXT,
+  MEMORY_SECRET_REPLY,
+  isForbiddenRememberMessage,
+  parseSubagentCard,
+  type SubagentCard,
+  type TaskState,
+} from "@lilith/contracts";
 
 export const CHAT_STORAGE_KEY = "lilith.chat";
 export const MAX_MESSAGE_LENGTH = 4_000;
@@ -14,13 +21,36 @@ export type ChatMessage = {
   subagents?: SubagentCard[];
 };
 
+export function rememberDisplayText(raw: string): string {
+  const text = raw.trim().slice(0, MAX_MESSAGE_LENGTH);
+  if (text === "") return text;
+  return isForbiddenRememberMessage(text) ? MEMORY_REDACTED_USER_TEXT : text;
+}
+
+export function redactRefusedSecrets(messages: ChatMessage[]): ChatMessage[] {
+  const refusedUserIds = new Set(
+    messages.flatMap((message) =>
+      message.role === "assistant" && message.text === MEMORY_SECRET_REPLY && message.replyTo !== undefined
+        ? [message.replyTo]
+        : [],
+    ),
+  );
+  return messages.map((message) => {
+    if (message.role !== "user") return message;
+    const text = refusedUserIds.has(message.id)
+      ? MEMORY_REDACTED_USER_TEXT
+      : rememberDisplayText(message.text);
+    return text === message.text ? message : { ...message, text };
+  });
+}
+
 export function beginReply(
   messages: ChatMessage[],
   userId: string,
   assistantId: string,
   rawText: string,
 ): ChatMessage[] {
-  const text = rawText.trim().slice(0, MAX_MESSAGE_LENGTH);
+  const text = rememberDisplayText(rawText);
   if (text === "") return messages;
   const user: ChatMessage = { id: userId, role: "user", text, status: "sent" };
   const assistant: ChatMessage = {
@@ -182,9 +212,9 @@ export function parsePersistedChat(raw: string | null): ChatMessage[] {
       ...(subagents === undefined || subagents.length === 0 ? {} : { subagents }),
     });
   }
-  return messages;
+  return redactRefusedSecrets(messages);
 }
 
 export function serializeChat(messages: ChatMessage[]): string {
-  return JSON.stringify(messages.slice(-200));
+  return JSON.stringify(redactRefusedSecrets(messages).slice(-200));
 }

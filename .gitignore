@@ -7,6 +7,8 @@ node_modules/
 .lilith-jobs/
 .lilith-tasks.json
 .lilith-tasks.json.*
+.lilith-memories.json
+.lilith-memories.json.*
 dist/
 web-build/
 npm-debug.log*

@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { MAX_QUESTION_CHARS, parseChatStreamEvent, parseHealthResponse, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type QuestionAnswer, type TaskState } from "@lilith/contracts";
+import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type QuestionAnswer, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -9,6 +9,7 @@ import {
 import {
   AccessibilityInfo,
   ActivityIndicator,
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -38,6 +39,7 @@ import {
   beginReply,
   finishReply,
   parsePersistedChat,
+  redactRefusedSecrets,
   retryReply,
   serializeChat,
   setTaskReply,
@@ -45,6 +47,13 @@ import {
   type ChatMessage,
   type SubagentCard,
 } from "./chat";
+import {
+  memoryEnabledFromIdentity,
+  memoryRowAccessibilityLabel,
+  removeMemory,
+  replaceMemory,
+  type MemoryItem,
+} from "./memory";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
@@ -218,6 +227,14 @@ function Home({
   const [state, setState] = useState<ConnectionState>("idle");
   const [hydrateError, setHydrateError] = useState(false);
   const [controlError, setControlError] = useState(false);
+  const [memoryError, setMemoryError] = useState(false);
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [memoryPaused, setMemoryPaused] = useState(false);
+  const [memoryReady, setMemoryReady] = useState(false);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [screen, setScreen] = useState<"chat" | "memories">("chat");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const pendingTaskLock = useRef<string | null>(null);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
@@ -231,6 +248,7 @@ function Home({
     identity.tools.length === 0
       ? "No optional tools"
       : identity.tools.map((tool) => TOOL_LABELS[tool]).join(", ");
+  const memoryEnabled = memoryEnabledFromIdentity(identity);
 
   useEffect(() => {
     let active = true;
@@ -277,6 +295,10 @@ function Home({
     setState("loading");
     setHydrateError(false);
     setControlError(false);
+    setMemoryError(false);
+    setMemories([]);
+    setMemoryPaused(false);
+    setMemoryReady(false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     let connected = false;
@@ -326,6 +348,167 @@ function Home({
     } finally {
       clearTimeout(hydrateTimer);
     }
+    await refreshMemories();
+  }
+
+  async function refreshMemories() {
+    const memoryController = new AbortController();
+    const memoryTimer = setTimeout(() => memoryController.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/memories`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token.trim()}` },
+        signal: memoryController.signal,
+      });
+      if (response.status !== 200) throw new Error("hydrate");
+      const list = parseMemoryListResponse(await response.json());
+      setMemories(list.memories);
+      setMemoryPaused(list.paused);
+      setMemoryReady(true);
+      setMemoryError(false);
+    } catch {
+      setMemories([]);
+      setMemoryPaused(false);
+      setMemoryReady(false);
+      setMemoryError(true);
+    } finally {
+      clearTimeout(memoryTimer);
+    }
+  }
+
+  async function confirmSensitiveMemory(consent: boolean, content: string) {
+    setMemoryBusy(true);
+    setMemoryError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/memories/confirm`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token.trim()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ consent, content, memoryEnabled }),
+        signal: controller.signal,
+      });
+      if (response.status !== 200) throw new Error("memory");
+      const result = parseMemoryConfirmResponse(await response.json());
+      if (result.confirmed && result.memory !== undefined) {
+        const memory = result.memory;
+        setMemories((current) => {
+          const replaced = replaceMemory(current, memory);
+          return replaced === current ? [...current, memory] : replaced;
+        });
+        setEditingId(null);
+        setEditDraft("");
+      }
+      await refreshMemories();
+    } catch {
+      setMemoryError(true);
+    } finally {
+      clearTimeout(timer);
+      setMemoryBusy(false);
+    }
+  }
+
+  function promptSensitiveMemoryConfirm(content: string) {
+    Alert.alert(
+      "Sensitive memory",
+      "This looks like personal or sensitive data. Store it as a memory?",
+      [
+        { text: "Don't store", style: "cancel", onPress: () => void confirmSensitiveMemory(false, content) },
+        { text: "Store", onPress: () => void confirmSensitiveMemory(true, content) },
+      ],
+    );
+  }
+
+  async function setPaused(paused: boolean) {
+    if (memoryBusy || state !== "success" || !memoryEnabled) return;
+    setMemoryBusy(true);
+    setMemoryError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/memories/pause`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token.trim()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ paused }),
+        signal: controller.signal,
+      });
+      if (response.status !== 200) throw new Error("memory");
+      setMemoryPaused(parseMemoryPauseRequest(await response.json()).paused);
+    } catch {
+      setMemoryError(true);
+    } finally {
+      clearTimeout(timer);
+      setMemoryBusy(false);
+    }
+  }
+
+  async function saveEditedMemory() {
+    if (editingId === null || memoryBusy || state !== "success") return;
+    const content = editDraft.trim();
+    if (content === "") return;
+    setMemoryBusy(true);
+    setMemoryError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/memories/${encodeURIComponent(editingId)}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token.trim()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content }),
+        signal: controller.signal,
+      });
+      if (response.status === 409) {
+        promptSensitiveMemoryConfirm(content);
+        return;
+      }
+      if (response.status !== 200) throw new Error("memory");
+      const updated = parseMemoryItem(await response.json());
+      setMemories((current) => replaceMemory(current, updated));
+      setEditingId(null);
+      setEditDraft("");
+    } catch {
+      setMemoryError(true);
+    } finally {
+      clearTimeout(timer);
+      setMemoryBusy(false);
+    }
+  }
+
+  async function deleteMemoryItem(id: string) {
+    if (memoryBusy || state !== "success") return;
+    setMemoryBusy(true);
+    setMemoryError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/memories/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token.trim()}` },
+        signal: controller.signal,
+      });
+      if (response.status !== 200) throw new Error("memory");
+      const list = parseMemoryListResponse(await response.json());
+      setMemories(list.memories);
+      setMemoryPaused(list.paused);
+      if (editingId === id) {
+        setEditingId(null);
+        setEditDraft("");
+      }
+    } catch {
+      setMemoryError(true);
+    } finally {
+      clearTimeout(timer);
+      setMemoryBusy(false);
+    }
   }
 
   function nextId(prefix: string) {
@@ -356,10 +539,17 @@ function Home({
     function settle(nextState: ConnectionState, replyStatus: "complete" | "failed") {
       if (settled) return;
       settled = true;
-      setMessages((current) => finishReply(current, userId, replyStatus));
+      setMessages((current) => redactRefusedSecrets(finishReply(current, userId, replyStatus)));
       setActiveUserId(null);
       setState(nextState);
       request.current = null;
+      if (nextState === "success") {
+        void refreshMemories();
+        const content = parseRememberContent(text);
+        if (spokenReply === MEMORY_CONFIRM_REPLY && content !== undefined) {
+          promptSensitiveMemoryConfirm(content);
+        }
+      }
     }
 
     function consume() {
@@ -416,7 +606,7 @@ function Home({
       };
       xhr.onerror = () => settle("unreachable", "failed");
       xhr.onabort = () => settle("unreachable", "failed");
-      xhr.send(JSON.stringify({ message: text }));
+      xhr.send(JSON.stringify({ message: text, memoryEnabled }));
     } catch {
       settle("unreachable", "failed");
     }
@@ -523,6 +713,18 @@ function Home({
         >
           {toolsSummary}
         </Text>
+        <Pressable
+          onPress={() => {
+            const next = screen === "chat" ? "memories" : "chat";
+            setScreen(next);
+            if (next === "memories" && state === "success") void refreshMemories();
+          }}
+          accessibilityRole="button"
+          accessibilityLabel={screen === "chat" ? "Show memories" : "Show chat"}
+          style={({ pressed }) => [styles.screenToggle, pressed && styles.buttonPressed]}
+        >
+          <Text style={styles.screenToggleLabel}>{screen === "chat" ? "Memories" : "Chat"}</Text>
+        </Pressable>
       </View>
       <View style={styles.connectionRow}>
         <TextInput
@@ -532,6 +734,12 @@ function Home({
             setState("idle");
             setHydrateError(false);
             setControlError(false);
+            setMemoryError(false);
+            setMemories([]);
+            setMemoryPaused(false);
+            setMemoryReady(false);
+            setScreen("chat");
+            setEditingId(null);
           }}
           placeholder="Local API token"
           placeholderTextColor="#8A8A8A"
@@ -589,6 +797,36 @@ function Home({
           Could not update the task. Try again.
         </Text>
       ) : null}
+      {memoryError ? (
+        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
+          Could not load or update memories. Try again.
+        </Text>
+      ) : null}
+      {screen === "memories" ? (
+        <MemoriesPanel
+          connected={state === "success"}
+          enabled={memoryEnabled}
+          paused={memoryPaused}
+          ready={memoryReady}
+          failed={memoryError && !memoryReady}
+          busy={memoryBusy || state !== "success"}
+          memories={memories}
+          editingId={editingId}
+          editDraft={editDraft}
+          onEditDraft={setEditDraft}
+          onPause={(paused) => void setPaused(paused)}
+          onStartEdit={(item) => {
+            setEditingId(item.id);
+            setEditDraft(item.content);
+          }}
+          onCancelEdit={() => {
+            setEditingId(null);
+            setEditDraft("");
+          }}
+          onSaveEdit={() => void saveEditedMemory()}
+          onDelete={(id) => void deleteMemoryItem(id)}
+        />
+      ) : (
       <FlatList
         ref={list}
         data={messages}
@@ -630,6 +868,7 @@ function Home({
           if (shouldAutoScroll.current) list.current?.scrollToEnd({ animated: true });
         }}
       />
+      )}
       <View style={styles.composer}>
         <TextInput
           value={draft}
@@ -662,6 +901,159 @@ function Home({
         </Pressable>
       </View>
     </KeyboardAvoidingView>
+  );
+}
+
+function MemoriesPanel({
+  connected,
+  enabled,
+  paused,
+  ready,
+  failed,
+  busy,
+  memories,
+  editingId,
+  editDraft,
+  onEditDraft,
+  onPause,
+  onStartEdit,
+  onCancelEdit,
+  onSaveEdit,
+  onDelete,
+}: {
+  connected: boolean;
+  enabled: boolean;
+  paused: boolean;
+  ready: boolean;
+  failed: boolean;
+  busy: boolean;
+  memories: MemoryItem[];
+  editingId: string | null;
+  editDraft: string;
+  onEditDraft: (text: string) => void;
+  onPause: (paused: boolean) => void;
+  onStartEdit: (item: MemoryItem) => void;
+  onCancelEdit: () => void;
+  onSaveEdit: () => void;
+  onDelete: (id: string) => void;
+}) {
+  if (!connected) {
+    return (
+      <View style={styles.emptyChat}>
+        <Text style={styles.emptyText}>Connect to manage memories.</Text>
+      </View>
+    );
+  }
+  if (!ready) {
+    return (
+      <View style={styles.emptyChat}>
+        {failed ? (
+          <Text style={styles.emptyText}>Could not load memories. Try again.</Text>
+        ) : (
+          <ActivityIndicator color="#C4B5FD" accessibilityLabel="Loading memories" />
+        )}
+      </View>
+    );
+  }
+  return (
+    <ScrollView
+      keyboardShouldPersistTaps="handled"
+      keyboardDismissMode="interactive"
+      contentContainerStyle={memories.length === 0 ? styles.emptyChat : styles.memoryList}
+    >
+      <Text style={styles.sectionLabel}>Memories</Text>
+      {enabled ? (
+        <Pressable
+          onPress={() => onPause(!paused)}
+          disabled={busy}
+          accessibilityRole="switch"
+          accessibilityLabel="Pause memory"
+          accessibilityHint="Blocks new captures and retrieval. List, edit and delete stay available."
+          accessibilityState={{ checked: paused, disabled: busy }}
+          style={({ pressed }) => [styles.memoryPause, busy && styles.buttonDisabled, pressed && !busy && styles.buttonPressed]}
+        >
+          <Text style={styles.taskControlLabel}>{paused ? "Memory paused" : "Pause memory"}</Text>
+        </Pressable>
+      ) : (
+        <Text style={styles.memoryMeta}>Memory is off for the Blank setup. Capture and retrieval are disabled.</Text>
+      )}
+      {memories.length === 0 ? (
+        <Text style={styles.emptyText}>No memories yet. Say Merk dir in chat to store one.</Text>
+      ) : (
+        memories.map((item) => {
+          const editing = editingId === item.id;
+          const savedAt = new Date(item.updatedAt).toLocaleString();
+          return (
+            <View key={item.id} style={styles.memoryCard}>
+              {editing ? (
+                <TextInput
+                  value={editDraft}
+                  onChangeText={onEditDraft}
+                  multiline
+                  maxLength={MAX_MEMORY_CONTENT}
+                  keyboardAppearance="dark"
+                  accessibilityLabel="Memory content"
+                  style={styles.memoryInput}
+                />
+              ) : (
+                <Text style={styles.subagentAssignment}>{item.content}</Text>
+              )}
+              <Text style={styles.memoryMeta}>
+                Chat · {savedAt}
+              </Text>
+              <View style={styles.memoryActions}>
+                {editing ? (
+                  <>
+                    <Pressable
+                      onPress={onSaveEdit}
+                      disabled={busy || editDraft.trim() === ""}
+                      accessibilityRole="button"
+                      accessibilityLabel={memoryRowAccessibilityLabel("Save", editDraft, item.updatedAt)}
+                      accessibilityState={{ disabled: busy || editDraft.trim() === "", busy }}
+                      style={[styles.taskControl, (busy || editDraft.trim() === "") && styles.buttonDisabled]}
+                    >
+                      <Text style={styles.taskControlLabel}>Save</Text>
+                    </Pressable>
+                    <Pressable
+                      onPress={onCancelEdit}
+                      disabled={busy}
+                      accessibilityRole="button"
+                      accessibilityLabel="Cancel editing"
+                      accessibilityState={{ disabled: busy }}
+                      style={[styles.taskControl, busy && styles.buttonDisabled]}
+                    >
+                      <Text style={styles.taskControlLabel}>Cancel</Text>
+                    </Pressable>
+                  </>
+                ) : (
+                  <Pressable
+                    onPress={() => onStartEdit(item)}
+                    disabled={busy}
+                    accessibilityRole="button"
+                    accessibilityLabel={memoryRowAccessibilityLabel("Edit", item.content, item.updatedAt)}
+                    accessibilityState={{ disabled: busy, busy }}
+                    style={[styles.taskControl, busy && styles.buttonDisabled]}
+                  >
+                    <Text style={styles.taskControlLabel}>Edit</Text>
+                  </Pressable>
+                )}
+                <Pressable
+                  onPress={() => onDelete(item.id)}
+                  disabled={busy}
+                  accessibilityRole="button"
+                  accessibilityLabel={memoryRowAccessibilityLabel("Delete", item.content, item.updatedAt)}
+                  accessibilityHint="Removes this memory so it cannot be retrieved"
+                  accessibilityState={{ disabled: busy, busy }}
+                  style={[styles.taskControl, busy && styles.buttonDisabled]}
+                >
+                  <Text style={styles.taskControlLabel}>Delete</Text>
+                </Pressable>
+              </View>
+            </View>
+          );
+        })
+      )}
+    </ScrollView>
   );
 }
 
@@ -1005,6 +1397,17 @@ const styles = StyleSheet.create({
     color: "#8A8A8A",
     fontSize: 13,
   },
+  screenToggle: {
+    alignSelf: "flex-start",
+    minHeight: 44,
+    justifyContent: "center",
+    marginTop: 4,
+  },
+  screenToggleLabel: {
+    color: "#C4B5FD",
+    fontSize: 15,
+    fontWeight: "600",
+  },
   connectionRow: {
     flexDirection: "row",
     gap: 8,
@@ -1172,6 +1575,42 @@ const styles = StyleSheet.create({
     color: "#C4B5FD",
     fontSize: 15,
     fontWeight: "600",
+  },
+  memoryList: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    gap: 12,
+  },
+  memoryCard: {
+    gap: 4,
+    paddingBottom: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#3F3F3F",
+  },
+  memoryMeta: {
+    color: "#A3A3A3",
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  memoryPause: {
+    alignSelf: "flex-start",
+    minHeight: 44,
+    minWidth: 44,
+    justifyContent: "center",
+  },
+  memoryActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  memoryInput: {
+    minHeight: 44,
+    borderRadius: 12,
+    backgroundColor: "#1E1E1E",
+    color: "#F5F5F5",
+    fontSize: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   composer: {
     flexDirection: "row",
