@@ -57,8 +57,16 @@ import {
   runDisclosureResearch,
   runPublicPageRead,
   webResearchDepsForTask,
-  type WebResearchDeps,
 } from "./web-research.ts";
+import {
+  invokeBrowserOpen,
+  isBrowserOpenAction,
+  isCookieBrowserPrompt,
+  parsePublicOpenPrompt,
+  runCookieBrowser,
+  runPublicBrowserOpen,
+  type BrowserDeps,
+} from "./browser.ts";
 
 export type ApiConfig = {
   token: string;
@@ -92,7 +100,7 @@ export function createHealthServer(
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore = createTaskStore(),
   memories: MemoryStore = createMemoryStore(),
-  web: WebResearchDeps = {},
+  web: BrowserDeps = {},
   retention: RetentionStore = createRetentionStore(),
 ): Server {
   return createServer((req, res) => {
@@ -106,7 +114,7 @@ function handleRequest(
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore,
   memories: MemoryStore,
-  web: WebResearchDeps,
+  web: BrowserDeps,
   retention: RetentionStore,
 ): void {
   try {
@@ -143,7 +151,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void streamChatReply(req, res, owner, store, memories, web);
+      void streamChatReply(req, res, owner, store, memories, web, retention);
       return;
     }
 
@@ -178,7 +186,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void handleTaskAction(req, res, owner, store, action, web);
+      void handleTaskAction(req, res, owner, store, action, web, retention);
       return;
     }
 
@@ -198,7 +206,8 @@ async function streamChatReply(
   owner: OwnerContext,
   store: TaskStore,
   memories: MemoryStore,
-  web: WebResearchDeps,
+  web: BrowserDeps,
+  retention: RetentionStore,
 ): Promise<void> {
   try {
     const value = await readJsonBody(req);
@@ -230,6 +239,7 @@ async function streamChatReply(
         "memoryEnabled" in value && value.memoryEnabled === true,
         "webResearchEnabled" in value && value.webResearchEnabled === true,
         web,
+        retention,
       ),
     );
   } catch {
@@ -244,7 +254,8 @@ async function handleTaskAction(
   owner: OwnerContext,
   store: TaskStore,
   action: { id: string; kind: "stop" | "resume" | "answer" | "approve" },
-  web: WebResearchDeps,
+  web: BrowserDeps,
+  retention: RetentionStore,
 ): Promise<void> {
   try {
     const body = await readJsonBody(req);
@@ -270,10 +281,20 @@ async function handleTaskAction(
         files: task.approval.files,
         maxCostCents: task.approval.maxCostCents,
       };
+      const live = webResearchDepsForTask(store, task.id, web);
       const invoke =
         stored.actionClass === "data_disclosure"
           ? (actionArg: typeof stored, key: string) =>
-              invokeDataDisclosure(actionArg, key, webResearchDepsForTask(store, task.id, web))
+              isBrowserOpenAction(actionArg)
+                ? invokeBrowserOpen(actionArg, key, {
+                    ...web,
+                    ...live,
+                    store,
+                    owner,
+                    taskId: task.id,
+                    retention,
+                  })
+                : invokeDataDisclosure(actionArg, key, live)
           : mockExternalWrite;
       const updated = await decideApproval(store, owner, task.id, body, stored, invoke);
       writeJson(res, parseSubagentCard(subagentCard(updated)));
@@ -307,7 +328,8 @@ async function chatEvents(
   memories: MemoryStore,
   memoryEnabled: boolean,
   webResearchEnabled: boolean,
-  web: WebResearchDeps,
+  web: BrowserDeps,
+  retention: RetentionStore,
 ): Promise<ChatStreamEvent[]> {
   const remembered = captureExplicitMemory(memories, owner, message, memoryEnabled);
   if (remembered !== undefined) {
@@ -386,6 +408,56 @@ async function chatEvents(
       ];
     } catch {
       return [...deltaEvents("Web research failed."), { type: "done" }];
+    }
+  }
+
+  if (isCookieBrowserPrompt(message)) {
+    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    try {
+      const run = await runCookieBrowser(store, owner, { ...web, retention });
+      if (run.result === undefined) {
+        return [
+          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+          ...deltaEvents("Isolated browser failed."),
+          { type: "done" },
+        ];
+      }
+      return [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents(run.result),
+        { type: "done" },
+      ];
+    } catch {
+      return [...deltaEvents("Isolated browser failed."), { type: "done" }];
+    }
+  }
+
+  const openUrl = parsePublicOpenPrompt(message);
+  if (openUrl !== undefined) {
+    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    try {
+      const run = await runPublicBrowserOpen(store, owner, openUrl, { ...web, retention });
+      if (run.cards.some((card) => card.approval?.state === "pending")) {
+        return [
+          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+          ...deltaEvents("Review the bound request before any user data is sent. No network call has been made."),
+          { type: "done" },
+        ];
+      }
+      if (run.result === undefined) {
+        return [
+          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+          ...deltaEvents("Isolated browser failed."),
+          { type: "done" },
+        ];
+      }
+      return [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents(run.result),
+        { type: "done" },
+      ];
+    } catch {
+      return [...deltaEvents("Isolated browser failed."), { type: "done" }];
     }
   }
 

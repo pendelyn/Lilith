@@ -31,3 +31,15 @@ $env:RUN_DOCKER_TESTS = "1"
 npm run test --workspace=@lilith/api
 Remove-Item Env:RUN_DOCKER_TESTS
 ```
+
+## Isolated browser jobs
+
+Browser jobs reuse `runIsolatedJob` with `--network=none`, the same non-root user, read-only root, dropped capabilities, `no-new-privileges`, no Docker socket, and the 15-minute bound. They do **not** use `--ipc=host`, extra capabilities, host networking, or the host's Chrome/Playwright browsers.
+
+They run a second digest-pinned image, `mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27` (Playwright 1.63.0 / Chromium 1243), because Alpine has no Chromium. `playwright-core@1.63.0` is copied into the job workspace; browsers stay in `/ms-playwright` in the image (`chmod 777`, UID `65532` can read them).
+
+Chromium inside the already-sandboxed container uses `--no-sandbox` and `--disable-dev-shm-usage` because all capabilities are dropped and `/dev/shm` is not a large writable exec mount. That does not loosen the container boundary.
+
+**Pid limit (browser jobs only):** Chromium headless_shell at the CLI `--pids-limit=64` fails with `pthread_create: Resource temporarily unavailable` and `Zygote could not fork` (dump-dom timed out). dump-dom succeeded at 128 pids / 512 MiB. Node + `playwright-core` + Chromium at 128 pids hung until the job timeout, so browser jobs use `--pids-limit=256`. CLI jobs remain at 64 pids. Memory stays 512 MiB.
+
+Page network is a host-owned file protocol on the workspace bind: before the container starts, the API creates exclusive regular files under `.lilith-net` and `.lilith-browser` and keeps those file descriptors. The worker overwrites the host-owned inbox; the API reads and writes only through those fds, so a container-planted symlink or parent junction cannot redirect host reads or writes. The API allows only GET of an already-disclosed HTTPS URL through `resolvePublicHttps` + `pinnedHttpsGet`. Stdin is closed after start because keeping `docker start --attach --interactive` stdin open hung Chromium. Other hosts, extra query/path, POST, cookies, WebSockets, downloads, service workers, and redirects are denied. `file://` is limited to the cookie fixture `/workspace/cookie.html`. Workspace cleanup unlinks junctions/symlinks and does not follow them.

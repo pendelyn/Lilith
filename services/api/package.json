@@ -8,6 +8,7 @@
     "test": "node --test src/*.test.ts"
   },
   "dependencies": {
-    "@lilith/contracts": "*"
+    "@lilith/contracts": "*",
+    "playwright-core": "1.63.0"
   }
 }

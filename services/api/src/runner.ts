@@ -23,6 +23,11 @@ export type IsolatedJob = {
   workspace: string;
   command: readonly string[];
   timeoutMs?: number;
+  signal?: AbortSignal;
+  image?: string;
+  memory?: string;
+  pidsLimit?: number;
+  containerEnv?: Record<string, string>;
 };
 
 export type JobResult = {
@@ -62,7 +67,10 @@ export class JobCredentialBroker {
   }
 }
 
-export function dockerArgs(job: Pick<IsolatedJob, "workspace" | "command">, name: string): string[] {
+export function dockerArgs(
+  job: Pick<IsolatedJob, "workspace" | "command" | "image" | "memory" | "pidsLimit" | "containerEnv">,
+  name: string,
+): string[] {
   const workspaceRoot = realpathSync(RUNNER_WORKSPACES_ROOT);
   const workspace = realpathSync(job.workspace);
   const relation = relative(workspaceRoot, workspace);
@@ -76,6 +84,14 @@ export function dockerArgs(job: Pick<IsolatedJob, "workspace" | "command">, name
     throw new Error("Job requires one dedicated workspace directly below the runner workspace root");
   }
   if (workspace.includes(",")) throw new Error("Docker mount paths must not contain commas");
+  const image = job.image ?? RUNNER_IMAGE;
+  if (!/@sha256:[a-f0-9]{64}$/.test(image)) throw new Error("Runner image must be digest-pinned");
+  const memory = job.memory ?? "512m";
+  if (!/^\d+[mMgG]$/.test(memory)) throw new Error("Invalid job memory limit");
+  const pidsLimit = job.pidsLimit ?? 64;
+  if (!Number.isInteger(pidsLimit) || pidsLimit < 1 || pidsLimit > 1024) {
+    throw new Error("Invalid job pids limit");
+  }
 
   return [
     "create",
@@ -89,16 +105,17 @@ export function dockerArgs(job: Pick<IsolatedJob, "workspace" | "command">, name
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
     "--network=none",
-    "--pids-limit=64",
+    `--pids-limit=${pidsLimit}`,
     "--cpus=1",
-    "--memory=512m",
+    `--memory=${memory}`,
     "--tmpfs",
     `/tmp:rw,noexec,nosuid,size=64m,uid=${RUNNER_UID},gid=${RUNNER_GID}`,
     "--mount",
     `type=bind,src=${workspace},dst=/workspace`,
     "--workdir",
     "/workspace",
-    RUNNER_IMAGE,
+    ...containerEnvArgs(job.containerEnv),
+    image,
     ...job.command,
   ];
 }
@@ -116,6 +133,7 @@ export async function runIsolatedJob(
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) {
     throw new Error("Job timeout must be between 1 ms and 15 minutes");
   }
+  if (job.signal?.aborted) throw new Error("Docker job cancelled");
 
   await mkdir(RUNNER_WORKSPACES_ROOT, { recursive: true, mode: 0o700 });
   const name = `lilith-job-${randomUUID()}`;
@@ -132,7 +150,7 @@ export async function runIsolatedJob(
       env: dockerEnvironment(),
     });
     created = true;
-    return await startAttached(name, secret, timeoutMs);
+    return await startAttached(name, secret, timeoutMs, job.signal);
   } finally {
     if (createStarted) await removeContainer(name, !created);
   }
@@ -142,6 +160,7 @@ function startAttached(
   name: string,
   secret: string | undefined,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<JobResult> {
   return new Promise((resolve, reject) => {
     const child = spawn("docker", ["start", "--attach", "--interactive", name], {
@@ -153,11 +172,15 @@ function startAttached(
     let stderr = "";
     let settled = false;
     const timer = setTimeout(() => finish(new Error("Docker job timed out")), timeoutMs);
+    const onAbort = () => finish(new Error("Docker job cancelled"));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
 
     function finish(error?: Error) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       if (error) {
         child.kill();
         reject(new Error(redact(error.message, secret)));
@@ -220,6 +243,18 @@ async function removeContainer(name: string, retryCreationRace: boolean): Promis
     throw new Error("Cannot verify isolated job container removal");
   }
   throw new Error("Failed to remove isolated job container");
+}
+
+function containerEnvArgs(env: Record<string, string> | undefined): string[] {
+  if (env === undefined) return [];
+  const args: string[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(name) || /[\r\n]/.test(value) || value.length > 4_000) {
+      throw new Error("Invalid container environment");
+    }
+    args.push("--env", `${name}=${value}`);
+  }
+  return args;
 }
 
 function dockerEnvironment(): NodeJS.ProcessEnv {
