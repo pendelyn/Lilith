@@ -18,6 +18,7 @@ import {
   assertApprovalOpen,
   createParentTask,
   createTaskStore,
+  deleteOwnerTasks,
   openApproval,
   mockApprovalAction,
   recordCost,
@@ -688,6 +689,44 @@ test("persistence failure preserves disk and in-memory state", () => {
     assertApprovalOpen(store, owner, approval.id);
     assert.equal(store.approvals.get(approval.id), childId);
     assert.deepEqual(readFileSync(persistPath), disk);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("account task wipe persists before abort and reloads empty", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-task-wipe-"));
+  const persistPath = join(dir, "state.json");
+  try {
+    const store = createTaskStore({ persistPath });
+    const childId = heldChildId(store);
+    const parent = parentOf(store, childId);
+    const approval = openApproval(store, owner, childId, mockApprovalAction());
+    const signal = researchAbortSignal(store, childId);
+    const disk = readFileSync(persistPath);
+
+    (store as { persistPath?: string }).persistPath = join(persistPath, "blocked.json");
+    assert.throws(() => deleteOwnerTasks(store, owner));
+    assert.equal(signal.aborted, false);
+    assert.equal(store.tasks.has(childId), true);
+    assert.equal(store.tasks.has(parent.id), true);
+    assertApprovalOpen(store, owner, approval.id);
+    assert.equal(store.aborts.has(childId), true);
+    assert.deepEqual(readFileSync(persistPath), disk);
+
+    const reloaded = createTaskStore({ persistPath });
+    assert.equal(reloaded.tasks.has(childId), true);
+    assert.equal(reloaded.tasks.get(childId)?.state, "needs_input");
+    assert.equal(reloaded.approvals.get(approval.id), childId);
+
+    (store as { persistPath?: string }).persistPath = persistPath;
+    deleteOwnerTasks(store, owner);
+    assert.equal(signal.aborted, true);
+    assert.equal(store.tasks.has(childId), false);
+    assert.equal(store.approvals.size, 0);
+    const wiped = createTaskStore({ persistPath });
+    assert.equal(wiped.tasks.size, 0);
+    assert.equal(wiped.approvals.size, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

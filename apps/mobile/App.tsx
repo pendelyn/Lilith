@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type QuestionAnswer, type TaskState } from "@lilith/contracts";
+import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseAccountDeleteResponse, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type QuestionAnswer, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -55,6 +55,20 @@ import {
   replaceMemory,
   type MemoryItem,
 } from "./memory";
+import {
+  ACCOUNT_DELETION_NOTICE,
+  ACCOUNT_STORAGE_KEYS,
+  PROVIDER_SIDE_LIMIT,
+  RETENTION_SCHEDULE,
+  clearLocalAccountData,
+  createAccountPurge,
+  enqueueAccountWrite,
+  markAccountLocalCleared,
+  markAccountServerDeleted,
+  shouldPersistAccountData,
+  type AccountPurge,
+  type PersistQueue,
+} from "./privacy";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
@@ -97,8 +111,9 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [identity, setIdentity] = useState<AgentIdentity | null>(null);
   const [persistError, setPersistError] = useState(false);
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const saveRevision = useRef(0);
+  const accountPurge = useRef(createAccountPurge());
 
   useEffect(() => {
     let active = true;
@@ -117,15 +132,24 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (identity !== null || !accountPurge.current.localCleared) return;
+    accountPurge.current.serverDeleted = false;
+    accountPurge.current.localCleared = false;
+  }, [identity]);
+
   async function persist(next: AgentIdentity) {
+    if (identity === null) {
+      accountPurge.current.serverDeleted = false;
+      accountPurge.current.localCleared = false;
+    }
+    if (!shouldPersistAccountData(accountPurge.current)) return;
     const revision = ++saveRevision.current;
     setIdentity(next);
-    const save = saveQueue.current
-      .catch(() => undefined)
-      .then(() => AsyncStorage.setItem(IDENTITY_STORAGE_KEY, serializeIdentity(next)));
-    saveQueue.current = save;
     try {
-      await save;
+      await enqueueAccountWrite(saveQueue, accountPurge.current, () =>
+        AsyncStorage.setItem(IDENTITY_STORAGE_KEY, serializeIdentity(next)),
+      );
       if (revision === saveRevision.current) setPersistError(false);
     } catch {
       if (revision === saveRevision.current) setPersistError(true);
@@ -146,7 +170,17 @@ export default function App() {
           <Home
             identity={identity}
             persistError={persistError}
+            identitySaveQueue={saveQueue}
+            accountPurge={accountPurge.current}
             onIdentityChange={(next) => void persist(next)}
+            onAccountDeleted={() => {
+              const revision = ++saveRevision.current;
+              markAccountLocalCleared(accountPurge.current);
+              if (revision === saveRevision.current) {
+                setPersistError(false);
+                setIdentity(null);
+              }
+            }}
           />
         )}
       </SafeAreaView>
@@ -212,11 +246,17 @@ function Onboarding({ onComplete }: { onComplete: (identity: AgentIdentity) => v
 function Home({
   identity,
   persistError,
+  identitySaveQueue,
+  accountPurge,
   onIdentityChange,
+  onAccountDeleted,
 }: {
   identity: AgentIdentity;
   persistError: boolean;
+  identitySaveQueue: PersistQueue;
+  accountPurge: AccountPurge;
   onIdentityChange: (identity: AgentIdentity) => void;
+  onAccountDeleted: () => void;
 }) {
   const [name, setName] = useState(identity.name);
   const [token, setToken] = useState("");
@@ -229,16 +269,19 @@ function Home({
   const [hydrateError, setHydrateError] = useState(false);
   const [controlError, setControlError] = useState(false);
   const [memoryError, setMemoryError] = useState(false);
+  const [accountError, setAccountError] = useState(false);
+  const [accountBusy, setAccountBusy] = useState(false);
+  const [serverDeleted, setServerDeleted] = useState(accountPurge.serverDeleted);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [memoryPaused, setMemoryPaused] = useState(false);
   const [memoryReady, setMemoryReady] = useState(false);
   const [memoryBusy, setMemoryBusy] = useState(false);
-  const [screen, setScreen] = useState<"chat" | "memories">("chat");
+  const [screen, setScreen] = useState<"chat" | "memories" | "privacy">("chat");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
   const pendingTaskLock = useRef<string | null>(null);
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const saveRevision = useRef(0);
   const request = useRef<XMLHttpRequest | null>(null);
   const list = useRef<FlatList<ChatMessage> | null>(null);
@@ -271,13 +314,11 @@ function Home({
   }, []);
 
   useEffect(() => {
-    if (!chatReady) return;
+    if (!chatReady || !shouldPersistAccountData(accountPurge)) return;
     const revision = ++saveRevision.current;
-    const save = saveQueue.current
-      .catch(() => undefined)
-      .then(() => AsyncStorage.setItem(CHAT_STORAGE_KEY, serializeChat(messages)));
-    saveQueue.current = save;
-    void save.then(
+    void enqueueAccountWrite(saveQueue, accountPurge, () =>
+      AsyncStorage.setItem(CHAT_STORAGE_KEY, serializeChat(messages)),
+    ).then(
       () => {
         if (revision === saveRevision.current) setChatPersistError(false);
       },
@@ -285,7 +326,7 @@ function Home({
         if (revision === saveRevision.current) setChatPersistError(true);
       },
     );
-  }, [chatReady, messages]);
+  }, [accountPurge, chatReady, messages]);
 
   function commitName(raw: string) {
     const next = identityFromChoice(raw, identity.mode);
@@ -298,6 +339,7 @@ function Home({
     setHydrateError(false);
     setControlError(false);
     setMemoryError(false);
+    setAccountError(false);
     setMemories([]);
     setMemoryPaused(false);
     setMemoryReady(false);
@@ -513,6 +555,42 @@ function Home({
     }
   }
 
+  async function deleteAccount() {
+    if (accountBusy || accountPurge.localCleared) return;
+    if (!accountPurge.serverDeleted && state !== "success") return;
+    setAccountBusy(true);
+    setAccountError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      if (!accountPurge.serverDeleted) {
+        const response = await fetch(`${API_URL}/account/delete`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token.trim()}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ consent: true }),
+          signal: controller.signal,
+        });
+        if (response.status !== 200) throw new Error("account");
+        parseAccountDeleteResponse(await response.json());
+        request.current?.abort();
+        markAccountServerDeleted(accountPurge);
+        setServerDeleted(true);
+      }
+      await clearLocalAccountData([saveQueue, identitySaveQueue], () =>
+        AsyncStorage.multiRemove([...ACCOUNT_STORAGE_KEYS]),
+      );
+      onAccountDeleted();
+    } catch {
+      setAccountError(true);
+    } finally {
+      clearTimeout(timer);
+      if (!accountPurge.localCleared) setAccountBusy(false);
+    }
+  }
+
   function nextId(prefix: string) {
     idSequence.current += 1;
     return `${prefix}-${Date.now()}-${idSequence.current}`;
@@ -706,7 +784,9 @@ function Home({
           onChangeText={setName}
           onEndEditing={() => commitName(name)}
           maxLength={MAX_NAME_LENGTH}
+          editable={!accountBusy && !serverDeleted}
           accessibilityLabel="Companion name"
+          accessibilityState={{ disabled: accountBusy || serverDeleted }}
           style={styles.headerName}
         />
         <Text
@@ -715,18 +795,27 @@ function Home({
         >
           {toolsSummary}
         </Text>
-        <Pressable
-          onPress={() => {
-            const next = screen === "chat" ? "memories" : "chat";
-            setScreen(next);
-            if (next === "memories" && state === "success") void refreshMemories();
-          }}
-          accessibilityRole="button"
-          accessibilityLabel={screen === "chat" ? "Show memories" : "Show chat"}
-          style={({ pressed }) => [styles.screenToggle, pressed && styles.buttonPressed]}
-        >
-          <Text style={styles.screenToggleLabel}>{screen === "chat" ? "Memories" : "Chat"}</Text>
-        </Pressable>
+        <View accessibilityRole="tablist" accessibilityLabel="Screens" style={styles.screenTabs}>
+          {(["chat", "memories", "privacy"] as const).map((id) => {
+            const selected = screen === id;
+            const label = id === "chat" ? "Chat" : id === "memories" ? "Memories" : "Privacy";
+            return (
+              <Pressable
+                key={id}
+                onPress={() => {
+                  setScreen(id);
+                  if (id === "memories" && state === "success") void refreshMemories();
+                }}
+                accessibilityRole="tab"
+                accessibilityLabel={`Show ${label.toLowerCase()}`}
+                accessibilityState={{ selected }}
+                style={({ pressed }) => [styles.screenToggle, pressed && styles.buttonPressed]}
+              >
+                <Text style={[styles.screenToggleLabel, selected && styles.screenTabSelected]}>{label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
       </View>
       <View style={styles.connectionRow}>
         <TextInput
@@ -737,6 +826,7 @@ function Home({
             setHydrateError(false);
             setControlError(false);
             setMemoryError(false);
+            setAccountError(false);
             setMemories([]);
             setMemoryPaused(false);
             setMemoryReady(false);
@@ -784,6 +874,7 @@ function Home({
       >
         {STATUS_TEXT[state]}
       </Text>
+      <Text style={styles.privacyNotice}>{PROVIDER_SIDE_LIMIT}</Text>
       {persistError || chatPersistError ? (
         <Text accessibilityLiveRegion="polite" style={styles.statusError}>
           Could not save locally. Try again.
@@ -804,7 +895,23 @@ function Home({
           Could not load or update memories. Try again.
         </Text>
       ) : null}
-      {screen === "memories" ? (
+      {accountError ? (
+        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
+          Could not delete the account. Try again.
+        </Text>
+      ) : null}
+      {screen === "privacy" ? (
+        <PrivacyPanel
+          connected={state === "success" || serverDeleted}
+          busy={accountBusy}
+          onDelete={() => {
+            Alert.alert("Delete account", ACCOUNT_DELETION_NOTICE, [
+              { text: "Cancel", style: "cancel" },
+              { text: "Delete account", style: "destructive", onPress: () => void deleteAccount() },
+            ]);
+          }}
+        />
+      ) : screen === "memories" ? (
         <MemoriesPanel
           connected={state === "success"}
           enabled={memoryEnabled}
@@ -903,6 +1010,56 @@ function Home({
         </Pressable>
       </View>
     </KeyboardAvoidingView>
+  );
+}
+
+function PrivacyPanel({
+  connected,
+  busy,
+  onDelete,
+}: {
+  connected: boolean;
+  busy: boolean;
+  onDelete: () => void;
+}) {
+  const locked = busy || !connected;
+  return (
+    <ScrollView
+      keyboardShouldPersistTaps="handled"
+      keyboardDismissMode="interactive"
+      contentContainerStyle={styles.memoryList}
+    >
+      <Text style={styles.sectionLabel} accessibilityRole="header">
+        Privacy
+      </Text>
+      {RETENTION_SCHEDULE.map((line) => (
+        <Text key={line} style={styles.privacyNotice}>
+          {line}
+        </Text>
+      ))}
+      <Text style={styles.sectionLabel} accessibilityRole="header">
+        Provider copies
+      </Text>
+      <Text style={styles.privacyNotice}>{PROVIDER_SIDE_LIMIT}</Text>
+      <Text style={styles.sectionLabel} accessibilityRole="header">
+        Delete account
+      </Text>
+      <Text style={styles.privacyNotice}>{ACCOUNT_DELETION_NOTICE}</Text>
+      {!connected ? (
+        <Text style={styles.memoryMeta}>Connect to delete this account on the server.</Text>
+      ) : null}
+      <Pressable
+        onPress={onDelete}
+        disabled={locked}
+        accessibilityRole="button"
+        accessibilityLabel="Delete account"
+        accessibilityHint="Removes chats, tasks, and memories immediately. Backups expire within 30 days."
+        accessibilityState={{ disabled: locked, busy }}
+        style={({ pressed }) => [styles.taskControl, locked && styles.buttonDisabled, pressed && !locked && styles.buttonPressed]}
+      >
+        <Text style={styles.taskControlLabel}>Delete account</Text>
+      </Pressable>
+    </ScrollView>
   );
 }
 
@@ -1415,6 +1572,14 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginTop: 4,
   },
+  screenTabs: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 16,
+  },
+  screenTabSelected: {
+    color: "#F5F5F5",
+  },
   screenToggleLabel: {
     color: "#C4B5FD",
     fontSize: 15,
@@ -1603,6 +1768,11 @@ const styles = StyleSheet.create({
     color: "#A3A3A3",
     fontSize: 13,
     lineHeight: 18,
+  },
+  privacyNotice: {
+    color: "#D4D4D4",
+    fontSize: 15,
+    lineHeight: 22,
   },
   memoryPause: {
     alignSelf: "flex-start",
