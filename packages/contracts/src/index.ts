@@ -29,6 +29,24 @@ export {
   type MemoryRetrieveRequest,
   type MemoryRetrieveResponse,
 } from "./memory.ts";
+export {
+  ACCOUNT_DELETION_NOTICE,
+  AUDIT_TTL_MS,
+  BACKUP_TTL_MS,
+  DAY_MS,
+  PROVIDER_SIDE_LIMIT,
+  RETENTION_KINDS,
+  RETENTION_SCHEDULE,
+  SCREENSHOT_TTL_MS,
+  TASK_FILE_TTL_MS,
+  parseAccountDeleteRequest,
+  parseAccountDeleteResponse,
+  parseRetentionKind,
+  retentionTtlMs,
+  type AccountDeleteRequest,
+  type AccountDeleteResponse,
+  type RetentionKind,
+} from "./retention.ts";
 
 export type HealthResponse = {
   status: "ok";

@@ -161,6 +161,16 @@ export function deleteMemory(store: MemoryStore, owner: OwnerContext, memoryId: 
   }
 }
 
+export function deleteOwnerMemories(store: MemoryStore, owner: OwnerContext): void {
+  transact(store, () => {
+    for (const memory of [...store.memories.values()]) {
+      if (memory.ownerId === owner.ownerId) store.memories.delete(memory.id);
+    }
+    store.pausedOwnerIds.delete(owner.ownerId);
+  });
+  store.pendingByOwner.delete(owner.ownerId);
+}
+
 export function captureExplicitMemory(
   store: MemoryStore,
   owner: OwnerContext,

@@ -471,6 +471,25 @@ export function listResearchCards(store: TaskStore, owner: OwnerContext): Subage
   return cards;
 }
 
+export function deleteOwnerTasks(store: TaskStore, owner: OwnerContext): void {
+  const abortedIds = transact(store, () => {
+    const ids: string[] = [];
+    for (const task of [...store.tasks.values()]) {
+      if (task.ownerId !== owner.ownerId) continue;
+      if (task.approval !== undefined) store.approvals.delete(task.approval.id);
+      store.tasks.delete(task.id);
+      ids.push(task.id);
+    }
+    return ids;
+  });
+  for (const id of abortedIds) {
+    const controller = store.aborts.get(id);
+    if (controller === undefined) continue;
+    controller.abort();
+    store.aborts.delete(id);
+  }
+}
+
 export function subagentCard(task: Task): SubagentCard {
   if (task.role !== "research" || task.parentTaskId === undefined) {
     throw new Error("Task is not a research subagent");

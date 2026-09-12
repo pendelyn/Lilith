@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
+  parseAccountDeleteRequest,
+  parseAccountDeleteResponse,
   parseHealthResponse,
   parseMemoryConfirmRequest,
   parseMemoryConfirmResponse,
@@ -45,6 +47,7 @@ import {
   subagentCard,
   type TaskStore,
 } from "./tasks.ts";
+import { createRetentionStore, deleteAccount, type RetentionStore } from "./retention.ts";
 import {
   WEB_RESEARCH_OFF_REPLY,
   invokeDataDisclosure,
@@ -90,9 +93,10 @@ export function createHealthServer(
   store: TaskStore = createTaskStore(),
   memories: MemoryStore = createMemoryStore(),
   web: WebResearchDeps = {},
+  retention: RetentionStore = createRetentionStore(),
 ): Server {
   return createServer((req, res) => {
-    handleRequest(req, res, auth, store, memories, web);
+    handleRequest(req, res, auth, store, memories, web, retention);
   });
 }
 
@@ -103,6 +107,7 @@ function handleRequest(
   store: TaskStore,
   memories: MemoryStore,
   web: WebResearchDeps,
+  retention: RetentionStore,
 ): void {
   try {
     const owner = authenticateOwner(req.headers.authorization, auth);
@@ -113,6 +118,12 @@ function handleRequest(
     }
 
     const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (blocksOwnerApi(pathname, retention, owner)) {
+      res.writeHead(409);
+      res.end();
+      return;
+    }
+
     if (pathname === "/health") {
       if (req.method !== "GET") {
         res.writeHead(405, { Allow: "GET" });
@@ -137,6 +148,16 @@ function handleRequest(
     }
 
     if (handleMemoryRoute(req, res, owner, memories, pathname)) {
+      return;
+    }
+
+    if (pathname === "/account/delete") {
+      if (req.method !== "POST") {
+        res.writeHead(405, { Allow: "POST" });
+        res.end();
+        return;
+      }
+      void handleAccountDelete(req, res, owner, store, memories, retention);
       return;
     }
 
@@ -427,6 +448,32 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(raw);
 }
 
+async function handleAccountDelete(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  store: TaskStore,
+  memories: MemoryStore,
+  retention: RetentionStore,
+): Promise<void> {
+  try {
+    parseAccountDeleteRequest(await readJsonBody(req));
+    deleteAccount(retention, store, memories, owner);
+    writeJson(res, parseAccountDeleteResponse({ deleted: true }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const status =
+      message === "Invalid AccountDeleteRequest" ||
+      message === "Request too large" ||
+      message.startsWith("Invalid") ||
+      error instanceof SyntaxError
+        ? 400
+        : 500;
+    if (!res.headersSent) res.writeHead(status);
+    res.end();
+  }
+}
+
 function taskAction(pathname: string): { id: string; kind: "stop" | "resume" | "answer" | "approve" } | undefined {
   const match = /^\/tasks\/([^/]+)\/(stop|resume|answer|approve)$/.exec(pathname);
   if (match?.[1] === undefined || (match[2] !== "stop" && match[2] !== "resume" && match[2] !== "answer" && match[2] !== "approve")) {
@@ -610,4 +657,9 @@ function isEmptyObject(value: unknown): boolean {
 function writeJson(res: ServerResponse, value: unknown): void {
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(value));
+}
+
+function blocksOwnerApi(pathname: string, retention: RetentionStore, owner: OwnerContext): boolean {
+  // /health has no owner payload; authenticated POST /account/delete is the explicit retry.
+  return pathname !== "/health" && pathname !== "/account/delete" && retention.pendingOwnerDeletes.has(owner.ownerId);
 }

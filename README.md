@@ -103,6 +103,24 @@ Default `npm test` does not use the public internet. Live check: `$env:LILITH_LI
 
 This is not a search engine, browser, or Codex tool. Isolated CLI jobs keep `--network=none`.
 
+## Data retention (Issue #16)
+
+An hourly expiry job (also on API startup) enforces TTLs on **real** files this process already writes, plus screenshot bytes when a later P1 browser worker stores them:
+
+- Runner workspaces under `.lilith-jobs` are temporary task files and expire after 30 days.
+- Crash copies `.lilith-tasks.json.bak` and `.lilith-memories.json.bak` are backups and expire after 30 days.
+- Screenshots expire after 7 days once stored under `.lilith-retention/`. There is no screenshot producer in P0.
+- Security audit records expire after 90 days.
+- Live chats, `.lilith-tasks.json`, and `.lilith-memories.json` stay until you delete them. Expiry never opens those stores.
+
+Unreferenced files under `.lilith-retention/` are swept on the same job. Failed file deletes are retried; a pending account wipe is persisted and finished after restart so deleted tasks and memories cannot come back from disk.
+
+**Privacy** (before Connect and in the Privacy tab) states that no model provider is connected, and that copies a later provider stores follow that provider's rules — Lilith cannot delete them. Issue #8 stays deactivated. `LOCAL_API_TOKEN` is a server environment secret, not an account password; account deletion does not revoke or rotate it.
+
+**Delete account** requires Connect, then a confirmation. It removes chats, tasks, memories, screenshots, and temporary task files immediately. Crash backups expire within 30 days; audit records stay until 90 days. Local chat and identity keys are cleared only after the server accepts deletion; if that local wipe fails, the error stays visible so you can retry without rewriting storage.
+
+Retention metadata is `.lilith-retention.json` with optional files under `.lilith-retention/`. Both are gitignored.
+
 ## Physical iPhone (Expo Go)
 
 Expo's tunnel does **not** carry this API. Phone and PC must share Wi-Fi, and the API must listen on the LAN.
