@@ -103,13 +103,23 @@ Default `npm test` does not use the public internet. Live check: `$env:LILITH_LI
 
 This is not a search engine, browser, or Codex tool. Isolated CLI jobs keep `--network=none`.
 
+## Isolated browser (Issue #18)
+
+Recommended setup enables the same web-research flag that gates `Lies`. There is still **no live model** and **no desktop control**. Issue #8 stays deactivated. Page text is untrusted and cannot change tools, identity, or memories. Timeline screenshots in chat are Issue #19; form submit and other outward clicks are Issue #20.
+
+Send exactly `Öffne die Cookie-Testseite` to open a workspace HTML fixture in a short-lived Chromium job, dismiss only the cookie dialog, then find/scroll/read. Send `Öffne https://example.com/` (any user-supplied HTTPS URL) for the same `#13` `data_disclosure` preview as `Lies` **before** the worker starts; **Reject** makes no call, **Approve once** opens that exact URL.
+
+The browser container keeps `--network=none`. Chromium cannot open sockets. Document bytes come only from the existing SSRF-pinned HTTPS GET, and only for the URL that already passed disclosure (or the three P0 color fixtures). Subrequests to other hosts, paths, or query strings are denied without DNS. Cookies, POST, WebSockets, downloads, service workers, and redirects stay blocked. The cookie clicker only targets accept/agree controls inside a cookie dialog — not a random OK/Accept/Allow on the page. Host protocol files are created by the API before the job starts and used through kept file descriptors, so a container-planted symlink cannot redirect host reads or writes. `file://` is only the cookie fixture.
+
+Jobs use digest-pinned `mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27` with Chromium headless shell. Host Chrome/Edge/Firefox and `%LOCALAPPDATA%\ms-playwright` are not used. Stop aborts the Docker job and removes the container. Browser jobs use a 256-pid cgroup because 64 pids cannot fork a renderer and 128 pids hung with Playwright; CLI jobs stay at 64 pids and Alpine. Default `npm test` does not start Docker. Real check: `$env:RUN_DOCKER_TESTS='1'; npm run test --workspace=@lilith/api`. Optional live `Öffne https://example.com/` also needs `$env:LILITH_LIVE_WEB_TESTS='1'`.
+
 ## Data retention (Issue #16)
 
 An hourly expiry job (also on API startup) enforces TTLs on **real** files this process already writes, plus screenshot bytes when a later P1 browser worker stores them:
 
 - Runner workspaces under `.lilith-jobs` are temporary task files and expire after 30 days.
 - Crash copies `.lilith-tasks.json.bak` and `.lilith-memories.json.bak` are backups and expire after 30 days.
-- Screenshots expire after 7 days once stored under `.lilith-retention/`. There is no screenshot producer in P0.
+- Screenshots expire after 7 days once stored under `.lilith-retention/`. The Issue #18 browser worker writes JPEG bytes there; they are not shown in chat.
 - Security audit records expire after 90 days.
 - Live chats, `.lilith-tasks.json`, and `.lilith-memories.json` stay until you delete them. Expiry never opens those stores.
 

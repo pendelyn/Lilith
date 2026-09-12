@@ -162,6 +162,14 @@ export async function readPublicHttps(
   request: PublicReadRequest,
   deps: WebResearchDeps = {},
 ): Promise<{ url: string; text: string }> {
+  const page = await fetchPublicHttpsPage(request, deps);
+  return { url: page.url, text: page.text };
+}
+
+export async function fetchPublicHttpsPage(
+  request: PublicReadRequest,
+  deps: WebResearchDeps = {},
+): Promise<{ url: string; status: number; headers: Record<string, string>; text: string }> {
   if (hasMarkedUserData(request.userData)) {
     throw new Error("User data requires approval");
   }
@@ -342,7 +350,7 @@ export function offlineWebResearchDeps(options?: {
 async function fetchPublicPage(
   request: PublicReadRequest,
   deps: WebResearchDeps,
-): Promise<{ url: string; text: string }> {
+): Promise<{ url: string; status: number; headers: Record<string, string>; text: string }> {
   // Generic HTTPS reader. Chat and memories are never attached. User-facing
   // dispatch must apply disclosure policy before DNS or HTTPS; this path is the
   // consent-free fixture fetch and the post-consent invoke.
@@ -362,7 +370,7 @@ async function fetchPublicPage(
   });
   if (response.status >= 300 && response.status < 400) throw new Error("Redirect rejected");
   if (response.status !== 200) throw new Error("Fetch failed");
-  return { url: prepared.url.href, text: response.body };
+  return { url: prepared.url.href, status: response.status, headers: response.headers, text: response.body };
 }
 
 function prepareRequest(request: PublicReadRequest): {

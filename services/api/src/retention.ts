@@ -81,7 +81,7 @@ export function createRetentionStore(options?: {
 export function putArtifact(
   store: RetentionStore,
   owner: OwnerContext,
-  input: { kind: RetentionKind; body?: string },
+  input: { kind: RetentionKind; body?: string | Uint8Array },
 ): RetentionRecord {
   const kind = parseRetentionKind(input.kind);
   const body = input.body ?? "";

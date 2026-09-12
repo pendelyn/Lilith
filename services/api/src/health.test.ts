@@ -38,6 +38,12 @@ import {
   colorFixtureUrls,
   offlineWebResearchDeps,
 } from "./web-research.ts";
+import {
+  COOKIE_BROWSER_PROMPT,
+  COOKIE_FIND_TOKEN,
+  type BrowserDeps,
+  type BrowserDriver,
+} from "./browser.ts";
 
 const AUTH = { Authorization: "Bearer secret-token" };
 
@@ -1043,6 +1049,99 @@ test("arbitrary chat URL makes zero DNS or connect until one-time consent", asyn
   }, undefined, web);
 });
 
+test("cookie test page prompt is gated on web research and does not fetch", async () => {
+  let fetches = 0;
+  const driver: BrowserDriver = {
+    async run() {
+      return {
+        results: [
+          { op: "dismissCookies", dismissed: true, name: "Accept cookies" },
+          { op: "find", text: COOKIE_FIND_TOKEN, found: true },
+          { op: "scroll", scrollY: 800 },
+          { op: "read", text: `cookies-accepted\n${UNTRUSTED_PAGE_TEXT}` },
+        ],
+      };
+    },
+  };
+  const web: BrowserDeps = {
+    ...offlineWebResearchDeps({
+      connect: () => {
+        fetches += 1;
+      },
+    }),
+    driver,
+  };
+  await withServer(async (base) => {
+    const off = await chatEvents(base, COOKIE_BROWSER_PROMPT);
+    assert.equal(off.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join(""), WEB_RESEARCH_OFF_REPLY);
+    const events = await chatEvents(base, COOKIE_BROWSER_PROMPT, { webResearchEnabled: true });
+    const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+    assert.match(reply, /cookies-accepted/);
+    assert.match(reply, /FIND-TOKEN-18: yes/);
+    assert.equal(reply.includes("No model is connected yet"), false);
+    assert.equal(fetches, 0);
+  }, undefined, web);
+});
+
+test("Öffne URL uses disclosure before any browser fetch", async () => {
+  const url = "https://example.com/";
+  let fetches = 0;
+  const driver: BrowserDriver = {
+    async run(plan) {
+      assert.deepEqual(plan.approved, [url]);
+      fetches += 1;
+      return { results: [{ op: "read", text: "Example Domain" }] };
+    },
+  };
+  const web: BrowserDeps = {
+    ...offlineWebResearchDeps({
+      pages: { [url]: "Example Domain" },
+      connect: () => {
+        fetches += 1;
+      },
+    }),
+    driver,
+  };
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Öffne ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    assert.equal(card.approval.actionClass, "data_disclosure");
+    assert.equal(card.approval.operation, "OPEN /");
+    assert.equal(fetches, 0);
+    const rejected = parseSubagentCard(
+      await readJson(
+        await fetch(`${base}/tasks/${card.id}/approve`, {
+          method: "POST",
+          headers: { ...AUTH, "Content-Type": "application/json" },
+          body: JSON.stringify({ approval: card.approval, consent: false }),
+        }),
+      ),
+    );
+    assert.match(rejected.result ?? "", /No call/);
+    assert.equal(fetches, 0);
+  }, undefined, web);
+
+  fetches = 0;
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Öffne ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const updated = parseSubagentCard(
+      await readJson(
+        await fetch(`${base}/tasks/${card.id}/approve`, {
+          method: "POST",
+          headers: { ...AUTH, "Content-Type": "application/json" },
+          body: JSON.stringify({ approval: card.approval, consent: true }),
+        }),
+      ),
+    );
+    assert.equal(updated.approval?.state, "consumed");
+    assert.match(updated.result ?? "", /Example Domain/);
+    assert.equal(fetches, 1);
+  }, undefined, web);
+});
+
 async function chatEvents(
   base: string,
   message: string,
@@ -1083,7 +1182,7 @@ async function readJson(response: Response): Promise<unknown> {
 async function withServer(
   run: (base: string) => Promise<void>,
   store?: TaskStore,
-  web = offlineWebResearchDeps(),
+  web: BrowserDeps = offlineWebResearchDeps(),
 ): Promise<void> {
   const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" }, store, undefined, web);
   await new Promise<void>((resolve) => {

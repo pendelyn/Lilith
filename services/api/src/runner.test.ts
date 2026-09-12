@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { withDockerMutex } from "./docker-test-lock.ts";
 import {
   dockerArgs,
   JobCredentialBroker,
@@ -89,6 +90,18 @@ test("the credential broker is one-shot and bound to a trusted executable", asyn
   assert.throws(() => broker.issue("oversize", "x".repeat(64 * 1024 + 1)), /64 KiB/);
 });
 
+test("already-aborted jobs never start docker", async () => {
+  await assert.rejects(
+    runIsolatedJob({
+      id: "already-aborted",
+      workspace: process.cwd(),
+      command: ["true"],
+      signal: AbortSignal.abort(),
+    }),
+    /cancelled/,
+  );
+});
+
 test("job timeouts cannot exceed or disable the 15-minute bound", async () => {
   for (const timeoutMs of [0, 900_001]) {
     await assert.rejects(
@@ -102,6 +115,7 @@ test(
   "real Docker job is non-root, bounded, redacted, and removed",
   { skip: process.env.RUN_DOCKER_TESTS !== "1" },
   async () => {
+    await withDockerMutex(async () => {
     await mkdir(RUNNER_WORKSPACES_ROOT, { recursive: true });
     const workspace = await mkdtemp(join(RUNNER_WORKSPACES_ROOT, "integration-"));
     const containersBefore = containerNames();
@@ -149,5 +163,6 @@ test(
       delete process.env.LILITH_HOST_ONLY;
       await rm(workspace, { recursive: true, force: true });
     }
+    });
   },
 );
