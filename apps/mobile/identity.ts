@@ -18,6 +18,10 @@ export function toolsForMode(mode: SetupMode): OptionalTool[] {
   return mode === "recommended" ? ["webResearch", "memory"] : [];
 }
 
+export function webResearchEnabledFromIdentity(identity: AgentIdentity | null): boolean {
+  return identity?.tools.includes("webResearch") === true;
+}
+
 export function normalizeName(value: string): string {
   const name = value.trim().slice(0, MAX_NAME_LENGTH);
   return name === "" ? DEFAULT_NAME : name;

@@ -22,7 +22,6 @@ import {
   mockApprovalAction,
   recordCost,
   resumeTask,
-  runColorCompare,
   runHeldResearch,
   runQuestionResearch,
   setTaskState,
@@ -31,18 +30,22 @@ import {
   startTool,
   stopTask,
   subagentCard,
+  researchAbortSignal,
   type TaskStore,
 } from "./tasks.ts";
+import { formatColorCompareResult, offlineWebResearchDeps, runColorCompare, colorFixtureUrls, TEST_COLOR_FIXTURE_COMMIT } from "./web-research.ts";
 
 const owner = { ownerId: "alpha-owner" };
 
-test("color compare starts one research subagent and returns Blau", () => {
+test("color compare starts one research subagent and returns Blau", async () => {
   const store = createTaskStore();
-  const run = runColorCompare(store, owner);
+  const urls = colorFixtureUrls(TEST_COLOR_FIXTURE_COMMIT);
+  const run = await runColorCompare(store, owner, offlineWebResearchDeps());
   const ids = new Set(run.cards.map((card) => card.id));
+  const result = formatColorCompareResult("Blau", urls);
 
   assert.equal(ids.size, 1);
-  assert.equal(run.result, "Blau");
+  assert.equal(run.result, result);
   assert.equal(sharedColor(), "Blau");
   assert.deepEqual(
     run.cards.map((card) => card.state),
@@ -53,7 +56,7 @@ test("color compare starts one research subagent and returns Blau", () => {
     role: "research",
     assignment: RESEARCH_ASSIGNMENT,
     state: "completed",
-    result: "Blau",
+    result,
   });
   assert.equal(
     [...store.tasks.values()].filter((task) => task.parentTaskId !== undefined).length,
@@ -173,15 +176,28 @@ test("stop discards approvals, freezes the root tree, and ignores late results",
   );
 });
 
-test("stop does not rewrite a completed color-compare result", () => {
+test("stop aborts the research AbortSignal for in-flight tools", () => {
   const store = createTaskStore();
-  const run = runColorCompare(store, owner);
+  const childId = heldChildId(store);
+  const parent = parentOf(store, childId);
+  const childSignal = researchAbortSignal(store, childId);
+  const parentSignal = researchAbortSignal(store, parent.id);
+  assert.equal(childSignal.aborted, false);
+  assert.equal(parentSignal.aborted, false);
+  stopTask(store, owner, childId);
+  assert.equal(childSignal.aborted, true);
+  assert.equal(parentSignal.aborted, true);
+});
+
+test("stop does not rewrite a completed color-compare result", async () => {
+  const store = createTaskStore();
+  const run = await runColorCompare(store, owner, offlineWebResearchDeps());
   const childId = run.cards[0]?.id;
   if (childId === undefined) throw new Error("expected a research subagent");
 
   const after = stopTask(store, owner, childId);
   assert.equal(after.state, "completed");
-  assert.equal(after.result, "Blau");
+  assert.equal(after.result, run.result);
 });
 
 test("time limit pauses work until explicit consent starts a fresh slice", () => {

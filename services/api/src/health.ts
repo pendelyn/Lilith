@@ -28,9 +28,7 @@ import {
   type MemoryStore,
 } from "./memory.ts";
 import {
-  APPROVAL_ASSIGNMENT,
   decideApproval,
-  mockApprovalAction,
   mockExternalWrite,
   runApprovalResearch,
   createTaskStore,
@@ -41,13 +39,23 @@ import {
   isQuestionPrompt,
   listResearchCards,
   resumeTask,
-  runColorCompare,
   runHeldResearch,
   runQuestionResearch,
   stopTask,
   subagentCard,
   type TaskStore,
 } from "./tasks.ts";
+import {
+  WEB_RESEARCH_OFF_REPLY,
+  invokeDataDisclosure,
+  isDisclosurePrompt,
+  parsePublicReadPrompt,
+  runColorCompare,
+  runDisclosureResearch,
+  runPublicPageRead,
+  webResearchDepsForTask,
+  type WebResearchDeps,
+} from "./web-research.ts";
 
 export type ApiConfig = {
   token: string;
@@ -81,9 +89,10 @@ export function createHealthServer(
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore = createTaskStore(),
   memories: MemoryStore = createMemoryStore(),
+  web: WebResearchDeps = {},
 ): Server {
   return createServer((req, res) => {
-    handleRequest(req, res, auth, store, memories);
+    handleRequest(req, res, auth, store, memories, web);
   });
 }
 
@@ -93,6 +102,7 @@ function handleRequest(
   auth: Pick<ApiConfig, "token" | "ownerId">,
   store: TaskStore,
   memories: MemoryStore,
+  web: WebResearchDeps,
 ): void {
   try {
     const owner = authenticateOwner(req.headers.authorization, auth);
@@ -122,7 +132,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void streamChatReply(req, res, owner, store, memories);
+      void streamChatReply(req, res, owner, store, memories, web);
       return;
     }
 
@@ -147,7 +157,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void handleTaskAction(req, res, owner, store, action);
+      void handleTaskAction(req, res, owner, store, action, web);
       return;
     }
 
@@ -167,6 +177,7 @@ async function streamChatReply(
   owner: OwnerContext,
   store: TaskStore,
   memories: MemoryStore,
+  web: WebResearchDeps,
 ): Promise<void> {
   try {
     const value = await readJsonBody(req);
@@ -184,15 +195,20 @@ async function streamChatReply(
     if ("memoryEnabled" in value && typeof value.memoryEnabled !== "boolean") {
       throw new Error("Invalid message");
     }
+    if ("webResearchEnabled" in value && typeof value.webResearchEnabled !== "boolean") {
+      throw new Error("Invalid message");
+    }
 
     streamNdjson(
       res,
-      chatEvents(
+      await chatEvents(
         value.message.trim(),
         owner,
         store,
         memories,
         "memoryEnabled" in value && value.memoryEnabled === true,
+        "webResearchEnabled" in value && value.webResearchEnabled === true,
+        web,
       ),
     );
   } catch {
@@ -207,6 +223,7 @@ async function handleTaskAction(
   owner: OwnerContext,
   store: TaskStore,
   action: { id: string; kind: "stop" | "resume" | "answer" | "approve" },
+  web: WebResearchDeps,
 ): Promise<void> {
   try {
     const body = await readJsonBody(req);
@@ -222,8 +239,22 @@ async function handleTaskAction(
       return;
     }
     if (action.kind === "approve") {
-      if (task.assignment !== APPROVAL_ASSIGNMENT || task.approval === undefined) throw new Error("Task not found");
-      const updated = await decideApproval(store, owner, task.id, body, mockApprovalAction(task.approval.actionId), mockExternalWrite);
+      if (task.approval === undefined) throw new Error("Task not found");
+      const stored = {
+        actionId: task.approval.actionId,
+        actionClass: task.approval.actionClass,
+        origin: task.approval.origin,
+        operation: task.approval.operation,
+        payload: task.approval.payload,
+        files: task.approval.files,
+        maxCostCents: task.approval.maxCostCents,
+      };
+      const invoke =
+        stored.actionClass === "data_disclosure"
+          ? (actionArg: typeof stored, key: string) =>
+              invokeDataDisclosure(actionArg, key, webResearchDepsForTask(store, task.id, web))
+          : mockExternalWrite;
+      const updated = await decideApproval(store, owner, task.id, body, stored, invoke);
       writeJson(res, parseSubagentCard(subagentCard(updated)));
       return;
     }
@@ -248,13 +279,15 @@ async function handleTaskAction(
   }
 }
 
-function chatEvents(
+async function chatEvents(
   message: string,
   owner: OwnerContext,
   store: TaskStore,
   memories: MemoryStore,
   memoryEnabled: boolean,
-): ChatStreamEvent[] {
+  webResearchEnabled: boolean,
+  web: WebResearchDeps,
+): Promise<ChatStreamEvent[]> {
   const remembered = captureExplicitMemory(memories, owner, message, memoryEnabled);
   if (remembered !== undefined) {
     return [...deltaEvents(remembered), { type: "done" }];
@@ -270,12 +303,69 @@ function chatEvents(
   }
 
   if (isColorComparePrompt(message)) {
-    const run = runColorCompare(store, owner);
-    return [
-      ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-      ...deltaEvents(`A research subagent compared test sources A, B, and C. Shared color: ${run.result}.`),
-      { type: "done" },
-    ];
+    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    try {
+      const run = await runColorCompare(store, owner, web);
+      if (run.result === undefined) {
+        return [
+          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+          ...deltaEvents("Web research failed."),
+          { type: "done" },
+        ];
+      }
+      return [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents(
+          `A research subagent compared test sources A, B, and C. Shared color: ${run.result}.`,
+        ),
+        { type: "done" },
+      ];
+    } catch {
+      return [...deltaEvents("Web research failed."), { type: "done" }];
+    }
+  }
+
+  if (isDisclosurePrompt(message)) {
+    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    try {
+      const run = runDisclosureResearch(store, owner, web);
+      return [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents("Review the bound request before any user data is sent. No network call has been made."),
+        { type: "done" },
+      ];
+    } catch {
+      return [...deltaEvents("Web research failed."), { type: "done" }];
+    }
+  }
+
+  const publicUrl = parsePublicReadPrompt(message);
+  if (publicUrl !== undefined) {
+    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    try {
+      const run = await runPublicPageRead(store, owner, publicUrl, web);
+      if (run.cards.some((card) => card.approval?.state === "pending")) {
+        return [
+          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+          ...deltaEvents("Review the bound request before any user data is sent. No network call has been made."),
+          { type: "done" },
+        ];
+      }
+      if (run.result === undefined) {
+        return [
+          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+          ...deltaEvents("Web research failed."),
+          { type: "done" },
+        ];
+      }
+      return [
+        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
+        ...deltaEvents(run.result),
+        { type: "done" },
+      ];
+    } catch {
+      return [...deltaEvents("Web research failed."), { type: "done" }];
+    }
   }
 
   if (isHoldPrompt(message)) {
