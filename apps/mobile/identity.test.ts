@@ -5,6 +5,7 @@ import {
   identityFromChoice,
   parsePersistedIdentity,
   serializeIdentity,
+  webResearchEnabledFromIdentity,
 } from "./identity.ts";
 
 test("persistence parsing applies defaults and mode tools", () => {
@@ -46,4 +47,14 @@ test("persistence parsing applies defaults and mode tools", () => {
   const recommended = identityFromChoice("", "recommended");
   assert.deepEqual(JSON.parse(serializeIdentity(recommended)), recommended);
   assert.deepEqual(parsePersistedIdentity(serializeIdentity(recommended)), recommended);
+
+  assert.equal(webResearchEnabledFromIdentity(identityFromChoice("Lilith", "recommended")), true);
+  assert.equal(webResearchEnabledFromIdentity(identityFromChoice("Lilith", "blank")), false);
+  assert.equal(webResearchEnabledFromIdentity(null), false);
+  assert.equal(
+    webResearchEnabledFromIdentity(
+      parsePersistedIdentity(JSON.stringify({ name: "Nyx", mode: "blank", tools: ["webResearch", "memory"] })),
+    ),
+    false,
+  );
 });

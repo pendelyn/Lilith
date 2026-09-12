@@ -30,6 +30,14 @@ import {
   recordCost,
   type TaskStore,
 } from "./tasks.ts";
+import {
+  DISCLOSURE_PROMPT,
+  TEST_COLOR_FIXTURE_COMMIT,
+  UNTRUSTED_PAGE_TEXT,
+  WEB_RESEARCH_OFF_REPLY,
+  colorFixtureUrls,
+  offlineWebResearchDeps,
+} from "./web-research.ts";
 
 const AUTH = { Authorization: "Bearer secret-token" };
 
@@ -77,13 +85,14 @@ test("chat replies stream as validated NDJSON without raw logs", async () => {
 
 test("color compare test task streams one research subagent and Blau", async () => {
   await withServer(async (base) => {
+    const urls = colorFixtureUrls(TEST_COLOR_FIXTURE_COMMIT);
     const response = await fetch(`${base}/chat`, {
       method: "POST",
       headers: {
         ...AUTH,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ message: `  ${COLOR_COMPARE_PROMPT}  ` }),
+      body: JSON.stringify({ message: `  ${COLOR_COMPARE_PROMPT}  `, webResearchEnabled: true }),
     });
     assert.equal(response.status, 200);
     const events = (await response.text()).trim().split("\n").map((line) =>
@@ -102,11 +111,40 @@ test("color compare test task streams one research subagent and Blau", async () 
     );
     assert.equal(subagents[0]?.role, "research");
     assert.equal(subagents[0]?.assignment, RESEARCH_ASSIGNMENT);
-    assert.equal(subagents.at(-1)?.result, "Blau");
+    assert.match(subagents.at(-1)?.result ?? "", /Blau/);
+    assert.equal(subagents.at(-1)?.result?.includes(urls.A), true);
+    assert.equal(subagents.at(-1)?.result?.includes(urls.B), true);
+    assert.equal(subagents.at(-1)?.result?.includes(urls.C), true);
     assert.match(reply, /Blau/);
+    assert.equal(reply.includes(urls.A), true);
     assert.equal(reply.includes("No model is connected yet"), false);
     assert.deepEqual(events.at(-1), { type: "done" });
   });
+});
+
+test("Blank or omitted webResearchEnabled does not run color compare or fetch", async () => {
+  let connects = 0;
+  const web = offlineWebResearchDeps({ connect: () => { connects += 1; } });
+  await withServer(async (base) => {
+    for (const body of [
+      JSON.stringify({ message: COLOR_COMPARE_PROMPT }),
+      JSON.stringify({ message: COLOR_COMPARE_PROMPT, webResearchEnabled: false }),
+    ]) {
+      const response = await fetch(`${base}/chat`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body,
+      });
+      assert.equal(response.status, 200);
+      const events = (await response.text()).trim().split("\n").map((line) =>
+        parseChatStreamEvent(JSON.parse(line)),
+      );
+      const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+      assert.equal(events.some((event) => event.type === "subagent"), false);
+      assert.equal(reply, WEB_RESEARCH_OFF_REPLY);
+    }
+    assert.equal(connects, 0);
+  }, undefined, web);
 });
 
 test("subagent events reject extra fields", () => {
@@ -777,14 +815,246 @@ test("approval HTTP bindings survive process reload and still dispatch once", as
   }
 });
 
-async function chatEvents(base: string, message: string) {
+test("disclosure HTTP waits for consent before any fetch and dispatches stored args once", async () => {
+  let fetches = 0;
+  const web = offlineWebResearchDeps({
+    connect: () => {
+      fetches += 1;
+    },
+  });
+  await withServer(async (base) => {
+    const events = await chatEvents(base, DISCLOSURE_PROMPT, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    assert.equal(card.approval.actionClass, "data_disclosure");
+    assert.equal(fetches, 0);
+    const url = `${base}/tasks/${card.id}/approve`;
+    const post = (body: unknown) => fetch(url, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const rejected = parseSubagentCard(await readJson(await post({ approval: card.approval, consent: false })));
+    assert.match(rejected.result ?? "", /No call/);
+    assert.equal(fetches, 0);
+  }, undefined, web);
+
+  fetches = 0;
+  await withServer(async (base) => {
+    const events = await chatEvents(base, DISCLOSURE_PROMPT, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const url = `${base}/tasks/${card.id}/approve`;
+    const post = (body: unknown) => fetch(url, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const updated = parseSubagentCard(await readJson(await post({ approval: card.approval, consent: true })));
+    assert.equal(updated.approval?.state, "consumed");
+    assert.equal(fetches, 1);
+    assert.equal((await post({ approval: card.approval, consent: true })).status, 409);
+    assert.equal(fetches, 1);
+  }, undefined, web);
+});
+
+test("HTTP stop aborts an in-flight color-compare GET", { timeout: 8_000 }, async () => {
+  const store = createTaskStore();
+  let aborted = false;
+  let started!: () => void;
+  const startedAt = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const web = offlineWebResearchDeps({
+    get: async (input) => {
+      started();
+      return await new Promise<never>((_, reject) => {
+        input.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("Web research cancelled"));
+        });
+      });
+    },
+  });
+  await withServer(async (base) => {
+    const chat = chatEvents(base, COLOR_COMPARE_PROMPT, { webResearchEnabled: true });
+    await startedAt;
+    const child = [...store.tasks.values()].find((task) => task.role === "research");
+    assert.ok(child);
+    const stopped = await fetch(`${base}/tasks/${child.id}/stop`, { method: "POST", headers: AUTH });
+    assert.equal(stopped.status, 200);
+    const events = await chat;
+    const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+    assert.equal(aborted, true);
+    assert.equal(reply.includes("Blau"), false);
+    assert.match(reply, /failed/);
+  }, store, web);
+});
+
+test("Lies URL does not attach stored memories to the outbound request", async () => {
+  const url = "https://example.com/public";
+  let lookups = 0;
+  let href = "";
+  let headers: Record<string, string> = {};
+  let body: string | undefined;
+  const web = offlineWebResearchDeps({
+    lookupAll: async () => {
+      lookups += 1;
+      return [{ address: "1.1.1.1", family: 4 }];
+    },
+    get: async (input) => {
+      href = input.url.href;
+      headers = input.headers;
+      body = input.body;
+      return {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+        body: "ok",
+      };
+    },
+  });
+  await withServer(async (base) => {
+    await chatEvents(base, "Merk dir: Antwortsprache Deutsch", { memoryEnabled: true });
+    const events = await chatEvents(base, `Lies ${url}`, { webResearchEnabled: true, memoryEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    assert.equal(lookups, 0);
+    assert.equal(href, "");
+    const updated = parseSubagentCard(
+      await readJson(
+        await fetch(`${base}/tasks/${card.id}/approve`, {
+          method: "POST",
+          headers: { ...AUTH, "Content-Type": "application/json" },
+          body: JSON.stringify({ approval: card.approval, consent: true }),
+        }),
+      ),
+    );
+    assert.equal(updated.approval?.state, "consumed");
+    assert.equal(href, url);
+    assert.equal(body, undefined);
+    assert.equal(JSON.stringify(headers).includes("Deutsch"), false);
+    assert.equal(JSON.stringify(headers).includes("Antwortsprache"), false);
+    assert.equal(lookups, 1);
+  }, undefined, web);
+});
+
+test("untrusted remote text cannot capture memory or change tools", async () => {
+  const url = "https://example.com/inject";
+  const web = offlineWebResearchDeps({
+    pages: { [url]: UNTRUSTED_PAGE_TEXT },
+  });
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Lies ${url}`, { webResearchEnabled: true, memoryEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const updated = parseSubagentCard(
+      await readJson(
+        await fetch(`${base}/tasks/${card.id}/approve`, {
+          method: "POST",
+          headers: { ...AUTH, "Content-Type": "application/json" },
+          body: JSON.stringify({ approval: card.approval, consent: true }),
+        }),
+      ),
+    );
+    assert.match(updated.result ?? "", /Merk dir/);
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks.length, 1);
+    const memories = await fetch(`${base}/memories`, { headers: AUTH });
+    assert.equal(memories.status, 200);
+    assert.equal((await memories.json()).memories.length, 0);
+  }, undefined, web);
+});
+
+test("arbitrary chat URL makes zero DNS or connect until one-time consent", async () => {
+  const url = "https://example.com/notes?q=from-user";
+  let lookups = 0;
+  let fetches = 0;
+  const web = offlineWebResearchDeps({
+    pages: { [url]: "hello from the public web" },
+    lookupAll: async () => {
+      lookups += 1;
+      return [{ address: "1.1.1.1", family: 4 }];
+    },
+    connect: () => {
+      fetches += 1;
+    },
+  });
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Lies ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    assert.equal(card.approval.actionClass, "data_disclosure");
+    assert.equal(card.approval.origin, "https://example.com");
+    assert.equal(card.approval.operation, "GET /notes?q=from-user");
+    assert.match(card.approval.payload, /https:\/\/example.com\/notes\?q=from-user/);
+    assert.equal(lookups, 0);
+    assert.equal(fetches, 0);
+    const post = (body: unknown) =>
+      fetch(`${base}/tasks/${card.id}/approve`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const rejected = parseSubagentCard(await readJson(await post({ approval: card.approval, consent: false })));
+    assert.match(rejected.result ?? "", /No call/);
+    assert.equal(lookups, 0);
+    assert.equal(fetches, 0);
+  }, undefined, web);
+
+  lookups = 0;
+  fetches = 0;
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Lies ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const post = (body: unknown) =>
+      fetch(`${base}/tasks/${card.id}/approve`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const stopped = await fetch(`${base}/tasks/${card.id}/stop`, { method: "POST", headers: AUTH });
+    assert.equal(stopped.status, 200);
+    assert.equal((await post({ approval: card.approval, consent: true })).status, 409);
+    assert.equal(lookups, 0);
+    assert.equal(fetches, 0);
+  }, undefined, web);
+
+  lookups = 0;
+  fetches = 0;
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Lies ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const post = (body: unknown) =>
+      fetch(`${base}/tasks/${card.id}/approve`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const updated = parseSubagentCard(await readJson(await post({ approval: card.approval, consent: true })));
+    assert.equal(updated.approval?.state, "consumed");
+    assert.match(updated.result ?? "", /hello from the public web/);
+    assert.equal(lookups, 1);
+    assert.equal(fetches, 1);
+    assert.equal((await post({ approval: card.approval, consent: true })).status, 409);
+    assert.equal(lookups, 1);
+    assert.equal(fetches, 1);
+  }, undefined, web);
+});
+
+async function chatEvents(
+  base: string,
+  message: string,
+  extra: { webResearchEnabled?: boolean; memoryEnabled?: boolean } = {},
+) {
   const response = await fetch(`${base}/chat`, {
     method: "POST",
     headers: {
       ...AUTH,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, ...extra }),
   });
   assert.equal(response.status, 200);
   return (await response.text()).trim().split("\n").map((line) => parseChatStreamEvent(JSON.parse(line)));
@@ -810,8 +1080,12 @@ async function readJson(response: Response): Promise<unknown> {
   return response.json();
 }
 
-async function withServer(run: (base: string) => Promise<void>, store?: TaskStore): Promise<void> {
-  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" }, store);
+async function withServer(
+  run: (base: string) => Promise<void>,
+  store?: TaskStore,
+  web = offlineWebResearchDeps(),
+): Promise<void> {
+  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" }, store, undefined, web);
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());
   });

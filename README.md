@@ -89,6 +89,20 @@ Other sensitive content (email, phone, IBAN, address/health/ID cues) is not stor
 
 Memories persist in `.lilith-memories.json` with the same atomic replace/rollback pattern as tasks. The file is gitignored. Reconnect reloads the owner-scoped list; a stale Blank identity cannot enable Memory from a tampered tools array.
 
+## Web research (Issue #15)
+
+Recommended setup enables public web research; Blank leaves it off. There is still **no live model**. Issue #8 stays deactivated; page text is untrusted data and cannot change tools, identity, or memories.
+
+Send exactly `Vergleiche Testquelle A, B und C und lasse einen Recherche-Unteragenten die gemeinsame Farbe sammeln` with Recommended connected. Lilith fetches three controlled fixtures (A Rot/Blau, B Blau/Grün, C Blau/Gelb), returns **Blau**, and cites all three HTTPS URLs. Send `Lies https://example.com/path` (any user-supplied HTTPS URL, including a root URL) to preview that exact destination; **Reject** makes no call, **Approve once** fetches it. Send `Lies Testquelle A mit markierten Nutzerdaten` for the marked-header fixture of the same gate.
+
+Outbound reads are HTTPS port 443 only, to public unicast addresses (no host allowlist). Loopback, private, link-local, CGNAT, multicast, documentation/benchmark/AMT/ORCHID/DRIP/6to4/Teredo/NAT64/6bone, IANA-reserved `2000::/3` space, IPv4-compatible/translated embeddings, Azure `168.63.129.16`, metadata names, and mixed DNS answers are blocked before connect. DNS uses the same 10s deadline and stop AbortSignal as the GET; a late answer does not connect. Trailing-dot names (`localhost.`, `metadata.google.internal.`) are denylisted before DNS. Redirects are rejected. Stop aborts an in-flight HTTPS request; the HTTP request is not written until the connected socket address is pinned.
+
+Disclosure boundary: only the three exact server-owned pinned fixture URLs, with no added query, headers, or body, fetch without consent (the color-compare task). Any other user-supplied HTTPS URL — hostname, path, query, root URL, or encoded variant — uses the `#13` `data_disclosure` preview and one-time binding **before DNS or HTTPS**. This is not a host allowlist: every public HTTPS host still works after **Approve once** with the stored arguments. Chat text and stored memories are never added. Secrets may sit in hostname, path, or query, so the gate does not guess which URLs contain user data. The preview shows the canonical URL, destination, and bound data; changed arguments cannot dispatch.
+
+Default `npm test` does not use the public internet. Live check: `$env:LILITH_LIVE_WEB_TESTS='1'; npm test --workspace=@lilith/api` against the pinned commit `284f7f8a5fa74fbd7a0794b3be8e0352932dfe2a`. That run uses `COLOR_FIXTURE_COMMIT` and the real HTTPS client; do not mock, disable TLS, or allow private nets.
+
+This is not a search engine, browser, or Codex tool. Isolated CLI jobs keep `--network=none`.
+
 ## Physical iPhone (Expo Go)
 
 Expo's tunnel does **not** carry this API. Phone and PC must share Wi-Fi, and the API must listen on the LAN.

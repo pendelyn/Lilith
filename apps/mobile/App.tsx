@@ -27,6 +27,7 @@ import {
   identityFromChoice,
   parsePersistedIdentity,
   serializeIdentity,
+  webResearchEnabledFromIdentity,
   type AgentIdentity,
   type OptionalTool,
   type SetupMode,
@@ -249,6 +250,7 @@ function Home({
       ? "No optional tools"
       : identity.tools.map((tool) => TOOL_LABELS[tool]).join(", ");
   const memoryEnabled = memoryEnabledFromIdentity(identity);
+  const webResearchEnabled = webResearchEnabledFromIdentity(identity);
 
   useEffect(() => {
     let active = true;
@@ -606,7 +608,7 @@ function Home({
       };
       xhr.onerror = () => settle("unreachable", "failed");
       xhr.onabort = () => settle("unreachable", "failed");
-      xhr.send(JSON.stringify({ message: text, memoryEnabled }));
+      xhr.send(JSON.stringify({ message: text, memoryEnabled, webResearchEnabled }));
     } catch {
       settle("unreachable", "failed");
     }
@@ -1166,7 +1168,7 @@ function SubagentStatusCard({
       <Text style={styles.subagentState}>{detail}</Text>
       {card.approval ? (
         <View style={styles.subagentCard}>
-          <Text style={styles.questionPrompt}>One-time approval (mock)</Text>
+          <Text style={styles.questionPrompt}>One-time approval</Text>
           <Text style={styles.subagentAssignment}>Origin: {card.approval.origin}</Text>
           <Text style={styles.subagentAssignment}>Operation: {card.approval.operation}</Text>
           <Text style={styles.subagentAssignment}>Class: {card.approval.actionClass}</Text>
@@ -1182,7 +1184,11 @@ function SubagentStatusCard({
           </Text>
           {card.approval.state === "pending" ? (
             <>
-              <Text style={styles.subagentState}>If expired, send the simulation prompt again for a new preview.</Text>
+              <Text style={styles.subagentState}>
+                {card.approval.actionClass === "data_disclosure"
+                  ? "If expired, send the same HTTPS URL again for a new disclosure preview."
+                  : "If expired, send the simulation prompt again for a new preview."}
+              </Text>
               {[true, false].map((consent) => {
                 const locked = disabled || card.state !== "needs_input" || Date.now() >= card.approval!.expiresAt;
                 return (
@@ -1192,7 +1198,13 @@ function SubagentStatusCard({
                     disabled={locked}
                     accessibilityRole="button"
                     accessibilityLabel={consent ? "Approve once" : "Reject action"}
-                    accessibilityHint={consent ? "Runs the mocked write once. Nothing is sent externally." : "Makes no call."}
+                    accessibilityHint={
+                      consent
+                        ? card.approval!.actionClass === "data_disclosure"
+                          ? "Sends the bound request once after consent."
+                          : "Runs the mocked write once. Nothing is sent externally."
+                        : "Makes no call."
+                    }
                     accessibilityState={{ disabled: locked, busy: pending }}
                     style={[styles.taskControl, locked && styles.buttonDisabled]}
                   >

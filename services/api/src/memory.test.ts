@@ -18,6 +18,7 @@ import {
 } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer } from "./health.ts";
+import { offlineWebResearchDeps } from "./web-research.ts";
 import {
   MEMORY_CONFIRM_REPLY,
   MEMORY_CONFIRM_TTL_MS,
@@ -609,7 +610,7 @@ async function chatReply(base: string, message: string, memoryEnabled: boolean) 
   const response = await fetch(`${base}/chat`, {
     method: "POST",
     headers: { ...AUTH, "Content-Type": "application/json" },
-    body: JSON.stringify({ message, memoryEnabled }),
+    body: JSON.stringify({ message, memoryEnabled, webResearchEnabled: true }),
   });
   assert.equal(response.status, 200);
   const raw = await response.text();
@@ -651,6 +652,7 @@ async function withServer(
     { token: "secret-token", ownerId: "alpha-owner" },
     store ?? createTaskStore(),
     memories ?? createMemoryStore(),
+    offlineWebResearchDeps(),
   );
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());

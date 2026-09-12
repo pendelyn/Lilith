@@ -66,6 +66,8 @@ export type TaskStore = {
   readonly tasks: Map<string, Task>;
   // Index of pending approvals; the full binding is persisted on its task.
   readonly approvals: Map<string, string>;
+  // In-process AbortControllers for in-flight HTTPS; never persisted.
+  readonly aborts: Map<string, AbortController>;
   readonly now: () => number;
   readonly persistPath?: string;
 };
@@ -77,6 +79,7 @@ export function createTaskStore(options?: {
   const store: TaskStore = {
     tasks: new Map(),
     approvals: new Map(),
+    aborts: new Map(),
     now: options?.now ?? Date.now,
     ...(options?.persistPath === undefined ? {} : { persistPath: options.persistPath }),
   };
@@ -179,9 +182,17 @@ export function setTaskState(
   );
 }
 
+export function researchAbortSignal(store: TaskStore, taskId: string): AbortSignal {
+  const existing = store.aborts.get(taskId);
+  if (existing !== undefined && !existing.signal.aborted) return existing.signal;
+  const controller = new AbortController();
+  store.aborts.set(taskId, controller);
+  return controller.signal;
+}
+
 export function stopTask(store: TaskStore, owner: OwnerContext, taskId: string): Task {
   ownedTask(store, owner, taskId);
-  return transact(store, () => {
+  const stopped = transact(store, () => {
     const current = ownedTask(store, owner, taskId);
     const members = executionSet(store, current);
     const memberIds = new Set(members.map((member) => member.id));
@@ -195,8 +206,15 @@ export function stopTask(store: TaskStore, owner: OwnerContext, taskId: string):
     for (const [id, approvedTaskId] of store.approvals) {
       if (memberIds.has(approvedTaskId)) store.approvals.delete(id);
     }
-    return ownedTask(store, owner, taskId);
+    return { task: ownedTask(store, owner, taskId), memberIds: [...memberIds] };
   });
+  for (const id of stopped.memberIds) {
+    const controller = store.aborts.get(id);
+    if (controller === undefined) continue;
+    controller.abort();
+    store.aborts.delete(id);
+  }
+  return stopped.task;
 }
 
 export function resumeTask(
@@ -471,24 +489,6 @@ export function subagentCard(task: Task): SubagentCard {
     ...(task.question === undefined ? {} : { question: task.question }),
     ...(task.approval === undefined ? {} : { approval: structuredClone(task.approval) }),
   };
-}
-
-export function runColorCompare(
-  store: TaskStore,
-  owner: OwnerContext,
-): { cards: SubagentCard[]; result: string } {
-  const parent = createParentTask(store, owner, COLOR_COMPARE_PROMPT);
-  const started = startSubagent(store, owner, {
-    parentTaskId: parent.id,
-    assignment: RESEARCH_ASSIGNMENT,
-    role: "research",
-  });
-  const cards = [subagentCard(started)];
-  cards.push(subagentCard(setTaskState(store, owner, started.id, "working")));
-  const result = sharedColor();
-  cards.push(subagentCard(setTaskState(store, owner, started.id, "completed", result)));
-  setTaskState(store, owner, parent.id, "completed", result);
-  return { cards, result };
 }
 
 export function runHeldResearch(
