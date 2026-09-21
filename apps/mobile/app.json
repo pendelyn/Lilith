@@ -7,14 +7,14 @@
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "splash": {
-      "backgroundColor": "#121212"
+      "backgroundColor": "#100D17"
     },
     "ios": {
       "supportsTablet": false
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#121212"
+        "backgroundColor": "#100D17"
       }
     },
     "plugins": [
