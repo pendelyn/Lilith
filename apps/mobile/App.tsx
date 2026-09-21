@@ -70,6 +70,8 @@ import {
   type PersistQueue,
 } from "./privacy";
 
+import { colors } from "./theme";
+
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
 
@@ -162,7 +164,7 @@ export default function App() {
         <StatusBar style="light" />
         {!ready ? (
           <View style={styles.loading} accessibilityLabel="Loading">
-            <ActivityIndicator color="#C4B5FD" />
+            <ActivityIndicator color={colors.accent} />
           </View>
         ) : identity === null ? (
           <Onboarding onComplete={(next) => void persist(next)} />
@@ -199,6 +201,7 @@ function Onboarding({ onComplete }: { onComplete: (identity: AgentIdentity) => v
       automaticallyAdjustKeyboardInsets
       contentContainerStyle={styles.scroll}
     >
+      <Text accessible={false} importantForAccessibility="no" style={styles.welcomeMark}>✦</Text>
       <Text style={styles.title} accessibilityRole="header">
         Welcome
       </Text>
@@ -778,6 +781,7 @@ function Home({
       style={styles.chatScreen}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
+      <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent} keyboardShouldPersistTaps="handled">
       <View style={styles.chatHeader}>
         <TextInput
           value={name}
@@ -809,7 +813,7 @@ function Home({
                 accessibilityRole="tab"
                 accessibilityLabel={`Show ${label.toLowerCase()}`}
                 accessibilityState={{ selected }}
-                style={({ pressed }) => [styles.screenToggle, pressed && styles.buttonPressed]}
+                style={({ pressed }) => [styles.screenToggle, selected && styles.screenToggleSelected, pressed && styles.buttonPressed]}
               >
                 <Text style={[styles.screenToggleLabel, selected && styles.screenTabSelected]}>{label}</Text>
               </Pressable>
@@ -834,7 +838,7 @@ function Home({
             setEditingId(null);
           }}
           placeholder="Local API token"
-          placeholderTextColor="#8A8A8A"
+          placeholderTextColor={colors.muted}
           secureTextEntry
           autoCapitalize="none"
           autoCorrect={false}
@@ -857,7 +861,7 @@ function Home({
           ]}
         >
           {state === "loading" ? (
-            <ActivityIndicator color="#121212" />
+            <ActivityIndicator color={colors.canvas} />
           ) : (
             <Text style={styles.connectLabel}>Connect</Text>
           )}
@@ -900,6 +904,7 @@ function Home({
           Could not delete the account. Try again.
         </Text>
       ) : null}
+      </ScrollView>
       {screen === "privacy" ? (
         <PrivacyPanel
           connected={state === "success" || serverDeleted}
@@ -957,9 +962,13 @@ function Home({
         contentContainerStyle={messages.length === 0 ? styles.emptyChat : styles.messageList}
         ListEmptyComponent={
           chatReady ? (
-            <Text style={styles.emptyText}>Start a conversation with {identity.name}.</Text>
+            <View style={styles.emptyCard}>
+              <Text accessible={false} importantForAccessibility="no" style={styles.welcomeMark}>✦</Text>
+              <Text style={styles.emptyTitle}>{identity.name}</Text>
+              <Text style={styles.emptyText}>Start a conversation with {identity.name}.</Text>
+            </View>
           ) : (
-            <ActivityIndicator color="#C4B5FD" />
+            <ActivityIndicator color={colors.accent} />
           )
         }
         keyboardDismissMode="interactive"
@@ -983,7 +992,7 @@ function Home({
           value={draft}
           onChangeText={setDraft}
           placeholder={state === "success" ? "Message" : "Connect to send a message"}
-          placeholderTextColor="#8A8A8A"
+          placeholderTextColor={colors.muted}
           multiline
           maxLength={MAX_MESSAGE_LENGTH}
           editable={state === "success" && activeUserId === null}
@@ -1029,6 +1038,7 @@ function PrivacyPanel({
       keyboardDismissMode="interactive"
       contentContainerStyle={styles.memoryList}
     >
+      <View style={styles.memoryCard}>
       <Text style={styles.sectionLabel} accessibilityRole="header">
         Privacy
       </Text>
@@ -1037,10 +1047,14 @@ function PrivacyPanel({
           {line}
         </Text>
       ))}
+      </View>
+      <View style={styles.memoryCard}>
       <Text style={styles.sectionLabel} accessibilityRole="header">
         Provider copies
       </Text>
       <Text style={styles.privacyNotice}>{PROVIDER_SIDE_LIMIT}</Text>
+      </View>
+      <View style={styles.memoryCard}>
       <Text style={styles.sectionLabel} accessibilityRole="header">
         Delete account
       </Text>
@@ -1057,8 +1071,9 @@ function PrivacyPanel({
         accessibilityState={{ disabled: locked, busy }}
         style={({ pressed }) => [styles.taskControl, locked && styles.buttonDisabled, pressed && !locked && styles.buttonPressed]}
       >
-        <Text style={styles.taskControlLabel}>Delete account</Text>
+        <Text style={styles.destructiveLabel}>Delete account</Text>
       </Pressable>
+      </View>
     </ScrollView>
   );
 }
@@ -1109,7 +1124,7 @@ function MemoriesPanel({
         {failed ? (
           <Text style={styles.emptyText}>Could not load memories. Try again.</Text>
         ) : (
-          <ActivityIndicator color="#C4B5FD" accessibilityLabel="Loading memories" />
+          <ActivityIndicator color={colors.accent} accessibilityLabel="Loading memories" />
         )}
       </View>
     );
@@ -1205,7 +1220,7 @@ function MemoriesPanel({
                   accessibilityState={{ disabled: busy, busy }}
                   style={[styles.taskControl, busy && styles.buttonDisabled]}
                 >
-                  <Text style={styles.taskControlLabel}>Delete</Text>
+                  <Text style={styles.destructiveLabel}>Delete</Text>
                 </Pressable>
               </View>
             </View>
@@ -1324,7 +1339,7 @@ function SubagentStatusCard({
       <Text style={styles.subagentAssignment}>{card.assignment}</Text>
       <Text style={styles.subagentState}>{detail}</Text>
       {card.approval ? (
-        <View style={styles.subagentCard}>
+        <View style={styles.approvalCard}>
           <Text style={styles.questionPrompt}>One-time approval</Text>
           <Text style={styles.subagentAssignment}>Origin: {card.approval.origin}</Text>
           <Text style={styles.subagentAssignment}>Operation: {card.approval.operation}</Text>
@@ -1365,7 +1380,7 @@ function SubagentStatusCard({
                     accessibilityState={{ disabled: locked, busy: pending }}
                     style={[styles.taskControl, locked && styles.buttonDisabled]}
                   >
-                    <Text style={styles.taskControlLabel}>{consent ? "Approve once" : "Reject"}</Text>
+                    <Text style={consent ? styles.taskControlLabel : styles.destructiveLabel}>{consent ? "Approve once" : "Reject"}</Text>
                   </Pressable>
                 );
               })}
@@ -1410,7 +1425,7 @@ function SubagentStatusCard({
             keyboardAppearance="dark"
             accessibilityLabel="Other answer"
             placeholder="Other answer"
-            placeholderTextColor="#8A8A8A"
+            placeholderTextColor={colors.muted}
             style={styles.questionInput}
           />
           <Pressable
@@ -1445,7 +1460,7 @@ function SubagentStatusCard({
             pressed && !disabled && styles.buttonPressed,
           ]}
         >
-          <Text style={styles.taskControlLabel}>Stop</Text>
+          <Text style={styles.destructiveLabel}>Stop</Text>
         </Pressable>
       ) : null}
       {card.state === "paused" ? (
@@ -1487,7 +1502,7 @@ function NameField({
         onEndEditing={onEndEditing}
         maxLength={MAX_NAME_LENGTH}
         placeholder={DEFAULT_NAME}
-        placeholderTextColor="#8A8A8A"
+        placeholderTextColor={colors.muted}
         autoCapitalize="words"
         autoCorrect={false}
         autoComplete="off"
@@ -1541,9 +1556,37 @@ function ModeChoice({
 }
 
 const styles = StyleSheet.create({
+  // ponytail: scrollable chrome keeps safety copy reachable at large font sizes.
+  shell: {
+    maxHeight: "48%",
+    flexGrow: 0,
+    flexShrink: 0,
+  },
+  shellContent: { paddingBottom: 8 },
+  screenToggleSelected: { backgroundColor: colors.accent, borderColor: colors.accent },
+  welcomeMark: { color: colors.accent, fontSize: 48, textAlign: "center" },
+  emptyCard: {
+    width: "100%",
+    padding: 24,
+    gap: 12,
+    borderRadius: 28,
+    borderWidth: 1,
+    borderColor: colors.outline,
+    backgroundColor: colors.surface,
+  },
+  emptyTitle: { color: colors.text, fontSize: 24, fontWeight: "700", textAlign: "center" },
+  approvalCard: {
+    padding: 12,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: colors.accent,
+    borderRadius: 18,
+    backgroundColor: colors.surface,
+  },
+  destructiveLabel: { color: colors.danger, fontSize: 15, fontWeight: "600" },
   safe: {
     flex: 1,
-    backgroundColor: "#121212",
+    backgroundColor: colors.canvas,
   },
   chatScreen: {
     flex: 1,
@@ -1553,68 +1596,79 @@ const styles = StyleSheet.create({
     paddingTop: 6,
     paddingBottom: 8,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#2A2A2A",
+    borderBottomColor: colors.outline,
   },
   headerName: {
-    color: "#F5F5F5",
-    fontSize: 22,
-    fontWeight: "600",
-    minHeight: 44,
+    color: colors.text,
+    fontSize: 26,
+    fontWeight: "700",
+    minHeight: 48,
     padding: 0,
   },
   headerMeta: {
-    color: "#8A8A8A",
+    color: colors.muted,
     fontSize: 13,
   },
   screenToggle: {
     alignSelf: "flex-start",
-    minHeight: 44,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: colors.outline,
+    minHeight: 48,
     justifyContent: "center",
     marginTop: 4,
   },
   screenTabs: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 16,
+    gap: 8,
   },
   screenTabSelected: {
-    color: "#F5F5F5",
+    color: colors.canvas,
   },
   screenToggleLabel: {
-    color: "#C4B5FD",
+    color: colors.accent,
     fontSize: 15,
     fontWeight: "600",
   },
   connectionRow: {
     flexDirection: "row",
+    flexWrap: "wrap",
     gap: 8,
     paddingHorizontal: 12,
     paddingTop: 10,
   },
   connectionInput: {
-    flex: 1,
-    minHeight: 44,
-    borderRadius: 10,
-    backgroundColor: "#1E1E1E",
-    color: "#F5F5F5",
+    flexGrow: 1,
+    flexBasis: 160,
+    borderWidth: 1,
+    borderColor: colors.outline,
+    minHeight: 48,
+    borderRadius: 16,
+    backgroundColor: colors.inset,
+    color: colors.text,
     paddingHorizontal: 12,
     fontSize: 16,
   },
   connectButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     minWidth: 88,
-    minHeight: 44,
+    minHeight: 48,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: 10,
-    backgroundColor: "#C4B5FD",
+    borderRadius: 16,
+    backgroundColor: colors.accent,
   },
   connectLabel: {
-    color: "#121212",
+    color: colors.canvas,
     fontSize: 15,
     fontWeight: "600",
   },
   connectionStatus: {
-    color: "#A3A3A3",
+    color: colors.muted,
     fontSize: 13,
     minHeight: 28,
     paddingHorizontal: 14,
@@ -1632,7 +1686,7 @@ const styles = StyleSheet.create({
     padding: 32,
   },
   emptyText: {
-    color: "#8A8A8A",
+    color: colors.muted,
     fontSize: 16,
     lineHeight: 22,
     textAlign: "center",
@@ -1645,111 +1699,132 @@ const styles = StyleSheet.create({
     justifyContent: "flex-end",
   },
   bubble: {
-    maxWidth: "84%",
-    borderRadius: 18,
+    maxWidth: "94%",
+    flexShrink: 1,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: colors.outline,
     paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingVertical: 12,
   },
   assistantBubble: {
-    backgroundColor: "#262626",
-    borderBottomLeftRadius: 6,
+    backgroundColor: colors.surface,
+    borderBottomLeftRadius: 8,
   },
   userBubble: {
-    backgroundColor: "#6D5CA8",
-    borderBottomRightRadius: 6,
+    backgroundColor: colors.user,
+    borderBottomRightRadius: 8,
   },
   messageText: {
-    color: "#F5F5F5",
+    color: colors.text,
     fontSize: 17,
     lineHeight: 23,
   },
   retryButton: {
     alignSelf: "flex-start",
-    minHeight: 44,
-    minWidth: 44,
+    minHeight: 48,
+    minWidth: 48,
     justifyContent: "center",
     marginTop: 2,
   },
   retryLabel: {
-    color: "#C4B5FD",
+    color: colors.accent,
     fontSize: 15,
     fontWeight: "600",
   },
   subagentCard: {
-    gap: 2,
+    gap: 8,
     marginBottom: 8,
-    paddingBottom: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#3F3F3F",
+    padding: 12,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: colors.outline,
+    backgroundColor: colors.inset,
   },
   subagentRole: {
-    color: "#C4B5FD",
+    color: colors.accent,
     fontSize: 13,
     fontWeight: "600",
   },
   subagentAssignment: {
-    color: "#F5F5F5",
+    color: colors.text,
     fontSize: 15,
     lineHeight: 20,
   },
   subagentState: {
-    color: "#A3A3A3",
+    color: colors.muted,
     fontSize: 13,
   },
   questionPrompt: {
-    color: "#F5F5F5",
+    color: colors.text,
     fontSize: 15,
     lineHeight: 20,
     marginTop: 6,
   },
   questionOption: {
-    alignSelf: "flex-start",
-    minHeight: 44,
-    minWidth: 44,
+    alignSelf: "stretch",
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: colors.outline,
+    minHeight: 48,
+    minWidth: 48,
     justifyContent: "center",
     marginTop: 4,
     paddingHorizontal: 8,
-    borderRadius: 8,
+    borderRadius: 16,
   },
   questionOptionSelected: {
-    backgroundColor: "#3F3F3F",
+    borderColor: colors.accent,
+    backgroundColor: colors.user,
   },
   questionOptionLabel: {
-    color: "#C4B5FD",
+    color: colors.accent,
     fontSize: 15,
     fontWeight: "600",
   },
   questionInput: {
-    minHeight: 44,
+    borderWidth: 1,
+    borderColor: colors.outline,
+    minHeight: 48,
     marginTop: 8,
-    borderRadius: 12,
-    backgroundColor: "#1E1E1E",
-    color: "#F5F5F5",
+    borderRadius: 18,
+    backgroundColor: colors.inset,
+    color: colors.text,
     fontSize: 16,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
   questionSend: {
     alignSelf: "flex-start",
-    minHeight: 44,
-    minWidth: 44,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 16,
+    backgroundColor: colors.accent,
+    minHeight: 48,
+    minWidth: 48,
     justifyContent: "center",
     marginTop: 4,
   },
   questionSendLabel: {
-    color: "#C4B5FD",
+    color: colors.canvas,
     fontSize: 15,
     fontWeight: "600",
   },
   taskControl: {
     alignSelf: "flex-start",
-    minHeight: 44,
-    minWidth: 44,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: colors.outline,
+    borderRadius: 16,
+    backgroundColor: colors.surface,
+    minHeight: 48,
+    minWidth: 48,
     justifyContent: "center",
     marginTop: 4,
   },
   taskControlLabel: {
-    color: "#C4B5FD",
+    color: colors.accent,
     fontSize: 15,
     fontWeight: "600",
   },
@@ -1759,25 +1834,35 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   memoryCard: {
-    gap: 4,
-    paddingBottom: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: "#3F3F3F",
+    gap: 10,
+    padding: 16,
+    borderWidth: 1,
+    borderRadius: 22,
+    borderColor: colors.outline,
+    backgroundColor: colors.surface,
   },
   memoryMeta: {
-    color: "#A3A3A3",
+    color: colors.muted,
     fontSize: 13,
     lineHeight: 18,
   },
   privacyNotice: {
-    color: "#D4D4D4",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    color: colors.secondary,
     fontSize: 15,
     lineHeight: 22,
   },
   memoryPause: {
     alignSelf: "flex-start",
-    minHeight: 44,
-    minWidth: 44,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: colors.accent,
+    backgroundColor: colors.surface,
+    minHeight: 48,
+    minWidth: 48,
     justifyContent: "center",
   },
   memoryActions: {
@@ -1786,10 +1871,12 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   memoryInput: {
-    minHeight: 44,
-    borderRadius: 12,
-    backgroundColor: "#1E1E1E",
-    color: "#F5F5F5",
+    borderWidth: 1,
+    borderColor: colors.outline,
+    minHeight: 48,
+    borderRadius: 18,
+    backgroundColor: colors.inset,
+    color: colors.text,
     fontSize: 16,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -1801,30 +1888,33 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: "#2A2A2A",
+    backgroundColor: colors.surface,
+    borderTopWidth: 1,
+    borderTopColor: colors.outline,
   },
   composerInput: {
+    borderWidth: 1,
+    borderColor: colors.outline,
     flex: 1,
-    minHeight: 44,
+    minHeight: 48,
     maxHeight: 120,
     borderRadius: 18,
-    backgroundColor: "#1E1E1E",
-    color: "#F5F5F5",
+    backgroundColor: colors.inset,
+    color: colors.text,
     fontSize: 17,
     paddingHorizontal: 14,
     paddingVertical: 10,
   },
   sendButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 48,
+    height: 48,
+    borderRadius: 18,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#C4B5FD",
+    backgroundColor: colors.accent,
   },
   sendLabel: {
-    color: "#121212",
+    color: colors.canvas,
     fontSize: 26,
     fontWeight: "600",
     lineHeight: 30,
@@ -1842,24 +1932,24 @@ const styles = StyleSheet.create({
     gap: 16,
   },
   title: {
-    color: "#F5F5F5",
-    fontSize: 28,
-    fontWeight: "600",
+    color: colors.text,
+    fontSize: 36,
+    fontWeight: "700",
     letterSpacing: 0.2,
   },
   lede: {
-    color: "#A3A3A3",
+    color: colors.muted,
     fontSize: 17,
     lineHeight: 24,
   },
   meta: {
-    color: "#A3A3A3",
+    color: colors.muted,
     fontSize: 16,
     lineHeight: 22,
   },
   sectionLabel: {
-    color: "#D4D4D4",
-    fontSize: 13,
+    color: colors.accent,
+    fontSize: 17,
     fontWeight: "600",
     letterSpacing: 0.2,
     marginTop: 8,
@@ -1868,16 +1958,16 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   fieldLabel: {
-    color: "#D4D4D4",
+    color: colors.secondary,
     fontSize: 13,
     fontWeight: "600",
   },
   input: {
-    backgroundColor: "#1E1E1E",
-    borderColor: "#3F3F3F",
+    backgroundColor: colors.inset,
+    borderColor: colors.outline,
     borderWidth: 1,
-    borderRadius: 12,
-    color: "#F5F5F5",
+    borderRadius: 18,
+    color: colors.text,
     fontSize: 17,
     minHeight: 48,
     paddingHorizontal: 14,
@@ -1888,15 +1978,16 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 14,
-    backgroundColor: "#1E1E1E",
-    borderColor: "#3F3F3F",
+    backgroundColor: colors.inset,
+    borderColor: colors.outline,
     borderWidth: 1,
-    borderRadius: 12,
+    borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 14,
   },
   choiceSelected: {
-    borderColor: "#C4B5FD",
+    backgroundColor: colors.surface,
+    borderColor: colors.accent,
   },
   choicePressed: {
     opacity: 0.85,
@@ -1906,23 +1997,23 @@ const styles = StyleSheet.create({
     height: 22,
     borderRadius: 11,
     borderWidth: 1.5,
-    borderColor: "#8A8A8A",
+    borderColor: colors.muted,
   },
   choiceMarkSelected: {
-    borderColor: "#C4B5FD",
-    backgroundColor: "#C4B5FD",
+    borderColor: colors.accent,
+    backgroundColor: colors.accent,
   },
   choiceCopy: {
     flex: 1,
     gap: 2,
   },
   choiceTitle: {
-    color: "#F5F5F5",
+    color: colors.text,
     fontSize: 17,
     fontWeight: "600",
   },
   choiceDetail: {
-    color: "#A3A3A3",
+    color: colors.muted,
     fontSize: 15,
     lineHeight: 20,
   },
@@ -1934,8 +2025,10 @@ const styles = StyleSheet.create({
     minHeight: 8,
   },
   button: {
-    backgroundColor: "#C4B5FD",
-    borderRadius: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    backgroundColor: colors.accent,
+    borderRadius: 18,
     minHeight: 48,
     alignItems: "center",
     justifyContent: "center",
@@ -1947,19 +2040,19 @@ const styles = StyleSheet.create({
     opacity: 0.8,
   },
   buttonLabel: {
-    color: "#121212",
+    color: colors.canvas,
     fontSize: 17,
     fontWeight: "600",
   },
   status: {
-    color: "#D4D4D4",
+    color: colors.secondary,
     fontSize: 16,
     lineHeight: 22,
   },
   statusSuccess: {
-    color: "#4ADE80",
+    color: colors.success,
   },
   statusError: {
-    color: "#F87171",
+    color: colors.danger,
   },
 });
