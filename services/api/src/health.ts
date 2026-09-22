@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
+  parseApprovalDecision,
   parseAccountDeleteRequest,
   parseAccountDeleteResponse,
   parseHealthResponse,
@@ -61,11 +62,17 @@ import {
   webResearchDepsForTask,
 } from "./web-research.ts";
 import {
+  inspectBrowserEffect,
+  invokeBrowserEffect,
   invokeBrowserOpen,
+  isBrowserEffectAction,
   isBrowserOpenAction,
   isCookieBrowserPrompt,
+  parseFormPrompt,
   parsePublicOpenPrompt,
   runCookieBrowser,
+  runFormEffect,
+  runFormPreview,
   runPublicBrowserOpen,
   type BrowserDeps,
 } from "./browser.ts";
@@ -287,22 +294,27 @@ async function handleTaskAction(
         files: task.approval.files,
         maxCostCents: task.approval.maxCostCents,
       };
-      const live = webResearchDepsForTask(store, task.id, web);
+      const decision = parseApprovalDecision(body);
+      const browserDeps = {
+        ...web,
+        ...webResearchDepsForTask(store, task.id, web),
+        store,
+        owner,
+        taskId: task.id,
+        retention,
+      };
+      const actual =
+        decision.consent && isBrowserEffectAction(stored) ? await inspectBrowserEffect(stored, browserDeps) : stored;
       const invoke =
         stored.actionClass === "data_disclosure"
           ? (actionArg: typeof stored, key: string) =>
               isBrowserOpenAction(actionArg)
-                ? invokeBrowserOpen(actionArg, key, {
-                    ...web,
-                    ...live,
-                    store,
-                    owner,
-                    taskId: task.id,
-                    retention,
-                  })
-                : invokeDataDisclosure(actionArg, key, live)
-          : mockExternalWrite;
-      const updated = await decideApproval(store, owner, task.id, body, stored, invoke);
+                ? invokeBrowserOpen(actionArg, key, browserDeps)
+                : invokeDataDisclosure(actionArg, key, browserDeps)
+          : isBrowserEffectAction(stored)
+            ? (actionArg: typeof stored, key: string) => invokeBrowserEffect(actionArg, key, browserDeps)
+            : mockExternalWrite;
+      const updated = await decideApproval(store, owner, task.id, body, actual, invoke);
       writeJson(res, parseSubagentCard(subagentCard(updated)));
       return;
     }
@@ -460,6 +472,33 @@ async function emitChatEvents(
     }
   }
 
+  const formPrompt = parseFormPrompt(message);
+  if (formPrompt !== undefined) {
+    if (!webResearchEnabled) {
+      push([...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }]);
+      return;
+    }
+    try {
+      const run =
+        formPrompt.kind === "preview"
+          ? await runFormPreview(store, owner, message, formPrompt.value, {
+              ...web,
+              retention,
+              onCard: (card) => emit({ type: "subagent", ...card }),
+            })
+          : await runFormEffect(store, owner, message, formPrompt.effect, formPrompt.value, {
+              ...web,
+              retention,
+              onCard: (card) => emit({ type: "subagent", ...card }),
+            });
+      push([...formRunFollowUp(run), { type: "done" }]);
+      return;
+    } catch {
+      push([...deltaEvents("Isolated browser failed."), { type: "done" }]);
+      return;
+    }
+  }
+
   const openUrl = parsePublicOpenPrompt(message);
   if (openUrl !== undefined) {
     if (!webResearchEnabled) {
@@ -502,6 +541,15 @@ async function emitChatEvents(
 
   // ponytail: deterministic bridge until the gated provider adapter in Issue #8 is activated.
   push([...deltaEvents(`No model is connected yet. You said: ${message}`), { type: "done" }]);
+}
+
+function formRunFollowUp(run: { cards: SubagentCard[]; result?: string }): ChatStreamEvent[] {
+  if (run.cards.some((card) => card.approval?.state === "pending")) {
+    return deltaEvents("Review the browser action before it runs. Nothing has been sent.");
+  }
+  if (run.result !== undefined) return deltaEvents(run.result);
+  if (run.cards.some((card) => card.state === "stopped")) return deltaEvents("Isolated browser stopped.");
+  return deltaEvents("Isolated browser failed.");
 }
 
 function browserRunFollowUp(run: { cards: SubagentCard[]; result?: string }): ChatStreamEvent[] {
