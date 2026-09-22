@@ -82,6 +82,9 @@ import {
   type ShotCacheEntry,
 } from "./screenshots";
 import {
+  approvalConsentHint,
+  approvalExpiryHint,
+  consumedApprovalLabel,
   isStoppableState,
   isTaskDecisionDisabled,
   isTaskStopDisabled,
@@ -1440,15 +1443,11 @@ function SubagentStatusCard({
           <Text style={styles.subagentState}>Expires: {new Date(card.approval.expiresAt).toLocaleString()}</Text>
           <Text selectable style={styles.subagentState}>SHA-256: {card.approval.payloadDigest}</Text>
           <Text accessibilityLiveRegion="polite" style={styles.subagentState}>
-            {card.approval.state === "consumed" ? "Consumed — cannot run again." : card.approval.state}
+            {consumedApprovalLabel(card.approval, card.state)}
           </Text>
           {card.approval.state === "pending" ? (
             <>
-              <Text style={styles.subagentState}>
-                {card.approval.actionClass === "data_disclosure"
-                  ? "If expired, send the same HTTPS URL again for a new disclosure preview."
-                  : "If expired, send the simulation prompt again for a new preview."}
-              </Text>
+              <Text style={styles.subagentState}>{approvalExpiryHint(card.approval)}</Text>
               {[true, false].map((consent) => {
                 const locked = approvalDisabled;
                 return (
@@ -1458,13 +1457,7 @@ function SubagentStatusCard({
                     disabled={locked}
                     accessibilityRole="button"
                     accessibilityLabel={consent ? "Approve once" : "Reject action"}
-                    accessibilityHint={
-                      consent
-                        ? card.approval!.actionClass === "data_disclosure"
-                          ? "Sends the bound request once after consent."
-                          : "Runs the mocked write once. Nothing is sent externally."
-                        : "Makes no call."
-                    }
+                    accessibilityHint={approvalConsentHint(card.approval!, consent)}
                     accessibilityState={{ disabled: locked, busy: decisionBusy }}
                     style={[styles.taskControl, locked && styles.buttonDisabled]}
                   >

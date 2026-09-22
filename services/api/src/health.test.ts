@@ -1191,7 +1191,7 @@ test("cookie chat streams live steps and screenshot ids before done", async () =
     const driver: BrowserDriver = {
       async run(plan, deps) {
         for (const op of plan.ops) {
-          if (op.op === "hang") continue;
+          if (op.op === "hang" || op.op === "fill" || op.op === "snapshot") continue;
           await new Promise((resolve) => setTimeout(resolve, 25));
           const { putArtifact } = await import("./retention.ts");
           const record = putArtifact(retention, { ownerId: "alpha-owner" }, { kind: "screenshot", body: jpeg });

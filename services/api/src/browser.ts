@@ -5,21 +5,30 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { ApprovalAction, SubagentCard, BrowserStep } from "@lilith/contracts";
 import { parseBrowserStepOp } from "@lilith/contracts";
-import { parsePublicHttpsUrl } from "./ssrf.ts";
+import { parsePublicHttpsUrl, pinnedHttpsGet, resolvePublicHttps } from "./ssrf.ts";
 import {
   ALLOWED_WORKSPACE_FILES,
+  BROWSER_EFFECTS,
   COOKIE_ACCEPT_RE,
   COOKIE_BARE_OK_RE,
   COOKIE_DIALOG_LOCATOR,
   COOKIE_FIXTURE_FILE,
   COOKIE_HAS_RE,
   COOKIE_NEED_RE,
+  FORM_FIXTURE_FILE,
+  FORM_FIXTURE_WORKSPACE_PATH,
+  FORM_NOTE_ID,
   SENSITIVE_FIXTURE_FILE,
   SENSITIVE_INPUT_SELECTOR,
   SENSITIVE_QUERY_KEYS,
   UNSAFE_PIXEL_SELECTOR,
   assertPublicUrlProjection,
+  formControlsFromNodes,
+  formDomDigest,
   sanitizeBrowserUrl,
+  type BrowserEffect,
+  type FormControlSnapshot,
+  type RawFormNode,
 } from "./browser-policy.ts";
 import {
   closeHostProtocol,
@@ -69,10 +78,31 @@ export { COOKIE_FIXTURE_FILE };
 export const COOKIE_ASSIGNMENT = "Open the cookie test page in the isolated browser.";
 export const PUBLIC_OPEN_PROMPT_PREFIX = "Öffne ";
 export const PUBLIC_OPEN_ASSIGNMENT = "Open one public HTTPS page in the isolated browser.";
+export const FORM_PREVIEW_PROMPT_PREFIX = "Bereite den Formulartext vor: ";
+export const FORM_SUBMIT_PROMPT_PREFIX = "Sende das Formular: ";
+export const FORM_UPLOAD_PROMPT_PREFIX = "Lade die Formulardatei hoch: ";
+export const FORM_MESSAGE_PROMPT_PREFIX = "Sende die Formularnachricht: ";
+export const FORM_PURCHASE_PROMPT_PREFIX = "Kaufe im Formular: ";
+export const FORM_AMBIGUOUS_PROMPT_PREFIX = "Klicke unklar im Formular: ";
+export const FORM_PREVIEW_ASSIGNMENT = "Prepare form text as a preview.";
+export const FORM_EFFECT_ASSIGNMENT = "Wait for one-time approval before a browser action with external effect.";
+export const FORM_VALUE_MAX = 200;
+export const FORM_UPLOAD_PATH = "upload.txt";
+const FORM_FILE_URL = `file://${FORM_FIXTURE_WORKSPACE_PATH}`;
+const FORM_PROMPT_KINDS = [
+  [FORM_PREVIEW_PROMPT_PREFIX, "preview"],
+  [FORM_SUBMIT_PROMPT_PREFIX, "submit"],
+  [FORM_UPLOAD_PROMPT_PREFIX, "upload"],
+  [FORM_MESSAGE_PROMPT_PREFIX, "message"],
+  [FORM_PURCHASE_PROMPT_PREFIX, "purchase"],
+  [FORM_AMBIGUOUS_PROMPT_PREFIX, "ambiguous"],
+] as const;
+const OUTWARD_BROWSER_OPS = new Set(["effect", "submit", "upload", "message", "purchase", "click"]);
 
 const WORKER_FILE = fileURLToPath(new URL("./browser-worker.mjs", import.meta.url));
 const COOKIE_FIXTURE = fileURLToPath(new URL("../../../fixtures/browser/cookie.html", import.meta.url));
 const SENSITIVE_FIXTURE = fileURLToPath(new URL("../../../fixtures/browser/sensitive.html", import.meta.url));
+const FORM_FIXTURE = fileURLToPath(new URL("../../../fixtures/browser/form.html", import.meta.url));
 const require = createRequire(import.meta.url);
 const PLAYWRIGHT_CORE_ROOT = dirname(require.resolve("playwright-core/package.json"));
 export const MAX_BROWSER_SHOTS_PER_JOB = 12;
@@ -85,7 +115,9 @@ export type BrowserOp =
   | { op: "find"; text: string }
   | { op: "scroll"; dy?: number }
   | { op: "screenshot" }
-  | { op: "hang" };
+  | { op: "hang" }
+  | { op: "fill"; selector: "#note"; value: string }
+  | { op: "snapshot" };
 
 export type BrowserPlan = {
   ops: BrowserOp[];
@@ -105,6 +137,7 @@ export type BrowserOpResult = {
   maskedFields?: number;
   coveredSurfaces?: number;
   projected?: { name: string; autocomplete: string; value: string; title: string; ariaLabel: string }[];
+  nodes?: RawFormNode[];
 };
 
 export type BrowserSessionResult = {
@@ -275,6 +308,120 @@ export async function invokeBrowserOpen(
   return formatBrowserResult(session);
 }
 
+export type FormPrompt =
+  | { kind: "preview"; value: string }
+  | { kind: "effect"; effect: BrowserEffect; value: string };
+
+export function parseFormPrompt(message: string): FormPrompt | undefined {
+  const trimmed = message.trim();
+  for (const [prefix, kind] of FORM_PROMPT_KINDS) {
+    if (!trimmed.startsWith(prefix)) continue;
+    const value = formPromptValue(trimmed.slice(prefix.length));
+    if (value === undefined) return undefined;
+    if (kind === "preview") return { kind: "preview", value };
+    return { kind: "effect", effect: kind, value };
+  }
+  return undefined;
+}
+
+export function formatBrowserEffectPreview(value: string): string {
+  return `Preview: ${value}`;
+}
+
+export function formatBrowserEffectExecuted(effect: BrowserEffect): string {
+  return `Browser action executed once (${effect}). This cannot be undone.`;
+}
+
+export function isBrowserEffectAction(action: ApprovalAction): boolean {
+  if (action.actionClass !== "external_effect") return false;
+  try {
+    const parsed: unknown = JSON.parse(action.payload);
+    return (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      "tool" in parsed &&
+      parsed.tool === "browser-effect"
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function assertPlanHasNoOutwardOp(plan: BrowserPlan): void {
+  for (const op of plan.ops) {
+    if (OUTWARD_BROWSER_OPS.has(op.op)) throw new Error("Outward browser action requires approval");
+  }
+}
+
+export async function runFormPreview(
+  store: TaskStore,
+  owner: OwnerContext,
+  message: string,
+  value: string,
+  deps: BrowserDeps = {},
+): Promise<{ cards: SubagentCard[]; result?: string }> {
+  return runFormTask(store, owner, message, FORM_PREVIEW_ASSIGNMENT, deps, async (taskId, emit) => {
+    const session = await runBrowserSession(previewPlan(value), store, owner, taskId, { ...deps, onCard: emit });
+    const filled = session.results.find((result) => result.op === "fill")?.text;
+    if (filled !== value) throw new Error("Browser job failed");
+    return formatBrowserEffectPreview(value);
+  });
+}
+
+export async function runFormEffect(
+  store: TaskStore,
+  owner: OwnerContext,
+  message: string,
+  effect: BrowserEffect,
+  value: string,
+  deps: BrowserDeps = {},
+): Promise<{ cards: SubagentCard[]; result?: string }> {
+  return runFormTask(store, owner, message, FORM_EFFECT_ASSIGNMENT, deps, async (taskId, emit) => {
+    const controls = await observeForm(value, { ...deps, onCard: emit, store, owner, taskId });
+    openApproval(store, owner, taskId, actionFromControls(controls, effect, value, randomUUID()));
+    return undefined;
+  });
+}
+
+export async function inspectBrowserEffect(
+  action: ApprovalAction,
+  deps: BrowserDeps & { store: TaskStore; owner: OwnerContext; taskId: string },
+): Promise<ApprovalAction> {
+  const bound = parseBoundEffect(action);
+  const controls = await observeForm(bound.note, deps);
+  return actionFromControls(controls, bound.effect, bound.note, action.actionId);
+}
+
+export async function invokeBrowserEffect(
+  action: ApprovalAction,
+  idempotencyKey: string,
+  deps: BrowserDeps & { store: TaskStore; owner: OwnerContext; taskId: string },
+): Promise<string> {
+  if (idempotencyKey !== action.actionId) throw new Error("Approval changed; request new consent");
+  const bound = parseBoundEffect(action);
+  const signal = mergeSignals(deps.signal, researchAbortSignal(deps.store, deps.taskId));
+  const live = actionFromControls(
+    await observeForm(bound.note, { ...deps, signal }),
+    bound.effect,
+    bound.note,
+    action.actionId,
+  );
+  if (
+    live.payload !== action.payload ||
+    live.operation !== action.operation ||
+    live.origin !== action.origin ||
+    JSON.stringify(live.files) !== JSON.stringify(action.files)
+  ) {
+    throw new Error("Approval changed; request new consent");
+  }
+  // ponytail: the outward effect is one pinned HTTPS POST, not an in-page click.
+  // Chromium stays network=none, so a click cannot open a second egress path.
+  // Upgrade path: gated click after this same digest check, still fulfilled only here.
+  await postBoundEffect(bound, action.payload, idempotencyKey, { ...deps, signal });
+  return formatBrowserEffectExecuted(bound.effect);
+}
+
 export async function runBrowserSession(
   plan: BrowserPlan,
   store: TaskStore,
@@ -282,6 +429,7 @@ export async function runBrowserSession(
   taskId: string,
   deps: BrowserDeps = {},
 ): Promise<BrowserSessionResult> {
+  assertPlanHasNoOutwardOp(plan);
   const driver = deps.driver ?? dockerBrowserDriver;
   return await driver.run(plan, {
     ...deps,
@@ -349,6 +497,278 @@ function browserOpenAction(request: { url: string }, actionId: string = randomUU
     files: [],
     maxCostCents: 0,
   };
+}
+
+type BoundEffect = {
+  effect: BrowserEffect;
+  url: string;
+  domDigest: string;
+  target: string;
+  fields: { name: string; value: string }[];
+  file?: { path: string; content: string };
+  note: string;
+};
+
+async function runFormTask(
+  store: TaskStore,
+  owner: OwnerContext,
+  message: string,
+  assignment: string,
+  deps: BrowserDeps,
+  work: (taskId: string, emit: (card: SubagentCard) => SubagentCard) => Promise<string | undefined>,
+): Promise<{ cards: SubagentCard[]; result?: string }> {
+  const parent = createParentTask(store, owner, message);
+  const started = startSubagent(store, owner, { parentTaskId: parent.id, assignment, role: "research" });
+  const cards: SubagentCard[] = [];
+  const emit = (card: SubagentCard): SubagentCard => {
+    cards.push(card);
+    deps.onCard?.(card);
+    return card;
+  };
+  try {
+    emit(subagentCard(started));
+    emit(subagentCard(setTaskState(store, owner, started.id, "working")));
+    startTool(store, owner, started.id);
+    const result = await work(started.id, emit);
+    if (result === undefined) {
+      const opened = store.tasks.get(started.id);
+      if (opened === undefined) throw new Error("Task not found");
+      emit(subagentCard(opened));
+      return { cards };
+    }
+    emit(subagentCard(setTaskState(store, owner, started.id, "completed", result)));
+    setTaskState(store, owner, parent.id, "completed", result);
+    return { cards, result };
+  } catch {
+    failBrowser(store, owner, started.id, parent.id);
+    const failed = store.tasks.get(started.id);
+    if (failed !== undefined && failed.role === "research") emit(subagentCard(failed));
+    return { cards };
+  }
+}
+
+function previewPlan(value: string): BrowserPlan {
+  return {
+    ops: [
+      { op: "open", url: FORM_FILE_URL },
+      { op: "fill", selector: "#note", value },
+      { op: "read" },
+    ],
+    approved: [],
+  };
+}
+
+async function observeForm(
+  value: string,
+  deps: BrowserDeps & { store: TaskStore; owner: OwnerContext; taskId: string },
+): Promise<FormControlSnapshot[]> {
+  const session = await runBrowserSession(
+    {
+      ops: [
+        { op: "open", url: FORM_FILE_URL },
+        { op: "fill", selector: "#note", value },
+        { op: "snapshot" },
+      ],
+      approved: [],
+    },
+    deps.store,
+    deps.owner,
+    deps.taskId,
+    deps,
+  );
+  const nodes = session.results.find((result) => result.op === "snapshot")?.nodes;
+  if (nodes === undefined) throw new Error("Browser job failed");
+  const controls = formControlsFromNodes(parseRawNodes(nodes));
+  const note = controls.find((control) => control.id === FORM_NOTE_ID && control.effect === "text");
+  if (note === undefined || note.name !== "note" || note.value !== value) throw new Error("Browser job failed");
+  return controls;
+}
+
+function actionFromControls(
+  controls: readonly FormControlSnapshot[],
+  effect: BrowserEffect,
+  value: string,
+  actionId: string,
+): ApprovalAction {
+  const target = controls.find((control) => control.effect === effect);
+  if (target === undefined || target.label.trim() === "") throw new Error("Approval changed; request new consent");
+  let url: URL;
+  try {
+    url = parsePublicHttpsUrl(target.action);
+    assertPublicUrlProjection(url.href);
+  } catch {
+    throw new Error("Approval changed; request new consent");
+  }
+  const fields = controls
+    .filter((control) => control.effect === "text")
+    .map((control) => ({ name: control.name, value: control.value }));
+  if (fields.length !== 1 || fields[0]?.name !== "note" || fields[0]?.value !== value) {
+    throw new Error("Approval changed; request new consent");
+  }
+  const file = effect === "upload" ? { path: FORM_UPLOAD_PATH, content: value } : undefined;
+  return {
+    actionId,
+    actionClass: "external_effect",
+    origin: url.origin,
+    operation: `POST ${url.pathname}${url.search}`,
+    payload: JSON.stringify({
+      tool: "browser-effect",
+      effect,
+      url: url.href,
+      domDigest: formDomDigest(controls),
+      target: target.label,
+      fields,
+      ...(file === undefined ? {} : { file }),
+    }),
+    files: file === undefined ? [] : [file],
+    maxCostCents: 0,
+  };
+}
+
+function parseBoundEffect(action: ApprovalAction): BoundEffect {
+  if (!isBrowserEffectAction(action)) throw new Error("Approval changed; request new consent");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(action.payload);
+  } catch {
+    throw new Error("Approval changed; request new consent");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Approval changed; request new consent");
+  }
+  const record = parsed as Record<string, unknown>;
+  const effect = record.effect;
+  if (typeof effect !== "string" || !isBrowserEffectName(effect)) throw new Error("Approval changed; request new consent");
+  if (typeof record.url !== "string" || typeof record.domDigest !== "string" || !/^[a-f0-9]{64}$/.test(record.domDigest)) {
+    throw new Error("Approval changed; request new consent");
+  }
+  if (typeof record.target !== "string" || record.target.trim() === "" || record.target.length > 200) {
+    throw new Error("Approval changed; request new consent");
+  }
+  if (!Array.isArray(record.fields) || record.fields.length !== 1) throw new Error("Approval changed; request new consent");
+  const field: unknown = record.fields[0];
+  if (typeof field !== "object" || field === null || Array.isArray(field)) {
+    throw new Error("Approval changed; request new consent");
+  }
+  const fieldRecord = field as Record<string, unknown>;
+  if (
+    Object.keys(fieldRecord).length !== 2 ||
+    fieldRecord.name !== "note" ||
+    typeof fieldRecord.value !== "string" ||
+    formPromptValue(fieldRecord.value) === undefined
+  ) {
+    throw new Error("Approval changed; request new consent");
+  }
+  const note = fieldRecord.value;
+  let url: URL;
+  try {
+    url = parsePublicHttpsUrl(record.url);
+  } catch {
+    throw new Error("Approval changed; request new consent");
+  }
+  if (url.origin !== action.origin || action.operation !== `POST ${url.pathname}${url.search}`) {
+    throw new Error("Approval changed; request new consent");
+  }
+  const file = parseBoundFile(effect, record.file, action, note);
+  const allowed = file === undefined
+    ? ["tool", "effect", "url", "domDigest", "target", "fields"]
+    : ["tool", "effect", "url", "domDigest", "target", "fields", "file"];
+  if (Object.keys(record).length !== allowed.length || Object.keys(record).some((key) => !allowed.includes(key))) {
+    throw new Error("Approval changed; request new consent");
+  }
+  return {
+    effect,
+    url: url.href,
+    domDigest: record.domDigest,
+    target: record.target,
+    fields: [{ name: "note", value: note }],
+    ...(file === undefined ? {} : { file }),
+    note,
+  };
+}
+
+function parseBoundFile(
+  effect: BrowserEffect,
+  file: unknown,
+  action: ApprovalAction,
+  note: string,
+): { path: string; content: string } | undefined {
+  if (effect !== "upload") {
+    if (file !== undefined || action.files.length !== 0) throw new Error("Approval changed; request new consent");
+    return undefined;
+  }
+  if (typeof file !== "object" || file === null || Array.isArray(file)) {
+    throw new Error("Approval changed; request new consent");
+  }
+  const record = file as Record<string, unknown>;
+  if (Object.keys(record).length !== 2 || record.path !== FORM_UPLOAD_PATH || record.content !== note) {
+    throw new Error("Approval changed; request new consent");
+  }
+  if (action.files.length !== 1 || action.files[0]?.path !== FORM_UPLOAD_PATH || action.files[0]?.content !== note) {
+    throw new Error("Approval changed; request new consent");
+  }
+  return { path: FORM_UPLOAD_PATH, content: note };
+}
+
+function parseRawNodes(value: RawFormNode[]): RawFormNode[] {
+  if (value.length > 40) throw new Error("Browser job failed");
+  return value.map((entry) => {
+    const record = entry as unknown;
+    if (typeof record !== "object" || record === null || Array.isArray(record)) throw new Error("Browser job failed");
+    const node = record as Record<string, unknown>;
+    const keys = ["id", "tag", "type", "name", "label", "value", "action"];
+    if (Object.keys(node).length !== keys.length || keys.some((key) => typeof node[key] !== "string")) {
+      throw new Error("Browser job failed");
+    }
+    return {
+      id: boundedNode(node.id),
+      tag: boundedNode(node.tag),
+      type: boundedNode(node.type),
+      name: boundedNode(node.name),
+      label: boundedNode(node.label),
+      value: boundedNode(node.value),
+      action: boundedNode(node.action),
+    };
+  });
+}
+
+function boundedNode(value: unknown): string {
+  if (typeof value !== "string" || value.length > 400) throw new Error("Browser job failed");
+  return value;
+}
+
+async function postBoundEffect(
+  bound: BoundEffect,
+  payload: string,
+  idempotencyKey: string,
+  deps: BrowserDeps,
+): Promise<void> {
+  if (deps.signal?.aborted) throw new Error("Web research cancelled");
+  const url = parsePublicHttpsUrl(bound.url);
+  const resolved = await resolvePublicHttps(url.href, deps.lookupAll, deps.signal);
+  if (deps.signal?.aborted) throw new Error("Web research cancelled");
+  const get = deps.get ?? pinnedHttpsGet;
+  const response = await get({
+    url,
+    hostname: resolved.hostname,
+    addresses: resolved.addresses,
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: payload,
+    ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+  });
+  if (response.status >= 300 && response.status < 400) throw new Error("Redirect rejected");
+  if (response.status !== 200) throw new Error("Fetch failed");
+}
+
+function formPromptValue(raw: string): string | undefined {
+  if (raw.length === 0 || raw.length > FORM_VALUE_MAX || raw !== raw.trim()) return undefined;
+  if (/[\u0000-\u001F\u007F]/.test(raw)) return undefined;
+  return raw;
+}
+
+function isBrowserEffectName(value: string): value is BrowserEffect {
+  return (BROWSER_EFFECTS as readonly string[]).includes(value);
 }
 
 function browserUrlFromApproval(action: ApprovalAction): string {
@@ -553,6 +973,7 @@ async function prepareBrowserWorkspace(workspace: string, plan: BrowserPlan): Pr
   await cp(WORKER_FILE, join(root, "worker.mjs"));
   await cp(COOKIE_FIXTURE, join(workspace, COOKIE_FIXTURE_FILE));
   await cp(SENSITIVE_FIXTURE, join(workspace, SENSITIVE_FIXTURE_FILE));
+  await cp(FORM_FIXTURE, join(workspace, FORM_FIXTURE_FILE));
   await cp(PLAYWRIGHT_CORE_ROOT, join(root, "node_modules", "playwright-core"), {
     recursive: true,
     filter: (source) => !source.includes(".local-browsers"),

@@ -302,6 +302,38 @@ async function runOp(page, op, session) {
     const capture = await captureStep(page, session, "screenshot");
     return { op: "screenshot", file: SHOT, bytes: 0, maskedFields: capture.maskedFields, coveredSurfaces: capture.coveredSurfaces };
   }
+  if (op.op === "fill") {
+    if (op.selector !== "#note" || typeof op.value !== "string" || op.value.length > 200) {
+      throw new Error("Unsupported browser op");
+    }
+    const handle = page.locator("#note");
+    const kind = await handle.evaluate((el) => (el instanceof HTMLInputElement ? el.type : ""));
+    if (kind !== "text") throw new Error("Unsupported browser op");
+    await handle.fill(op.value);
+    return { op: "fill", text: await handle.inputValue() };
+  }
+  if (op.op === "snapshot") {
+    const nodes = await page.evaluate(() => {
+      const found = [];
+      for (const el of document.querySelectorAll("input, button, textarea")) {
+        const tag = el.tagName.toLowerCase();
+        found.push({
+          id: el.id,
+          tag,
+          type: (el.getAttribute("type") ?? "").toLowerCase(),
+          name: el.getAttribute("name") ?? "",
+          label: el.getAttribute("aria-label") ?? "",
+          value: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : "",
+          action: el.getAttribute("data-action") ?? "",
+        });
+      }
+      return found;
+    });
+    return { op: "snapshot", nodes };
+  }
+  if (op.op === "effect" || op.op === "submit" || op.op === "upload" || op.op === "message" || op.op === "purchase" || op.op === "click") {
+    throw new Error("Outward browser action requires approval");
+  }
   if (op.op === "hang") {
     const heartbeatMs = Number(session.heartbeatMs) > 0 ? Number(session.heartbeatMs) : 2_000;
     const heartbeat = setInterval(() => {

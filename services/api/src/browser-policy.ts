@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import {
   MAX_BROWSER_URL_CHARS,
@@ -11,11 +12,15 @@ export { SENSITIVE_QUERY_KEYS, isSensitiveQueryKey };
 export const WORKSPACE_ROOT = "/workspace";
 export const COOKIE_FIXTURE_FILE = "cookie.html";
 export const SENSITIVE_FIXTURE_FILE = "sensitive.html";
+export const FORM_FIXTURE_FILE = "form.html";
+export const FORM_NOTE_ID = "note";
 export const COOKIE_FIXTURE_WORKSPACE_PATH = `${WORKSPACE_ROOT}/${COOKIE_FIXTURE_FILE}`;
 export const SENSITIVE_FIXTURE_WORKSPACE_PATH = `${WORKSPACE_ROOT}/${SENSITIVE_FIXTURE_FILE}`;
+export const FORM_FIXTURE_WORKSPACE_PATH = `${WORKSPACE_ROOT}/${FORM_FIXTURE_FILE}`;
 export const ALLOWED_WORKSPACE_FILES = [
   COOKIE_FIXTURE_WORKSPACE_PATH,
   SENSITIVE_FIXTURE_WORKSPACE_PATH,
+  FORM_FIXTURE_WORKSPACE_PATH,
 ] as const;
 export const COOKIE_DIALOG_LOCATOR =
   '[role="dialog"], [role="alertdialog"], [id*="cookie" i], [class*="cookie" i]';
@@ -164,4 +169,112 @@ export function assertPublicUrlProjection(raw: string): string {
     }
   }
   return preview;
+}
+
+export const BROWSER_EFFECTS = ["submit", "upload", "message", "purchase", "ambiguous"] as const;
+export type BrowserEffect = (typeof BROWSER_EFFECTS)[number];
+export type FormEffect = "text" | BrowserEffect;
+
+const PURCHASE_RE = /\b(?:buy|purchase|checkout|kaufen|bezahlen|bestellen)\b/i;
+const MESSAGE_RE = /\b(?:message|nachricht|reply|comment|kommentar)\b/i;
+const TEXT_INPUT_TYPES = new Set(["", "text", "search", "email", "tel", "url", "number"]);
+
+export type RawFormNode = {
+  id: string;
+  tag: string;
+  type: string;
+  name: string;
+  label: string;
+  value: string;
+  action: string;
+};
+
+export type FormControlSnapshot = {
+  id: string;
+  effect: FormEffect;
+  name: string;
+  label: string;
+  value: string;
+  action: string;
+};
+
+export function classifyFormNode(node: RawFormNode): FormControlSnapshot | undefined {
+  const tag = node.tag.trim().toLowerCase();
+  const type = node.type.trim().toLowerCase();
+  const id = node.id.trim();
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) return undefined;
+  const effect = formEffect(tag, type, node.label);
+  if (effect === undefined) return undefined;
+  return {
+    id,
+    effect,
+    name: node.name.trim(),
+    label: node.label.trim(),
+    value: effect === "text" ? node.value : "",
+    action: node.action.trim(),
+  };
+}
+
+export function formControlsFromNodes(nodes: readonly RawFormNode[]): FormControlSnapshot[] {
+  const controls: FormControlSnapshot[] = [];
+  for (const node of nodes) {
+    const classified = classifyFormNode(node);
+    if (classified !== undefined) controls.push(classified);
+  }
+  controls.sort((left, right) => left.id.localeCompare(right.id));
+  return controls;
+}
+
+export function canonicalFormControls(controls: readonly FormControlSnapshot[]): string {
+  return JSON.stringify(
+    controls.map((control) => ({
+      action: control.action,
+      effect: control.effect,
+      id: control.id,
+      label: control.label,
+      name: control.name,
+      value: control.value,
+    })),
+  );
+}
+
+export function formDomDigest(controls: readonly FormControlSnapshot[]): string {
+  return createHash("sha256").update(canonicalFormControls(controls)).digest("hex");
+}
+
+export function parseFormNodes(html: string): RawFormNode[] {
+  const nodes: RawFormNode[] = [];
+  const re = /<(input|button|textarea)\b([^>]*)>(?:([^<]*)<\/\1>)?/gi;
+  for (const match of html.matchAll(re)) {
+    const tag = match[1]?.toLowerCase() ?? "";
+    const attrs = match[2] ?? "";
+    const inner = (match[3] ?? "").trim();
+    nodes.push({
+      id: attr(attrs, "id"),
+      tag,
+      type: attr(attrs, "type").toLowerCase(),
+      name: attr(attrs, "name"),
+      label: attr(attrs, "aria-label") || inner,
+      value: attr(attrs, "value"),
+      action: attr(attrs, "data-action"),
+    });
+  }
+  return nodes;
+}
+
+function formEffect(tag: string, type: string, label: string): FormEffect | undefined {
+  if (tag === "input" && type === "file") return "upload";
+  if ((tag === "button" && (type === "" || type === "submit")) || (tag === "input" && type === "submit")) {
+    return "submit";
+  }
+  if (PURCHASE_RE.test(label)) return "purchase";
+  if (MESSAGE_RE.test(label)) return "message";
+  if (tag === "textarea" || (tag === "input" && TEXT_INPUT_TYPES.has(type))) return "text";
+  if (tag === "button" || type === "button") return "ambiguous";
+  return undefined;
+}
+
+function attr(source: string, name: string): string {
+  const match = new RegExp(`\\b${name}="([^"]*)"`, "i").exec(source);
+  return match?.[1] ?? "";
 }
