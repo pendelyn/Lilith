@@ -372,3 +372,203 @@ test("approval binding survives chat persistence and server decisions replace th
     assert.deepEqual(parsePersistedChat(serializeChat(next))[1]?.subagents, [updated]);
   }
 });
+
+test("browser timeline persists ids not bytes; late completed cannot replace stopped", () => {
+  const shot = "11111111-1111-4111-8111-111111111111";
+  const working = {
+    id: "sub-b",
+    role: "research" as const,
+    assignment: "Open the cookie test page in the isolated browser.",
+    state: "working" as const,
+    browser: {
+      current: { op: "open" as const, at: 10, url: "file:///workspace/cookie.html", screenshotId: shot },
+      steps: [{ op: "open" as const, at: 10, url: "file:///workspace/cookie.html", screenshotId: shot }],
+    },
+  };
+  let messages = beginReply([], "user-b", "assistant-b", "Öffne die Cookie-Testseite");
+  messages = upsertSubagent(messages, "user-b", working);
+  const restored = parsePersistedChat(serializeChat(messages));
+  assert.deepEqual(restored[1]?.subagents, [working]);
+  assert.equal(serializeChat(messages).includes("data:image/"), false);
+  assert.equal(serializeChat(messages).includes("token="), false);
+
+  messages = upsertSubagent(messages, "user-b", { ...working, state: "stopped" });
+  messages = upsertSubagent(messages, "user-b", {
+    ...working,
+    state: "completed",
+    result: "late success",
+  });
+  assert.equal(messages[1]?.subagents?.[0]?.state, "stopped");
+  assert.equal("result" in (messages[1]?.subagents?.[0] ?? {}), false);
+
+  const hydrated = applyServerCards(messages, [
+    { ...working, state: "completed", result: "late success" },
+  ]);
+  assert.equal(hydrated[1]?.subagents?.[0]?.state, "stopped");
+
+  const failedLate = applyServerCards(messages, [
+    { ...working, state: "failed" },
+  ]);
+  assert.equal(failedLate[1]?.subagents?.[0]?.state, "stopped");
+  const afterReply = setTaskReply(failedLate, working.id, "late success");
+  assert.equal(afterReply[1]?.text, "");
+});
+
+test("serialized browser approval cards never keep raw URL secrets", () => {
+  const secretUrl =
+    "https://example.com/?password=hunter2-secret&token=abc&client_secret=shh&q=ok";
+  const approval = {
+    id: "approval-b",
+    taskId: "sub-sec",
+    actionId: "action-b",
+    actionClass: "data_disclosure" as const,
+    origin: "https://example.com",
+    operation: "OPEN /?password=%5Bredacted%5D&token=%5Bredacted%5D&client_secret=%5Bredacted%5D&q=ok",
+    payload: JSON.stringify({
+      url: "https://example.com/?password=%5Bredacted%5D&token=%5Bredacted%5D&client_secret=%5Bredacted%5D&q=ok",
+      tool: "browser",
+    }),
+    files: [] as { path: string; content: string }[],
+    maxCostCents: 0,
+    payloadDigest: "b".repeat(64),
+    expiresAt: 2_000_000_000_000,
+    state: "pending" as const,
+  };
+  const card = {
+    id: "sub-sec",
+    role: "research" as const,
+    assignment: "Open one public HTTPS page in the isolated browser.",
+    state: "needs_input" as const,
+    approval,
+  };
+  let messages = beginReply([], "user-s", "assistant-s", `Öffne ${secretUrl}`);
+  messages = upsertSubagent(messages, "user-s", card);
+  assert.equal(messages[0]?.text.includes("hunter2"), false);
+  assert.equal(messages[0]?.text.includes("token=abc"), false);
+  assert.equal(messages[0]?.text.includes("client_secret=shh"), false);
+  assert.match(messages[0]?.text ?? "", /q=ok/);
+  const persisted = serializeChat(messages);
+  assert.equal(persisted.includes("hunter2"), false);
+  assert.equal(persisted.includes("token=abc"), false);
+  assert.equal(persisted.includes("client_secret=shh"), false);
+  const restored = parsePersistedChat(persisted);
+  assert.equal(restored[0]?.text, messages[0]?.text);
+  assert.deepEqual(restored[1]?.subagents, [card]);
+});
+
+test("secret-bearing user messages are redacted at serialize, restore, and render", () => {
+  const raw =
+    "Öffne https://example.com/?password=hunter2-secret&token=abc&client_secret=shh&q=ok";
+  const messages = beginReply([], "user-s", "assistant-s", raw);
+  assert.equal(messages[0]?.text.includes("hunter2"), false);
+  assert.equal(messages[0]?.text.includes("token=abc"), false);
+  assert.equal(messages[0]?.text.includes("client_secret=shh"), false);
+  assert.match(messages[0]?.text ?? "", /^Öffne https:\/\/example\.com\/\?/);
+  assert.match(messages[0]?.text ?? "", /q=ok/);
+  const persisted = serializeChat(messages);
+  assert.equal(persisted.includes("hunter2"), false);
+  assert.equal(persisted.includes("token=abc"), false);
+  const restored = parsePersistedChat(persisted);
+  assert.equal(restored[0]?.text, messages[0]?.text);
+  const leaked = parsePersistedChat(
+    JSON.stringify([{ id: "user-s", role: "user", text: raw, status: "sent" }]),
+  );
+  assert.equal(leaked[0]?.text.includes("hunter2"), false);
+  assert.equal(leaked[0]?.text.includes("token=abc"), false);
+  const echoed = [
+    { id: "user-e", role: "user" as const, text: "please open https://example.com/?password=hunter2-secret&q=ok", status: "sent" as const },
+    {
+      id: "assistant-e",
+      role: "assistant" as const,
+      text: "No model is connected yet. You said: please open https://example.com/?password=hunter2-secret&q=ok",
+      status: "complete" as const,
+      replyTo: "user-e",
+    },
+  ];
+  const cleaned = redactRefusedSecrets(echoed);
+  assert.equal(cleaned.some((message) => message.text.includes("hunter2")), false);
+  assert.equal(serializeChat(echoed).includes("hunter2"), false);
+  const lies = setTaskReply(
+    [
+      { id: "user-l", role: "user", text: "Lies https://example.com/notes?q=ok", status: "sent" },
+      {
+        id: "assistant-l",
+        role: "assistant",
+        text: "",
+        status: "complete",
+        replyTo: "user-l",
+        subagents: [
+          {
+            id: "sub-l",
+            role: "research",
+            assignment: "Read one public HTTPS page.",
+            state: "completed",
+            result: "Read https://example.com/notes?password=hunter2-secret&token=abc&q=ok\nok-notes",
+          },
+        ],
+      },
+    ],
+    "sub-l",
+    "Read https://example.com/notes?password=hunter2-secret&token=abc&q=ok\nok-notes",
+  );
+  assert.equal(lies[1]?.text.includes("hunter2"), false);
+  assert.equal(serializeChat(lies).includes("hunter2"), false);
+  assert.match(lies[1]?.text ?? "", /ok-notes/);
+});
+
+test("URL redaction does not rewrite unrelated memory or non-URL user text", () => {
+  const memory = beginReply([], "user-m", "assistant-m", "Merk dir: Antwortsprache Deutsch");
+  assert.equal(memory[0]?.text, "Merk dir: Antwortsprache Deutsch");
+  const plain = beginReply([], "user-p", "assistant-p", "Hello hunter2 token=abc");
+  assert.equal(plain[0]?.text, "Hello hunter2 token=abc");
+  assert.equal(serializeChat(plain).includes("hunter2"), true);
+});
+
+test("persisted chat drops screenshot bytes", () => {
+  assert.deepEqual(
+    parsePersistedChat(
+      JSON.stringify([
+        {
+          id: "assistant-1",
+          role: "assistant",
+          text: "data:image/jpeg;base64,abc",
+          status: "complete",
+          replyTo: "user-1",
+        },
+      ]),
+    ),
+    [],
+  );
+});
+
+test("hydration re-sanitizes persisted browser URLs", () => {
+  const dirtyUrl = "https://example.com/?password=hunter2-secret&token=abc&q=ok";
+  const restored = parsePersistedChat(
+    JSON.stringify([
+      {
+        id: "assistant-1",
+        role: "assistant",
+        text: "",
+        status: "complete",
+        replyTo: "user-1",
+        subagents: [
+          {
+            id: "sub-1",
+            role: "research",
+            assignment: "Open one public HTTPS page in the isolated browser.",
+            state: "working",
+            browser: {
+              current: { op: "open", at: 1, url: dirtyUrl },
+              steps: [{ op: "open", at: 1, url: dirtyUrl }],
+            },
+          },
+        ],
+      },
+    ]),
+  );
+  const url = restored[0]?.subagents?.[0]?.browser?.current.url ?? "";
+  assert.equal(url.includes("hunter2"), false);
+  assert.equal(url.includes("token=abc"), false);
+  assert.match(url, /q=ok/);
+  assert.equal(restored[0]?.subagents?.[0]?.browser?.steps[0]?.url, url);
+});

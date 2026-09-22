@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
+  ARTIFACT_ID_RE,
   parseRetentionKind,
   retentionTtlMs,
   type RetentionKind,
@@ -124,6 +125,44 @@ export function listArtifacts(store: RetentionStore, owner?: OwnerContext): Rete
     items.push({ ...record });
   }
   return items;
+}
+
+export type ScreenshotBytes = {
+  id: string;
+  createdAt: number;
+  bytes: Buffer;
+};
+
+export function isJpeg(bytes: Uint8Array): boolean {
+  return bytes.byteLength >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8;
+}
+
+export function readScreenshot(store: RetentionStore, owner: OwnerContext, id: string): ScreenshotBytes {
+  if (store.pendingOwnerDeletes.has(owner.ownerId)) throw new Error("Resource access denied");
+  if (!ARTIFACT_ID_RE.test(id)) throw new Error("Artifact not found");
+  const record = store.records.get(id);
+  if (record === undefined || record.ownerId !== owner.ownerId) throw new Error("Artifact not found");
+  let kind: RetentionKind;
+  try {
+    kind = parseRetentionKind(record.kind);
+  } catch {
+    throw new Error("Artifact not found");
+  }
+  if (kind !== "screenshot") throw new Error("Artifact not found");
+  if (store.now() - record.createdAt >= retentionTtlMs(kind)) throw new Error("Artifact not found");
+  if (record.path === undefined || store.filesRoot === undefined) throw new Error("Artifact not found");
+  try {
+    const dest = artifactFile(store, record.path);
+    const listing = lstatSync(dest);
+    if (listing.isSymbolicLink() || !listing.isFile()) throw new Error("Artifact not found");
+    const bytes = readFileSync(dest);
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_ARTIFACT_BYTES || !isJpeg(bytes)) {
+      throw new Error("Artifact not found");
+    }
+    return { id: record.id, createdAt: record.createdAt, bytes };
+  } catch {
+    throw new Error("Artifact not found");
+  }
 }
 
 export function runExpiryJob(store: RetentionStore): ExpiryResult {

@@ -9,11 +9,13 @@ import { test } from "node:test";
 import {
   BROWSER_IMAGE,
   BROWSER_PIDS_LIMIT,
+  COOKIE_BROWSER_PROMPT,
   COOKIE_FIND_TOKEN,
   browserDockerArgs,
   formatBrowserResult,
   runBrowserSession,
 } from "./browser.ts";
+import { SENSITIVE_FIXTURE_FILE, MASKED_INPUT_VALUE } from "./browser-policy.ts";
 import {
   closeHostProtocol,
   HOST_BODY,
@@ -26,6 +28,8 @@ import {
 import { withDockerMutex } from "./docker-test-lock.ts";
 import { createRetentionStore, listArtifacts } from "./retention.ts";
 import { RUNNER_WORKSPACES_ROOT, runIsolatedJob } from "./runner.ts";
+import { createHealthServer } from "./health.ts";
+import { parseChatStreamEvent, parseTaskListResponse } from "@lilith/contracts";
 import {
   createParentTask,
   createTaskStore,
@@ -158,6 +162,10 @@ test(
       assert.equal(result.includes("dialog-ok"), false);
       assert.equal(result.includes("form-ok"), false);
       assert.equal(listArtifacts(retention, owner).some((item) => item.kind === "screenshot"), true);
+      assert.ok(listArtifacts(retention, owner).filter((item) => item.kind === "screenshot").length >= 2);
+      assert.ok((store.tasks.get(started.id)?.browser?.steps.length ?? 0) >= 2);
+      assert.equal(store.tasks.get(started.id)?.browser?.steps[0]?.op, "open");
+      assert.ok(store.tasks.get(started.id)?.browser?.steps.some((step) => step.screenshotId !== undefined));
       const leftover = [...containerNames()].filter((name) => !before.has(name));
       assert.deepEqual(leftover, []);
     } finally {
@@ -208,6 +216,69 @@ test(
     assert.equal(store.tasks.get(started.id)?.result, undefined);
     const leftover = [...containerNames()].filter((name) => !before.has(name));
     assert.deepEqual(leftover, []);
+    });
+  },
+);
+
+test(
+  "long-running hang emits intermediate screenshots then stop",
+  { skip: !docker, timeout: 180_000 },
+  async () => {
+    await withDockerMutex(async () => {
+      const before = containerNames();
+      const filesRoot = await mkdtemp(join(tmpdir(), "lilith-hang-shots-"));
+      const retention = createRetentionStore({ filesRoot });
+      try {
+        const store = createTaskStore();
+        const parent = createParentTask(store, owner, "hang-shots");
+        const started = startSubagent(store, owner, {
+          parentTaskId: parent.id,
+          assignment: "hang-shots",
+          role: "research",
+        });
+        setTaskState(store, owner, started.id, "working");
+        const pending = runBrowserSession(
+          {
+            ops: [{ op: "open", url: "file:///workspace/cookie.html" }, { op: "hang" }],
+            approved: [],
+          },
+          store,
+          owner,
+          started.id,
+          { retention },
+        );
+        const startedAt = Date.now();
+        let readyName: string | undefined;
+        while (Date.now() - startedAt < 90_000) {
+          const live = [...containerNames(false)].filter((name) => !before.has(name));
+          readyName = live.find((name) => pageReadyIn(name) && chromiumRunningIn(name));
+          if (readyName !== undefined) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        assert.ok(readyName, "hang waited for page-ready and a running Chromium process");
+        const waitShots = Date.now();
+        while (Date.now() - waitShots < 45_000) {
+          const shotCount =
+            store.tasks.get(started.id)?.browser?.steps.filter((step) => step.screenshotId !== undefined).length ?? 0;
+          if (shotCount >= 2) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        const liveTask = store.tasks.get(started.id);
+        assert.equal(liveTask?.state, "working");
+        assert.ok((liveTask?.browser?.steps.length ?? 0) >= 2);
+        assert.ok((liveTask?.browser?.steps.filter((step) => step.screenshotId !== undefined).length ?? 0) >= 2);
+        assert.equal(liveTask?.browser?.steps[0]?.op, "open");
+        assert.ok(liveTask?.browser?.steps.some((step) => step.op === "screenshot"));
+        const stopped = stopTask(store, owner, started.id);
+        assert.equal(stopped.state, "stopped");
+        await assert.rejects(pending, /cancelled|failed|timed out/);
+        assert.equal(store.tasks.get(started.id)?.state, "stopped");
+        assert.equal(store.tasks.get(started.id)?.result, undefined);
+        const leftover = [...containerNames()].filter((name) => !before.has(name));
+        assert.deepEqual(leftover, []);
+      } finally {
+        await rm(filesRoot, { recursive: true, force: true });
+      }
     });
   },
 );
@@ -296,6 +367,153 @@ test(
           {},
         ),
       );
+    });
+  },
+);
+
+test(
+  "sensitive fixture masks password fields; metadata does not keep hunter2",
+  { skip: !docker, timeout: 180_000 },
+  async () => {
+    await withDockerMutex(async () => {
+      const filesRoot = await mkdtemp(join(tmpdir(), "lilith-sensitive-shot-"));
+      const retention = createRetentionStore({ filesRoot });
+      try {
+        const store = createTaskStore();
+        const parent = createParentTask(store, owner, "sensitive-browser");
+        const started = startSubagent(store, owner, {
+          parentTaskId: parent.id,
+          assignment: "sensitive-browser",
+          role: "research",
+        });
+        setTaskState(store, owner, started.id, "working");
+        const session = await runBrowserSession(
+          {
+            ops: [{ op: "open", url: `file:///workspace/${SENSITIVE_FIXTURE_FILE}` }, { op: "read" }],
+            approved: [],
+          },
+          store,
+          owner,
+          started.id,
+          { retention },
+        );
+        const masked = session.results.some((result) => (result.maskedFields ?? 0) >= 1);
+        assert.equal(masked, true);
+        assert.equal(session.results.some((result) => (result.coveredSurfaces ?? 0) >= 1), true);
+        const read = session.results.find((result) => result.op === "read")?.text ?? "";
+        assert.match(read, /Visible page text is not claimed redacted/);
+        assert.equal(read.includes("hunter2"), false);
+        assert.equal(read.includes("4111111111111111"), false);
+        const projected = session.results.flatMap((result) => result.projected ?? []);
+        const byName = (name: string) => projected.filter((item) => item.name.toLowerCase() === name);
+        const token = byName("token").at(-1);
+        assert.ok(token);
+        assert.equal(token.value, MASKED_INPUT_VALUE);
+        assert.equal(token.title, MASKED_INPUT_VALUE);
+        assert.equal(token.ariaLabel, MASKED_INPUT_VALUE);
+        assert.equal(byName("api_key").at(-1)?.value, MASKED_INPUT_VALUE);
+        assert.equal(byName("client_secret").at(-1)?.value, MASKED_INPUT_VALUE);
+        const otp = projected.filter((item) => item.autocomplete.toLowerCase() === "one-time-code").at(-1);
+        assert.equal(otp?.value, MASKED_INPUT_VALUE);
+        assert.equal(read.includes("named-token-secret"), false);
+        assert.equal(read.includes("named-apikey-secret"), false);
+        assert.equal(read.includes("named-client-secret"), false);
+        assert.equal(read.includes("textarea-password-secret"), false);
+        assert.equal(read.includes("named-otp-secret"), false);
+        const blob = `${JSON.stringify(store.tasks.get(started.id)?.browser ?? {})}\n${JSON.stringify(session.results)}\n${formatBrowserResult(session)}`;
+        assert.equal(blob.includes("hunter2"), false);
+        assert.equal(blob.includes("named-token-secret"), false);
+        assert.equal(blob.includes("named-apikey-secret"), false);
+        assert.equal(blob.includes("named-client-secret"), false);
+        assert.equal(blob.includes("4111111111111111"), false);
+        assert.equal(blob.includes("SECRET-CANVAS"), false);
+        assert.ok((store.tasks.get(started.id)?.browser?.steps.length ?? 0) >= 2);
+        assert.ok(listArtifacts(retention, owner).some((item) => item.kind === "screenshot"));
+        for (const shot of listArtifacts(retention, owner).filter((item) => item.kind === "screenshot")) {
+          const bytes = readFileSync(join(filesRoot, shot.path ?? ""));
+          assert.equal(bytes.includes("hunter2-secret"), false);
+          assert.equal(bytes.includes("4111111111111111"), false);
+          assert.equal(bytes.includes("SECRET-CANVAS"), false);
+        }
+      } finally {
+        await rm(filesRoot, { recursive: true, force: true });
+      }
+    });
+  },
+);
+
+test(
+  "cookie chat NDJSON then authenticated screenshot GET uses the real browser",
+  { skip: !docker, timeout: 180_000 },
+  async () => {
+    await withDockerMutex(async () => {
+      const filesRoot = await mkdtemp(join(tmpdir(), "lilith-e2e-shot-"));
+      const retention = createRetentionStore({ filesRoot });
+      const store = createTaskStore();
+      const server = createHealthServer(
+        { token: "secret-token", ownerId: "alpha-owner" },
+        store,
+        undefined,
+        {},
+        retention,
+      );
+      await new Promise<void>((resolve) => {
+        server.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("expected a TCP address");
+      const base = `http://127.0.0.1:${address.port}`;
+      const auth = { Authorization: "Bearer secret-token" };
+      try {
+        const response = await fetch(`${base}/chat`, {
+          method: "POST",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({ message: COOKIE_BROWSER_PROMPT, webResearchEnabled: true }),
+        });
+        assert.equal(response.status, 200);
+        assert.ok(response.body);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let sawLiveShot = false;
+        let shotId: string | undefined;
+        let finished = false;
+        while (!finished) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buf += decoder.decode(chunk.value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+          for (const line of lines) {
+            if (line === "") continue;
+            const event = parseChatStreamEvent(JSON.parse(line));
+            if (event.type === "subagent" && event.browser?.current.screenshotId !== undefined) {
+              shotId = event.browser.current.screenshotId;
+              if (event.state === "working") sawLiveShot = true;
+            }
+            if (event.type === "done") finished = true;
+          }
+        }
+        assert.equal(sawLiveShot, true);
+        const listed = parseTaskListResponse(await (await fetch(`${base}/tasks`, { headers: auth })).json());
+        const card = listed.tasks[0];
+        assert.ok(card);
+        const id = card.browser?.current.screenshotId ?? shotId;
+        assert.ok(id);
+        const shot = await fetch(`${base}/screenshots/${id}`, { headers: auth });
+        assert.equal(shot.status, 200);
+        assert.equal(shot.headers.get("cache-control"), "no-store");
+        const bytes = Buffer.from(await shot.arrayBuffer());
+        assert.equal(bytes[0], 0xff);
+        assert.equal(bytes[1], 0xd8);
+        const query = await fetch(`${base}/screenshots/${id}?token=secret-token`);
+        assert.equal(query.status, 401);
+      } finally {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        });
+        await rm(filesRoot, { recursive: true, force: true });
+      }
     });
   },
 );

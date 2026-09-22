@@ -40,6 +40,7 @@ import {
   finishPendingDeletes,
   listArtifacts,
   putArtifact,
+  readScreenshot,
   runExpiryJob,
   type RetentionRecord,
   type RetentionStore,
@@ -599,6 +600,103 @@ function readdirSafe(path: string): string[] {
     return [];
   }
 }
+
+test("screenshot reads require the owner, enforce TTL between jobs, and refuse traversal", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-shot-read-"));
+  try {
+    let now = 1_000;
+    const filesRoot = join(dir, "files");
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const store = createRetentionStore({ now: () => now, filesRoot });
+    const shot = putArtifact(store, owner, { kind: "screenshot", body: jpeg });
+    const otherShot = putArtifact(store, other, { kind: "screenshot", body: jpeg });
+    const text = putArtifact(store, owner, { kind: "screenshot", body: "not-jpeg" });
+    assert.deepEqual(readScreenshot(store, owner, shot.id).bytes, jpeg);
+    assert.throws(() => readScreenshot(store, other, shot.id), /Artifact not found/);
+    assert.throws(() => readScreenshot(store, owner, otherShot.id), /Artifact not found/);
+    assert.throws(() => readScreenshot(store, owner, text.id), /Artifact not found/);
+    assert.throws(() => readScreenshot(store, owner, "../etc/passwd"), /Artifact not found/);
+    assert.throws(() => readScreenshot(store, owner, "screenshot/../../etc/passwd"), /Artifact not found/);
+    assert.throws(() => readScreenshot(store, owner, shot.id + "/../" + shot.id), /Artifact not found/);
+    now = shot.createdAt + SCREENSHOT_TTL_MS;
+    assert.throws(() => readScreenshot(store, owner, shot.id), /Artifact not found/);
+    assert.equal(existsSync(join(filesRoot, shot.path ?? "")), true);
+    store.pendingOwnerDeletes.add(owner.ownerId);
+    now = 1_000;
+    assert.throws(() => readScreenshot(store, owner, shot.id), /Resource access denied/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET /screenshots is owner-authenticated and never takes a token in the URL", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-shot-http-"));
+  try {
+    let now = 5_000;
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const retention = createRetentionStore({ filesRoot: join(dir, "files"), now: () => now });
+    const shot = putArtifact(retention, owner, { kind: "screenshot", body: jpeg });
+    const tasks = createTaskStore();
+    const memories = createMemoryStore();
+    await withServer(async (base) => {
+      assert.equal((await fetch(`${base}/screenshots/${shot.id}`)).status, 401);
+      assert.equal((await fetch(`${base}/screenshots/${shot.id}?token=secret-token`)).status, 401);
+      assert.equal(
+        (await fetch(`${base}/screenshots/${shot.id}`, { method: "POST", headers: AUTH })).status,
+        405,
+      );
+      const ok = await fetch(`${base}/screenshots/${shot.id}`, { headers: AUTH });
+      assert.equal(ok.status, 200);
+      assert.equal(ok.headers.get("content-type"), "image/jpeg");
+      assert.equal(ok.headers.get("cache-control"), "no-store");
+      assert.deepEqual(Buffer.from(await ok.arrayBuffer()), jpeg);
+      const escaped = await fetch(`${base}/screenshots/${encodeURIComponent("../etc/passwd")}`, { headers: AUTH });
+      assert.equal(escaped.status, 404);
+      now = shot.createdAt + SCREENSHOT_TTL_MS;
+      assert.equal((await fetch(`${base}/screenshots/${shot.id}`, { headers: AUTH })).status, 404);
+      now = shot.createdAt;
+      retention.pendingOwnerDeletes.add(owner.ownerId);
+      assert.equal((await fetch(`${base}/screenshots/${shot.id}`, { headers: AUTH })).status, 409);
+      assert.equal((await fetch(`${base}/tasks`, { headers: AUTH })).status, 409);
+      assert.equal((await fetch(`${base}/health`, { headers: AUTH })).status, 200);
+    }, tasks, memories, retention);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("screenshot read loses a deletion race and refuses a swapped path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-shot-race-"));
+  try {
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const filesRoot = join(dir, "files");
+    const store = createRetentionStore({ filesRoot });
+    const shot = putArtifact(store, owner, { kind: "screenshot", body: jpeg });
+    const dest = join(filesRoot, shot.path ?? "");
+    const outside = join(dir, "outside");
+    mkdirSync(outside);
+    const secret = join(outside, "secret.txt");
+    writeFileSync(secret, "RAW-SECRET");
+    unlinkSync(dest);
+    const swapped = tryDirLink(outside, dest);
+    if (swapped) {
+      assert.throws(() => readScreenshot(store, owner, shot.id), /Artifact not found/);
+      assert.equal(readFileSync(secret, "utf8"), "RAW-SECRET");
+      unlinkSync(dest);
+    }
+    writeFileSync(dest, jpeg);
+    store.pendingOwnerDeletes.add(owner.ownerId);
+    assert.throws(() => readScreenshot(store, owner, shot.id), /Resource access denied/);
+    const tasks = createTaskStore();
+    const memories = createMemoryStore();
+    store.pendingOwnerDeletes.delete(owner.ownerId);
+    deleteAccount(store, tasks, memories, owner);
+    assert.throws(() => readScreenshot(store, owner, shot.id), /Artifact not found|Resource access denied/);
+    assert.equal(existsSync(dest), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 async function withServer(
   run: (base: string) => Promise<void>,
