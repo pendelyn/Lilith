@@ -14,7 +14,9 @@ import {
   parseResumeRequest,
   parseSubagentCard,
   parseTaskListResponse,
+  redactSensitiveUrlsInText,
   type ChatStreamEvent,
+  type SubagentCard,
 } from "@lilith/contracts";
 import { authenticateOwner, type OwnerContext } from "./auth.ts";
 import {
@@ -47,7 +49,7 @@ import {
   subagentCard,
   type TaskStore,
 } from "./tasks.ts";
-import { createRetentionStore, deleteAccount, type RetentionStore } from "./retention.ts";
+import { createRetentionStore, deleteAccount, readScreenshot, type RetentionStore } from "./retention.ts";
 import {
   WEB_RESEARCH_OFF_REPLY,
   invokeDataDisclosure,
@@ -155,6 +157,17 @@ function handleRequest(
       return;
     }
 
+    const screenshot = screenshotAction(pathname);
+    if (screenshot !== undefined) {
+      if (req.method !== "GET") {
+        res.writeHead(405, { Allow: "GET" });
+        res.end();
+        return;
+      }
+      handleScreenshot(res, owner, retention, screenshot.id);
+      return;
+    }
+
     if (handleMemoryRoute(req, res, owner, memories, pathname)) {
       return;
     }
@@ -229,18 +242,11 @@ async function streamChatReply(
       throw new Error("Invalid message");
     }
 
-    streamNdjson(
-      res,
-      await chatEvents(
-        value.message.trim(),
-        owner,
-        store,
-        memories,
-        "memoryEnabled" in value && value.memoryEnabled === true,
-        "webResearchEnabled" in value && value.webResearchEnabled === true,
-        web,
-        retention,
-      ),
+    const message = value.message.trim();
+    const memoryEnabled = "memoryEnabled" in value && value.memoryEnabled === true;
+    const webResearchEnabled = "webResearchEnabled" in value && value.webResearchEnabled === true;
+    streamNdjson(res, (emit) =>
+      emitChatEvents(message, owner, store, memories, memoryEnabled, webResearchEnabled, web, retention, emit),
     );
   } catch {
     if (!res.headersSent) res.writeHead(400);
@@ -321,7 +327,7 @@ async function handleTaskAction(
   }
 }
 
-async function chatEvents(
+async function emitChatEvents(
   message: string,
   owner: OwnerContext,
   store: TaskStore,
@@ -330,181 +336,218 @@ async function chatEvents(
   webResearchEnabled: boolean,
   web: BrowserDeps,
   retention: RetentionStore,
-): Promise<ChatStreamEvent[]> {
+  emit: (event: ChatStreamEvent) => void,
+): Promise<void> {
+  const push = (events: ChatStreamEvent[]): void => {
+    for (const event of events) emit(event);
+  };
   const remembered = captureExplicitMemory(memories, owner, message, memoryEnabled);
   if (remembered !== undefined) {
-    return [...deltaEvents(remembered), { type: "done" }];
+    push([...deltaEvents(remembered), { type: "done" }]);
+    return;
   }
 
   if (isApprovalPrompt(message)) {
     const run = runApprovalResearch(store, owner);
-    return [
+    push([
       ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
       ...deltaEvents("Review the mock action before approving. No external call has been made."),
       { type: "done" },
-    ];
+    ]);
+    return;
   }
 
   if (isColorComparePrompt(message)) {
-    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    if (!webResearchEnabled) {
+      push([...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }]);
+      return;
+    }
     try {
       const run = await runColorCompare(store, owner, web);
       if (run.result === undefined) {
-        return [
+        push([
           ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
           ...deltaEvents("Web research failed."),
           { type: "done" },
-        ];
+        ]);
+        return;
       }
-      return [
+      push([
         ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
         ...deltaEvents(
           `A research subagent compared test sources A, B, and C. Shared color: ${run.result}.`,
         ),
         { type: "done" },
-      ];
+      ]);
+      return;
     } catch {
-      return [...deltaEvents("Web research failed."), { type: "done" }];
+      push([...deltaEvents("Web research failed."), { type: "done" }]);
+      return;
     }
   }
 
   if (isDisclosurePrompt(message)) {
-    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    if (!webResearchEnabled) {
+      push([...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }]);
+      return;
+    }
     try {
       const run = runDisclosureResearch(store, owner, web);
-      return [
+      push([
         ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
         ...deltaEvents("Review the bound request before any user data is sent. No network call has been made."),
         { type: "done" },
-      ];
+      ]);
+      return;
     } catch {
-      return [...deltaEvents("Web research failed."), { type: "done" }];
+      push([...deltaEvents("Web research failed."), { type: "done" }]);
+      return;
     }
   }
 
   const publicUrl = parsePublicReadPrompt(message);
   if (publicUrl !== undefined) {
-    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    if (!webResearchEnabled) {
+      push([...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }]);
+      return;
+    }
     try {
       const run = await runPublicPageRead(store, owner, publicUrl, web);
       if (run.cards.some((card) => card.approval?.state === "pending")) {
-        return [
+        push([
           ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
           ...deltaEvents("Review the bound request before any user data is sent. No network call has been made."),
           { type: "done" },
-        ];
+        ]);
+        return;
       }
       if (run.result === undefined) {
-        return [
+        push([
           ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
           ...deltaEvents("Web research failed."),
           { type: "done" },
-        ];
+        ]);
+        return;
       }
-      return [
+      push([
         ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
         ...deltaEvents(run.result),
         { type: "done" },
-      ];
+      ]);
+      return;
     } catch {
-      return [...deltaEvents("Web research failed."), { type: "done" }];
+      push([...deltaEvents("Web research failed."), { type: "done" }]);
+      return;
     }
   }
 
   if (isCookieBrowserPrompt(message)) {
-    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    if (!webResearchEnabled) {
+      push([...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }]);
+      return;
+    }
     try {
-      const run = await runCookieBrowser(store, owner, { ...web, retention });
-      if (run.result === undefined) {
-        return [
-          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-          ...deltaEvents("Isolated browser failed."),
-          { type: "done" },
-        ];
-      }
-      return [
-        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-        ...deltaEvents(run.result),
-        { type: "done" },
-      ];
+      const run = await runCookieBrowser(store, owner, {
+        ...web,
+        retention,
+        onCard: (card) => emit({ type: "subagent", ...card }),
+      });
+      push([...browserRunFollowUp(run), { type: "done" }]);
+      return;
     } catch {
-      return [...deltaEvents("Isolated browser failed."), { type: "done" }];
+      push([...deltaEvents("Isolated browser failed."), { type: "done" }]);
+      return;
     }
   }
 
   const openUrl = parsePublicOpenPrompt(message);
   if (openUrl !== undefined) {
-    if (!webResearchEnabled) return [...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }];
+    if (!webResearchEnabled) {
+      push([...deltaEvents(WEB_RESEARCH_OFF_REPLY), { type: "done" }]);
+      return;
+    }
     try {
-      const run = await runPublicBrowserOpen(store, owner, openUrl, { ...web, retention });
-      if (run.cards.some((card) => card.approval?.state === "pending")) {
-        return [
-          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-          ...deltaEvents("Review the bound request before any user data is sent. No network call has been made."),
-          { type: "done" },
-        ];
-      }
-      if (run.result === undefined) {
-        return [
-          ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-          ...deltaEvents("Isolated browser failed."),
-          { type: "done" },
-        ];
-      }
-      return [
-        ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
-        ...deltaEvents(run.result),
-        { type: "done" },
-      ];
+      const run = await runPublicBrowserOpen(store, owner, openUrl, {
+        ...web,
+        retention,
+        onCard: (card) => emit({ type: "subagent", ...card }),
+      });
+      push([...browserRunFollowUp(run), { type: "done" }]);
+      return;
     } catch {
-      return [...deltaEvents("Isolated browser failed."), { type: "done" }];
+      push([...deltaEvents("Isolated browser failed."), { type: "done" }]);
+      return;
     }
   }
 
   if (isHoldPrompt(message)) {
     const run = runHeldResearch(store, owner);
-    return [
+    push([
       ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
       ...deltaEvents("A research subagent is working."),
       { type: "done" },
-    ];
+    ]);
+    return;
   }
 
   if (isQuestionPrompt(message)) {
     const run = runQuestionResearch(store, owner);
-    return [
+    push([
       ...run.cards.map((card) => ({ type: "subagent" as const, ...card })),
       ...deltaEvents("A research subagent needs a choice."),
       { type: "done" },
-    ];
+    ]);
+    return;
   }
 
   // ponytail: deterministic bridge until the gated provider adapter in Issue #8 is activated.
-  return [...deltaEvents(`No model is connected yet. You said: ${message}`), { type: "done" }];
+  push([...deltaEvents(`No model is connected yet. You said: ${message}`), { type: "done" }]);
+}
+
+function browserRunFollowUp(run: { cards: SubagentCard[]; result?: string }): ChatStreamEvent[] {
+  if (run.cards.some((card) => card.approval?.state === "pending")) {
+    return deltaEvents("Review the bound request before any user data is sent. No network call has been made.");
+  }
+  if (run.result !== undefined) return deltaEvents(run.result);
+  if (run.cards.some((card) => card.state === "stopped")) {
+    return deltaEvents("Isolated browser stopped.");
+  }
+  return deltaEvents("Isolated browser failed.");
 }
 
 function deltaEvents(reply: string): ChatStreamEvent[] {
-  return (reply.match(/[\s\S]{1,12}/g) ?? []).map((text) => ({ type: "delta", text }));
+  const text = redactSensitiveUrlsInText(reply);
+  return (text.match(/[\s\S]{1,12}/g) ?? []).map((chunk) => ({ type: "delta", text: chunk }));
 }
 
-function streamNdjson(res: ServerResponse, events: ChatStreamEvent[]): void {
+function streamNdjson(
+  res: ServerResponse,
+  produce: (emit: (event: ChatStreamEvent) => void) => Promise<void>,
+): void {
   res.writeHead(200, {
     "Cache-Control": "no-store",
     "Content-Type": "application/x-ndjson; charset=utf-8",
   });
-  let index = 0;
+  const queue: ChatStreamEvent[] = [];
+  let finished = false;
+  void produce((event) => {
+    queue.push(event);
+  }).finally(() => {
+    finished = true;
+  });
   const timer = setInterval(() => {
-    const event = events[index++];
-    if (event === undefined) {
-      clearInterval(timer);
-      res.end();
+    const event = queue.shift();
+    if (event !== undefined) {
+      res.write(`${JSON.stringify(event)}\n`);
+      if (event.type === "done") {
+        clearInterval(timer);
+        res.end();
+      }
       return;
     }
-    res.write(`${JSON.stringify(event)}\n`);
-    if (event.type === "done") {
-      clearInterval(timer);
-      res.end();
-    }
+    if (!finished) return;
+    clearInterval(timer);
+    if (!res.writableEnded) res.end();
   }, 40);
   res.on("close", () => clearInterval(timer));
 }
@@ -552,6 +595,35 @@ function taskAction(pathname: string): { id: string; kind: "stop" | "resume" | "
     return undefined;
   }
   return { id: decodeURIComponent(match[1]), kind: match[2] };
+}
+
+function screenshotAction(pathname: string): { id: string } | undefined {
+  const match = /^\/screenshots\/([^/]+)$/.exec(pathname);
+  if (match?.[1] === undefined) return undefined;
+  return { id: decodeURIComponent(match[1]) };
+}
+
+function handleScreenshot(
+  res: ServerResponse,
+  owner: OwnerContext,
+  retention: RetentionStore,
+  id: string,
+): void {
+  try {
+    const shot = readScreenshot(retention, owner, id);
+    res.writeHead(200, {
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Length": String(shot.bytes.byteLength),
+    });
+    res.end(shot.bytes);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const status = message === "Resource access denied" ? 409 : 404;
+    if (!res.headersSent) res.writeHead(status);
+    res.end();
+  }
 }
 
 function handleMemoryRoute(

@@ -23,6 +23,8 @@ export const HOST_REPLY = "reply";
 export const HOST_READY = "ready";
 export const HOST_SHOT = "shot.jpg";
 export const HOST_RESULT = "result.json";
+export const HOST_PROGRESS = "progress";
+export const HOST_PROGRESS_ACK = "progress-ack";
 export const HOST_BODY_CONTAINER_PATH = `/workspace/${HOST_NET_DIR}/${HOST_BODY}`;
 
 const PROTOCOL_NAME = /^[a-zA-Z0-9._-]+$/;
@@ -37,6 +39,8 @@ export type HostProtocol = {
   shot: number;
   result: number;
   ready: number;
+  progress: number;
+  progressAck: number;
 };
 
 export function openHostProtocol(workspace: string): HostProtocol {
@@ -53,11 +57,13 @@ export function openHostProtocol(workspace: string): HostProtocol {
     shot: openExclusiveFile(browserReal, HOST_SHOT),
     result: openExclusiveFile(browserReal, HOST_RESULT),
     ready: openExclusiveFile(browserReal, HOST_READY),
+    progress: openExclusiveFile(browserReal, HOST_PROGRESS),
+    progressAck: openExclusiveFile(browserReal, HOST_PROGRESS_ACK),
   };
 }
 
 export function closeHostProtocol(proto: HostProtocol): void {
-  for (const fd of [proto.inbox, proto.body, proto.reply, proto.shot, proto.result, proto.ready]) {
+  for (const fd of [proto.inbox, proto.body, proto.reply, proto.shot, proto.result, proto.ready, proto.progress, proto.progressAck]) {
     try {
       closeSync(fd);
     } catch {

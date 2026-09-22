@@ -26,10 +26,13 @@ import {
 import {
   isCookieAcceptName,
   isCookieDialogText,
+  isSensitiveFormControl,
   pickCookieAcceptButton,
+  sanitizeBrowserUrl,
+  UNSAFE_PIXEL_SELECTOR,
   workspaceFilePath,
 } from "./browser-policy.ts";
-import { decideApproval, createTaskStore, stopTask } from "./tasks.ts";
+import { decideApproval, createTaskStore, listResearchCards, publicApprovalRequest, recordBrowserStep, stopTask } from "./tasks.ts";
 import { dockerArgs, RUNNER_WORKSPACES_ROOT } from "./runner.ts";
 import { createRetentionStore, listArtifacts } from "./retention.ts";
 import {
@@ -37,7 +40,7 @@ import {
   fetchPublicHttpsPage,
   offlineWebResearchDeps,
 } from "./web-research.ts";
-import type { ApprovalRequest } from "@lilith/contracts";
+import { redactSensitiveUrlsInText, type ApprovalRequest } from "@lilith/contracts";
 
 const owner = { ownerId: "alpha-owner" };
 
@@ -67,7 +70,8 @@ test("cookie accept is limited to cookie dialogs, not any OK or Accept button", 
   assert.equal(workspaceFilePath("file:///workspace/.lilith-browser/session.json"), undefined);
   assert.equal(workspaceFilePath("file:///workspace/.lilith-net/body"), undefined);
   assert.equal(workspaceFilePath("file:///workspace/cookie.html/../.lilith-browser/session.json"), undefined);
-  assert.equal(workspaceFilePath("https://example.com/cookie.html"), undefined);
+  assert.equal(workspaceFilePath("file://user:hunter2@localhost/workspace/cookie.html"), undefined);
+  assert.equal(workspaceFilePath("file:///workspace/sensitive.html"), "/workspace/sensitive.html");
 });
 
 test("browser CLI isolation stays on alpine; browser jobs keep network=none and a digest pin", async () => {
@@ -128,8 +132,16 @@ test("cookie fixture open/read/find/scroll dismisses only the cookie dialog", as
   assert.equal(net.connects(), 0);
   assert.equal(net.lookups(), 0);
   assert.equal(listArtifacts(retention, owner).some((item) => item.kind === "screenshot"), true);
+  assert.ok((listArtifacts(retention, owner).filter((item) => item.kind === "screenshot").length) >= 2);
+  const timeline = run.cards.at(-1)?.browser;
+  assert.ok(timeline);
+  assert.ok(timeline.steps.length >= 2);
+  assert.equal(timeline.steps[0]?.op, "open");
+  assert.equal(timeline.current.op, timeline.steps.at(-1)?.op);
+  assert.ok(timeline.steps.some((step) => step.screenshotId !== undefined));
   assert.deepEqual(run.cards.map((card) => card.state).slice(0, 2), ["waiting", "working"]);
   assert.equal(run.cards.at(-1)?.assignment, COOKIE_ASSIGNMENT);
+  assert.equal(run.cards.at(-1)?.state, "completed");
   await rm(retentionDir, { recursive: true, force: true });
 });
 
@@ -255,10 +267,13 @@ test("untrusted browser text cannot start tools or extra fetches; stop does not 
 });
 
 test("fake hang abort does not complete a browser result", async () => {
+  const retentionDir = await mkdtemp(join(tmpdir(), "lilith-hang-shot-"));
+  const retention = createRetentionStore({ filesRoot: retentionDir });
   const store = createTaskStore();
   const run = runCookieBrowser(store, owner, {
     ...offlineWebResearchDeps(),
     driver: fakeBrowserDriver({ hang: true }),
+    retention,
   });
   let child = [...store.tasks.values()].find((task) => task.role === "research");
   for (let i = 0; i < 20 && child === undefined; i += 1) {
@@ -266,33 +281,270 @@ test("fake hang abort does not complete a browser result", async () => {
     child = [...store.tasks.values()].find((task) => task.role === "research");
   }
   assert.ok(child);
+  for (let i = 0; i < 40; i += 1) {
+    const steps = store.tasks.get(child.id)?.browser?.steps ?? [];
+    if (steps.some((step) => step.screenshotId !== undefined) && steps.some((step) => step.op === "screenshot")) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const live = store.tasks.get(child.id);
+  assert.equal(live?.state, "working");
+  assert.ok((live?.browser?.steps.length ?? 0) >= 1);
+  assert.ok(live?.browser?.steps.some((step) => step.screenshotId !== undefined));
   stopTask(store, owner, child.id);
   const finished = await run;
   assert.equal(finished.result, undefined);
   assert.equal(finished.cards.some((card) => card.state === "completed"), false);
+  assert.equal(finished.cards.some((card) => card.state === "failed"), false);
   assert.equal(store.tasks.get(child.id)?.state, "stopped");
+  assert.equal(store.tasks.get(child.id)?.result, undefined);
+  await rm(retentionDir, { recursive: true, force: true });
 });
 
-function fakeBrowserDriver(options?: { hang?: boolean; leak?: string }): BrowserDriver {
+test("browser job failure is failed not completed", async () => {
+  const store = createTaskStore();
+  const run = await runCookieBrowser(store, owner, {
+    ...offlineWebResearchDeps(),
+    driver: {
+      async run() {
+        throw new Error("worker crashed");
+      },
+    },
+  });
+  assert.equal(run.result, undefined);
+  assert.equal(run.cards.some((card) => card.state === "completed"), false);
+  assert.equal(run.cards[0]?.state, "waiting");
+  assert.equal(run.cards[1]?.state, "working");
+  assert.equal(run.cards.at(-1)?.state, "failed");
+  const child = [...store.tasks.values()].find((task) => task.role === "research");
+  assert.equal(child?.state, "failed");
+  assert.equal(child?.result, undefined);
+});
+
+test("live steps emit incremental screenshots before completion", async () => {
+  const retentionDir = await mkdtemp(join(tmpdir(), "lilith-live-steps-"));
+  const retention = createRetentionStore({ filesRoot: retentionDir });
+  const seen: string[] = [];
+  const store = createTaskStore();
+  const run = await runCookieBrowser(store, owner, {
+    ...offlineWebResearchDeps(),
+    driver: fakeBrowserDriver({ delayMs: 5 }),
+    retention,
+    onCard: (card) => {
+      if (card.browser?.current.screenshotId !== undefined) seen.push(card.browser.current.op);
+    },
+  });
+  assert.equal(run.cards[0]?.state, "waiting");
+  assert.equal(run.cards[1]?.state, "working");
+  assert.ok(seen.includes("open"));
+  assert.ok(seen.includes("dismissCookies"));
+  assert.ok(seen.includes("read"));
+  assert.notEqual(seen[0], seen.at(-1));
+  const shots = [...new Set(run.cards.flatMap((card) => card.browser?.steps.map((step) => step.screenshotId ?? "") ?? []))]
+    .filter(Boolean);
+  assert.ok(shots.length >= 2);
+  assert.equal(run.cards.at(-1)?.state, "completed");
+  const child = [...store.tasks.values()].find((task) => task.role === "research");
+  assert.equal(child?.browser?.current.op, run.cards.at(-1)?.browser?.current.op);
+  await rm(retentionDir, { recursive: true, force: true });
+});
+
+test("stop after intermediate steps does not accept a late completed result", async () => {
+  const store = createTaskStore();
+  const child = (await runPublicBrowserOpen(store, owner, "https://example.com/late", {
+    ...offlineWebResearchDeps(),
+    driver: fakeBrowserDriver(),
+  })).cards[0];
+  assert.ok(child?.approval);
+  const stopped = stopTask(store, owner, child.id);
+  assert.equal(stopped.state, "stopped");
+  const late = recordBrowserStep(store, owner, child.id, {
+    op: "read",
+    at: Date.now(),
+    screenshotId: "11111111-1111-4111-8111-111111111111",
+  });
+  assert.equal(late.state, "stopped");
+  assert.equal(late.result, undefined);
+  assert.equal(late.browser?.current.op === "read", false);
+  assert.throws(() => {
+    const current = store.tasks.get(child.id);
+    if (current === undefined || current.state === "stopped") throw new Error("Task cannot change state");
+  });
+});
+
+test("sensitive URL metadata redacts secrets; form masking is selector-limited", () => {
+  assert.equal(sanitizeBrowserUrl("https://user:hunter2@example.com/path?password=hunter2&q=ok"), "https://example.com/path?password=%5Bredacted%5D&q=ok");
+  assert.equal(sanitizeBrowserUrl("https://example.com/?token=abc&q=ok"), "https://example.com/?token=%5Bredacted%5D&q=ok");
+  assert.equal(sanitizeBrowserUrl("https://example.com/?client_secret=shh&q=ok"), "https://example.com/?client_secret=%5Bredacted%5D&q=ok");
+  assert.equal(sanitizeBrowserUrl("https://example.com/#access_token=abc"), "https://example.com/#access_token=%5Bredacted%5D");
+  assert.equal(sanitizeBrowserUrl("https://example.com/#section"), "https://example.com/#section");
+  assert.equal(sanitizeBrowserUrl("https://example.com:8443/"), undefined);
+  assert.equal(sanitizeBrowserUrl("file://user:hunter2@localhost/workspace/cookie.html"), undefined);
+  assert.equal(sanitizeBrowserUrl("file:///workspace/cookie.html"), "file:///workspace/cookie.html");
+  assert.equal(isSensitiveFormControl({ type: "password", value: "hunter2" } as { type: string }), true);
+  assert.equal(isSensitiveFormControl({ autocomplete: "cc-number" }), true);
+  assert.equal(isSensitiveFormControl({ autocomplete: "one-time-code" }), true);
+  assert.equal(isSensitiveFormControl({ name: "password" }), true);
+  assert.equal(isSensitiveFormControl({ name: "token" }), true);
+  assert.equal(isSensitiveFormControl({ name: "api_key" }), true);
+  assert.equal(isSensitiveFormControl({ name: "client_secret" }), true);
+  assert.equal(isSensitiveFormControl({ name: "access_token" }), true);
+  assert.equal(isSensitiveFormControl({ type: "text", name: "q", autocomplete: "off" }), false);
+  assert.equal(UNSAFE_PIXEL_SELECTOR, "canvas, video, iframe");
+  const echoed = redactSensitiveUrlsInText(
+    "No model is connected yet. You said: please open https://example.com/?password=hunter2-secret&token=abc&client_secret=shh&q=ok",
+  );
+  assert.equal(echoed.includes("hunter2"), false);
+  assert.equal(echoed.includes("token=abc"), false);
+  assert.equal(echoed.includes("client_secret=shh"), false);
+  assert.match(echoed, /password=%5Bredacted%5D/);
+  assert.equal(redactSensitiveUrlsInText("Merk dir: Antwortsprache Deutsch"), "Merk dir: Antwortsprache Deutsch");
+  assert.equal(redactSensitiveUrlsInText("Hello hunter2 token=abc"), "Hello hunter2 token=abc");
+});
+
+test("Öffne HTTPS timeline sanitizes query secrets after consent", async () => {
+  const url = "https://example.com/?password=hunter2-secret&token=abc&client_secret=shh&q=ok";
+  const net = countingBrowserNet({ [url]: "<html>ok</html>" });
+  const store = createTaskStore();
+  const preview = await runPublicBrowserOpen(store, owner, url, {
+    ...net.deps,
+    driver: fakeBrowserDriver(),
+  });
+  const approval = preview.cards[0]?.approval;
+  assert.ok(approval);
+  const publicBlob = JSON.stringify(preview.cards);
+  assert.equal(publicBlob.includes("hunter2"), false);
+  assert.equal(publicBlob.includes("token=abc"), false);
+  assert.equal(publicBlob.includes("client_secret=shh"), false);
+  assert.match(approval.operation, /password=%5Bredacted%5D/);
+  assert.match(approval.payload, /token=%5Bredacted%5D/);
+  assert.match(approval.payload, /client_secret=%5Bredacted%5D/);
+  const stored = store.tasks.get(approval.taskId)?.approval;
+  assert.ok(stored);
+  assert.deepEqual(approval, publicApprovalRequest(stored));
+  const listed = JSON.stringify(listResearchCards(store, owner));
+  assert.equal(listed.includes("hunter2"), false);
+  assert.equal(listed.includes("token=abc"), false);
+  assert.equal(stored.payload.includes("hunter2-secret"), true);
+  await assert.rejects(
+    decideApproval(
+      store,
+      owner,
+      approval.taskId,
+      { approval: stored, consent: true },
+      boundAction(stored),
+      () => "should not run",
+    ),
+    /changed/,
+  );
+  const approved = await decideApproval(
+    store,
+    owner,
+    approval.taskId,
+    { approval, consent: true },
+    boundAction(stored),
+    (action, key) =>
+      invokeBrowserOpen(action, key, {
+        ...net.deps,
+        driver: fakeBrowserDriver(),
+        store,
+        owner,
+        taskId: approval.taskId,
+      }),
+  );
+  const timeline = store.tasks.get(approval.taskId)?.browser;
+  assert.ok(timeline);
+  const blob = JSON.stringify(timeline);
+  assert.equal(blob.includes("hunter2"), false);
+  assert.equal(blob.includes("user:"), false);
+  assert.match(approved.result ?? "", /ok/);
+  assert.deepEqual(net.requested(), [url]);
+});
+
+test("stop during an approved hang does not complete and is not failed", async () => {
+  const url = "https://example.com/hang-stop";
+  const net = countingBrowserNet({ [url]: "<html>late</html>" });
+  const store = createTaskStore();
+  const preview = await runPublicBrowserOpen(store, owner, url, {
+    ...net.deps,
+    driver: fakeBrowserDriver({ hang: true }),
+  });
+  const approval = preview.cards[0]?.approval;
+  assert.ok(approval);
+  const stored = store.tasks.get(approval.taskId)?.approval;
+  assert.ok(stored);
+  const pending = decideApproval(
+    store,
+    owner,
+    approval.taskId,
+    { approval, consent: true },
+    boundAction(stored),
+    (action, key) =>
+      invokeBrowserOpen(action, key, {
+        ...net.deps,
+        driver: fakeBrowserDriver({ hang: true }),
+        store,
+        owner,
+        taskId: approval.taskId,
+      }),
+  );
+  for (let i = 0; i < 40; i += 1) {
+    if (store.tasks.get(approval.taskId)?.state === "working" && store.aborts.has(approval.taskId)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(store.tasks.get(approval.taskId)?.state, "working");
+  const stopped = stopTask(store, owner, approval.taskId);
+  assert.equal(stopped.state, "stopped");
+  await assert.rejects(pending);
+  assert.equal(store.tasks.get(approval.taskId)?.state, "stopped");
+  assert.equal(store.tasks.get(approval.taskId)?.result, undefined);
+});
+
+function fakeBrowserDriver(options?: { hang?: boolean; leak?: string; delayMs?: number }): BrowserDriver {
   return {
     async run(plan: BrowserPlan, deps: BrowserDeps): Promise<BrowserSessionResult> {
       if (deps.signal?.aborted) throw new Error("Docker job cancelled");
       const results: BrowserSessionResult["results"] = [];
       let body = "";
+      let lastScreenshotId: string | undefined;
+      const jpeg = tinyJpeg();
       for (const op of plan.ops) {
         if (deps.signal?.aborted) throw new Error("Docker job cancelled");
+        if (options?.delayMs !== undefined && options.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, options.delayMs));
+        }
         if (op.op === "hang" || (options?.hang === true && op.op === "open")) {
+          if (options?.hang === true) {
+            await emitFakeStep(deps, "open", "file:///workspace/cookie.html", jpeg);
+          }
+          if (deps.signal?.aborted) throw new Error("Docker job cancelled");
           await new Promise<never>((_, reject) => {
-            deps.signal?.addEventListener("abort", () => reject(new Error("Docker job cancelled")), { once: true });
+            const beat = setInterval(() => {
+              if (deps.signal?.aborted) return;
+              void emitFakeStep(deps, "screenshot", undefined, jpeg);
+            }, 30);
+            const onAbort = (): void => {
+              clearInterval(beat);
+              reject(new Error("Docker job cancelled"));
+            };
+            if (deps.signal?.aborted) {
+              onAbort();
+              return;
+            }
+            deps.signal?.addEventListener("abort", onAbort, { once: true });
           });
         }
         if (op.op === "open") {
           if (op.url.startsWith("file:")) {
-            body = await readFile(
-              join(fileURLToPath(new URL("../../../fixtures/browser/cookie.html", import.meta.url))),
-              "utf8",
-            );
-            results.push({ op: "open", url: op.url });
+            const fixture =
+              op.url.includes("sensitive.html")
+                ? join(fileURLToPath(new URL("../../../fixtures/browser/sensitive.html", import.meta.url)))
+                : join(fileURLToPath(new URL("../../../fixtures/browser/cookie.html", import.meta.url)));
+            body = await readFile(fixture, "utf8");
+            const url = sanitizeBrowserUrl(op.url);
+            results.push({ op: "open", url: url ?? op.url });
+            lastScreenshotId = await emitFakeStep(deps, "open", url, jpeg);
             continue;
           }
           if (!isApprovedBrowserFetch(op.url, plan.approved)) throw new Error("Blocked destination");
@@ -301,7 +553,9 @@ function fakeBrowserDriver(options?: { hang?: boolean; leak?: string }): Browser
           if (options?.leak !== undefined && isApprovedBrowserFetch(options.leak, plan.approved)) {
             await fetchPublicHttpsPage({ url: options.leak }, deps);
           }
-          results.push({ op: "open", url: page.url });
+          const url = sanitizeBrowserUrl(page.url);
+          results.push({ op: "open", url: url ?? page.url });
+          lastScreenshotId = await emitFakeStep(deps, "open", url, jpeg);
           continue;
         }
         if (op.op === "dismissCookies") {
@@ -315,32 +569,57 @@ function fakeBrowserDriver(options?: { hang?: boolean; leak?: string }): Browser
           assert.equal(clicked, 4);
           body = body.replace("blocked", "cookies-accepted");
           results.push({ op: "dismissCookies", dismissed: true, name: "Accept cookies" });
+          lastScreenshotId = await emitFakeStep(deps, "dismissCookies", sanitizeBrowserUrl("file:///workspace/cookie.html"), jpeg);
           continue;
         }
         if (op.op === "read") {
           results.push({ op: "read", text: `${visibleText(body)}\n${UNTRUSTED_PAGE_TEXT}` });
+          lastScreenshotId = await emitFakeStep(deps, "read", undefined, jpeg);
           continue;
         }
         if (op.op === "find") {
           results.push({ op: "find", text: op.text, found: body.includes(op.text) });
+          lastScreenshotId = await emitFakeStep(deps, "find", undefined, jpeg);
           continue;
         }
         if (op.op === "scroll") {
           results.push({ op: "scroll", scrollY: op.dy ?? 800 });
+          lastScreenshotId = await emitFakeStep(deps, "scroll", undefined, jpeg);
           continue;
         }
         if (op.op === "screenshot") {
-          results.push({ op: "screenshot", bytes: 4 });
+          results.push({ op: "screenshot", bytes: jpeg.byteLength });
+          lastScreenshotId = await emitFakeStep(deps, "screenshot", undefined, jpeg);
         }
       }
-      if (deps.retention !== undefined && deps.owner !== undefined) {
-        const { putArtifact } = await import("./retention.ts");
-        const record = putArtifact(deps.retention, deps.owner, { kind: "screenshot", body: Buffer.from("JPEG") });
-        return { results, screenshotId: record.id };
-      }
-      return { results };
+      return { results, ...(lastScreenshotId === undefined ? {} : { screenshotId: lastScreenshotId }) };
     },
   };
+}
+
+async function emitFakeStep(
+  deps: BrowserDeps,
+  op: "open" | "dismissCookies" | "read" | "find" | "scroll" | "screenshot",
+  url: string | undefined,
+  jpeg: Buffer,
+): Promise<string | undefined> {
+  if (deps.signal?.aborted) throw new Error("Docker job cancelled");
+  let screenshotId: string | undefined;
+  if (deps.retention !== undefined && deps.owner !== undefined) {
+    const { putArtifact } = await import("./retention.ts");
+    screenshotId = putArtifact(deps.retention, deps.owner, { kind: "screenshot", body: jpeg }).id;
+  }
+  deps.onStep?.({
+    op,
+    at: Date.now(),
+    ...(url === undefined ? {} : { url }),
+    ...(screenshotId === undefined ? {} : { screenshotId }),
+  });
+  return screenshotId;
+}
+
+function tinyJpeg(): Buffer {
+  return Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
 }
 
 function visibleText(html: string): string {

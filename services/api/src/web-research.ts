@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ApprovalAction, SubagentCard } from "@lilith/contracts";
+import { redactSensitiveUrlsInText, type ApprovalAction, type SubagentCard } from "@lilith/contracts";
 import {
   parsePublicHttpsUrl,
   pinnedHttpsGet,
@@ -10,6 +10,7 @@ import {
   type LookupAll,
   type PublicHttpsGet,
 } from "./ssrf.ts";
+import { assertPublicUrlProjection } from "./browser-policy.ts";
 import {
   COLOR_COMPARE_PROMPT,
   RESEARCH_ASSIGNMENT,
@@ -183,7 +184,7 @@ export async function invokeDataDisclosure(
 ): Promise<string> {
   const request = publicReadFromApproval(action);
   const page = await fetchPublicPage(request, deps);
-  return `Read ${page.url}\n${page.text}`;
+  return redactSensitiveUrlsInText(`Read ${page.url}\n${page.text}`);
 }
 
 function publicReadAction(request: PublicReadRequest, actionId: string = randomUUID()): ApprovalAction {
@@ -192,6 +193,7 @@ function publicReadAction(request: PublicReadRequest, actionId: string = randomU
     url: parsePublicHttpsUrl(request.url).href,
     ...(request.userData === undefined ? {} : { userData: request.userData }),
   };
+  assertPublicUrlProjection(bound.url);
   return {
     actionId,
     actionClass: "data_disclosure",
@@ -299,7 +301,7 @@ export async function runPublicPageRead(
     cards.push(subagentCard(setTaskState(store, owner, started.id, "working")));
     startTool(store, owner, started.id);
     const page = await readPublicHttps({ url }, webResearchDepsForTask(store, started.id, deps));
-    const result = `${page.text}\nSource: ${page.url}`;
+    const result = redactSensitiveUrlsInText(`${page.text}\nSource: ${page.url}`);
     cards.push(subagentCard(setTaskState(store, owner, started.id, "completed", result)));
     setTaskState(store, owner, parent.id, "completed", result);
     return { cards, result };

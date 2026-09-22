@@ -122,13 +122,19 @@ test("host protocol fds win a race that swaps the net dir for a junction", () =>
   }
 });
 
-test("host-owned ready file is readable through the kept fd", async () => {
+test("host-owned ready, progress, and shot files are readable through kept fds", async () => {
   await mkdir(join(tmpdir(), "lilith-hostfs-async"), { recursive: true });
   const workspace = await mkdtemp(join(tmpdir(), "lilith-hostfs-async-"));
   const proto = openHostProtocol(workspace);
   try {
     writeHostFd(proto.ready, "page-ready\n");
+    writeHostFd(proto.progress, `${JSON.stringify({ t: "step", seq: 1, op: "open" })}\n`);
+    writeHostFd(proto.shot, Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex"));
+    writeHostFd(proto.progressAck, `${JSON.stringify({ seq: 1 })}\n`);
     assert.equal(readHostFd(proto.ready, 32).toString("utf8"), "page-ready\n");
+    assert.match(readHostFd(proto.progress, 256).toString("utf8"), /"op":"open"/);
+    assert.equal(readHostFd(proto.shot, 64)[0], 0xff);
+    assert.match(readHostFd(proto.progressAck, 64).toString("utf8"), /"seq":1/);
   } finally {
     closeHostProtocol(proto);
     removeTreeNoFollow(workspace);

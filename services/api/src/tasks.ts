@@ -15,8 +15,14 @@ import {
   type QuestionOption,
   type SubagentCard,
   type TaskState,
+  parseBrowserTimeline,
+  type BrowserStep,
+  type BrowserTimeline,
+  MAX_BROWSER_STEPS,
+  redactSensitiveUrlsInText,
 } from "@lilith/contracts";
 import { requireOwned, type OwnerContext } from "./auth.ts";
+import { redactSensitiveUrl } from "./browser-policy.ts";
 
 export const MAX_PARALLEL_SUBAGENTS = 3;
 export const TASK_MAX_RUNTIME_MS = 15 * 60_000;
@@ -60,6 +66,7 @@ export type Task = {
   pauseReason?: PauseReason;
   question?: QuestionCard;
   approval?: ApprovalRequest;
+  browser?: BrowserTimeline;
 };
 
 export type TaskStore = {
@@ -255,6 +262,36 @@ export function startTool(store: TaskStore, owner: OwnerContext, taskId: string)
   }
 }
 
+export const MAX_BROWSER_SCREENSHOTS = 12;
+
+export function recordBrowserStep(
+  store: TaskStore,
+  owner: OwnerContext,
+  taskId: string,
+  input: BrowserStep,
+): Task {
+  let current: Task;
+  try {
+    applyLimits(store, owner, taskId);
+    current = ownedTask(store, owner, taskId);
+  } catch {
+    return ownedTask(store, owner, taskId);
+  }
+  if (!RUNNABLE_STATES.has(current.state)) return current;
+  const shots = current.browser?.steps.filter((step) => step.screenshotId !== undefined).length ?? 0;
+  const step: BrowserStep = {
+    op: input.op,
+    at: input.at,
+    ...(input.url === undefined ? {} : { url: input.url }),
+    ...(input.screenshotId === undefined || shots >= MAX_BROWSER_SCREENSHOTS ? {} : { screenshotId: input.screenshotId }),
+  };
+  const steps = [...(current.browser?.steps ?? []), step].slice(-MAX_BROWSER_STEPS);
+  const last = steps[steps.length - 1];
+  if (last === undefined) return current;
+  const browser = parseBrowserTimeline({ current: last, steps });
+  return transact(store, () => commitTask(store, { ...ownedTask(store, owner, taskId), browser }));
+}
+
 export function acceptToolResult(
   store: TaskStore,
   owner: OwnerContext,
@@ -320,6 +357,8 @@ function payloadDigest(action: ApprovalAction): string {
 }
 
 // The caller supplies the actual tool arguments, never arguments taken from the consent POST.
+// The POST body is the public projection (secret query values redacted). Dispatch uses the
+// stored exact binding, so consent cannot silently retarget another URL.
 export async function decideApproval(
   store: TaskStore,
   owner: OwnerContext,
@@ -335,7 +374,7 @@ export async function decideApproval(
   const expected = parseApprovalRequest({ ...approval, ...action, payloadDigest: payloadDigest(action) });
   if (
     approval.taskId !== taskId ||
-    JSON.stringify(approval) !== JSON.stringify(decision.approval) ||
+    JSON.stringify(publicApprovalRequest(approval)) !== JSON.stringify(decision.approval) ||
     JSON.stringify(approval) !== JSON.stringify(expected)
   ) {
     throw new Error("Approval changed; request new consent");
@@ -490,6 +529,40 @@ export function deleteOwnerTasks(store: TaskStore, owner: OwnerContext): void {
   }
 }
 
+export function publicApprovalRequest(approval: ApprovalRequest): ApprovalRequest {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(approval.payload);
+  } catch {
+    return approval;
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    !("url" in parsed) ||
+    typeof parsed.url !== "string"
+  ) {
+    return approval;
+  }
+  const preview = redactSensitiveUrl(parsed.url);
+  if (preview === undefined) throw new Error("Blocked destination");
+  if (preview === parsed.url) return approval;
+  const shown = new URL(preview);
+  const prefix = approval.operation.startsWith("OPEN ")
+    ? "OPEN "
+    : approval.operation.startsWith("GET ")
+      ? "GET "
+      : approval.operation.startsWith("POST ")
+        ? "POST "
+        : undefined;
+  return parseApprovalRequest({
+    ...approval,
+    payload: JSON.stringify({ ...parsed, url: preview }),
+    operation: prefix === undefined ? approval.operation : `${prefix}${shown.pathname}${shown.search}`,
+  });
+}
+
 export function subagentCard(task: Task): SubagentCard {
   if (task.role !== "research" || task.parentTaskId === undefined) {
     throw new Error("Task is not a research subagent");
@@ -501,12 +574,13 @@ export function subagentCard(task: Task): SubagentCard {
     state: task.state,
     ...(task.result === undefined || task.state === "paused" || task.state === "stopped"
       ? {}
-      : { result: task.result }),
+      : { result: redactSensitiveUrlsInText(task.result) }),
     ...(task.state === "paused" && task.pauseReason !== undefined
       ? { pauseReason: task.pauseReason }
       : {}),
     ...(task.question === undefined ? {} : { question: task.question }),
-    ...(task.approval === undefined ? {} : { approval: structuredClone(task.approval) }),
+    ...(task.approval === undefined ? {} : { approval: publicApprovalRequest(structuredClone(task.approval)) }),
+    ...(task.browser === undefined ? {} : { browser: structuredClone(task.browser) }),
   };
 }
 
@@ -887,7 +961,8 @@ function parsePersistedTask(value: unknown): Task {
       key !== "costCents" &&
       key !== "pauseReason" &&
       key !== "question" &&
-      key !== "approval"
+      key !== "approval" &&
+      key !== "browser"
     ) {
       throw new Error("Invalid task store");
     }
@@ -949,6 +1024,14 @@ function parsePersistedTask(value: unknown): Task {
   const approval = "approval" in value ? parseApprovalRequest(value.approval) : undefined;
   if (approval !== undefined && (approval.taskId !== value.id || question !== undefined || payloadDigest(approval) !== approval.payloadDigest)) throw new Error("Invalid task store");
   if (state === "needs_input" && question === undefined && approval?.state !== "pending") throw new Error("Invalid task store");
+  let browser: BrowserTimeline | undefined;
+  if ("browser" in value) {
+    try {
+      browser = parseBrowserTimeline(value.browser);
+    } catch {
+      throw new Error("Invalid task store");
+    }
+  }
   return {
     id: value.id,
     ownerId: value.ownerId,
@@ -962,5 +1045,6 @@ function parsePersistedTask(value: unknown): Task {
     ...(pauseReason === undefined ? {} : { pauseReason }),
     ...(question === undefined ? {} : { question }),
     ...(approval === undefined ? {} : { approval }),
+    ...(browser === undefined ? {} : { browser }),
   };
 }

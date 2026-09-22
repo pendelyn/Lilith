@@ -3,9 +3,12 @@ import {
   MEMORY_SECRET_REPLY,
   isForbiddenRememberMessage,
   parseSubagentCard,
+  redactSensitiveUrlsInText,
+  type BrowserStep,
   type SubagentCard,
   type TaskState,
 } from "@lilith/contracts";
+import { persistedChatHasScreenshotBytes } from "./screenshots.ts";
 
 export const CHAT_STORAGE_KEY = "lilith.chat";
 export const MAX_MESSAGE_LENGTH = 4_000;
@@ -24,7 +27,43 @@ export type ChatMessage = {
 export function rememberDisplayText(raw: string): string {
   const text = raw.trim().slice(0, MAX_MESSAGE_LENGTH);
   if (text === "") return text;
-  return isForbiddenRememberMessage(text) ? MEMORY_REDACTED_USER_TEXT : text;
+  if (isForbiddenRememberMessage(text)) return MEMORY_REDACTED_USER_TEXT;
+  return redactSensitiveUrlsInText(text);
+}
+
+function displayChatText(raw: string, max = MAX_MESSAGE_LENGTH * 4): string {
+  return redactSensitiveUrlsInText(raw).slice(0, max);
+}
+
+function sanitizeStep(step: BrowserStep): BrowserStep {
+  if (step.url === undefined) return step;
+  const url = redactSensitiveUrlsInText(step.url).slice(0, MAX_MESSAGE_LENGTH);
+  return url === step.url ? step : { ...step, url };
+}
+
+function sanitizeCard(card: SubagentCard): SubagentCard {
+  const result = card.result === undefined ? card.result : displayChatText(card.result, MAX_MESSAGE_LENGTH);
+  let browser = card.browser;
+  if (browser !== undefined) {
+    const timeline = browser;
+    const current = sanitizeStep(timeline.current);
+    const steps = timeline.steps.map(sanitizeStep);
+    if (current !== timeline.current || steps.some((step, index) => step !== timeline.steps[index])) {
+      browser = { current, steps };
+    }
+  }
+  if (result === card.result && browser === card.browser) return card;
+  return {
+    ...card,
+    ...(result === undefined ? {} : { result }),
+    ...(browser === undefined ? {} : { browser }),
+  };
+}
+
+function cardsUnchanged(current: SubagentCard[] | undefined, next: SubagentCard[] | undefined): boolean {
+  if (current === next) return true;
+  if (current === undefined || next === undefined || current.length !== next.length) return false;
+  return current.every((card, index) => card === next[index]);
 }
 
 export function redactRefusedSecrets(messages: ChatMessage[]): ChatMessage[] {
@@ -36,11 +75,19 @@ export function redactRefusedSecrets(messages: ChatMessage[]): ChatMessage[] {
     ),
   );
   return messages.map((message) => {
-    if (message.role !== "user") return message;
-    const text = refusedUserIds.has(message.id)
-      ? MEMORY_REDACTED_USER_TEXT
-      : rememberDisplayText(message.text);
-    return text === message.text ? message : { ...message, text };
+    const text =
+      message.role === "user"
+        ? refusedUserIds.has(message.id)
+          ? MEMORY_REDACTED_USER_TEXT
+          : rememberDisplayText(message.text)
+        : displayChatText(message.text);
+    const subagents = message.subagents?.map(sanitizeCard);
+    if (text === message.text && cardsUnchanged(message.subagents, subagents)) return message;
+    return {
+      ...message,
+      text,
+      ...(subagents === undefined || subagents.length === 0 ? {} : { subagents }),
+    };
   });
 }
 
@@ -113,28 +160,41 @@ export function upsertSubagent(
     const subagents = [...(message.subagents ?? [])];
     const index = subagents.findIndex((item) => item.id === card.id);
     if (index === -1) subagents.push(card);
-    else subagents[index] = card;
+    else if (shouldReplaceCard(subagents[index]!, card)) subagents[index] = card;
     return { ...message, subagents };
   });
 }
 
 export function setTaskReply(messages: ChatMessage[], taskId: string, text: string): ChatMessage[] {
   if (text === "") return messages;
-  return messages.map((message) =>
-    message.subagents?.some((card) => card.id === taskId)
-      ? { ...message, text: text.slice(0, MAX_MESSAGE_LENGTH * 4), status: "complete" }
-      : message,
-  );
+  return messages.map((message) => {
+    const card = message.subagents?.find((item) => item.id === taskId);
+    if (card === undefined || card.state === "stopped" || card.state === "failed" || card.state === "paused") {
+      return message;
+    }
+    return { ...message, text: displayChatText(text), status: "complete" };
+  });
 }
 
 const HYDRATE_STATES = new Set<TaskState>(["waiting", "working", "needs_input", "paused"]);
+const TERMINAL_STATES = new Set<TaskState>(["completed", "stopped", "failed"]);
+
+function shouldReplaceCard(current: SubagentCard, incoming: SubagentCard): boolean {
+  if (current.state === "stopped" && incoming.state !== "stopped") return false;
+  if (TERMINAL_STATES.has(current.state) && !TERMINAL_STATES.has(incoming.state)) return false;
+  return true;
+}
 
 export function applyServerCards(messages: ChatMessage[], cards: SubagentCard[]): ChatMessage[] {
   const next = messages.map((message) => {
     if (message.subagents === undefined) return message;
     return {
       ...message,
-      subagents: message.subagents.map((card) => cards.find((incoming) => incoming.id === card.id) ?? card),
+      subagents: message.subagents.map((card) => {
+        const incoming = cards.find((item) => item.id === card.id);
+        if (incoming === undefined || !shouldReplaceCard(card, incoming)) return card;
+        return incoming;
+      }),
     };
   });
   const known = new Set(next.flatMap((message) => message.subagents?.map((card) => card.id) ?? []));
@@ -156,6 +216,7 @@ export function applyServerCards(messages: ChatMessage[], cards: SubagentCard[])
 
 export function parsePersistedChat(raw: string | null): ChatMessage[] {
   if (raw == null) return [];
+  if (persistedChatHasScreenshotBytes(raw)) return [];
   let value: unknown;
   try {
     value = JSON.parse(raw);
@@ -197,6 +258,25 @@ export function parsePersistedChat(raw: string | null): ChatMessage[] {
             ...card,
             assignment: card.assignment.slice(0, MAX_MESSAGE_LENGTH),
             ...(card.result === undefined ? {} : { result: card.result.slice(0, MAX_MESSAGE_LENGTH) }),
+            ...(card.browser === undefined
+              ? {}
+              : {
+                  browser: {
+                    ...card.browser,
+                    current: sanitizeStep({
+                      ...card.browser.current,
+                      ...(card.browser.current.url === undefined
+                        ? {}
+                        : { url: card.browser.current.url.slice(0, MAX_MESSAGE_LENGTH) }),
+                    }),
+                    steps: card.browser.steps.map((step) =>
+                      sanitizeStep({
+                        ...step,
+                        ...(step.url === undefined ? {} : { url: step.url.slice(0, MAX_MESSAGE_LENGTH) }),
+                      }),
+                    ),
+                  },
+                }),
           };
         });
       } catch {

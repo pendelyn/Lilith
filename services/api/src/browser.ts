@@ -3,7 +3,8 @@ import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import type { ApprovalAction, SubagentCard } from "@lilith/contracts";
+import type { ApprovalAction, SubagentCard, BrowserStep } from "@lilith/contracts";
+import { parseBrowserStepOp } from "@lilith/contracts";
 import { parsePublicHttpsUrl } from "./ssrf.ts";
 import {
   ALLOWED_WORKSPACE_FILES,
@@ -13,6 +14,12 @@ import {
   COOKIE_FIXTURE_FILE,
   COOKIE_HAS_RE,
   COOKIE_NEED_RE,
+  SENSITIVE_FIXTURE_FILE,
+  SENSITIVE_INPUT_SELECTOR,
+  SENSITIVE_QUERY_KEYS,
+  UNSAFE_PIXEL_SELECTOR,
+  assertPublicUrlProjection,
+  sanitizeBrowserUrl,
 } from "./browser-policy.ts";
 import {
   closeHostProtocol,
@@ -23,7 +30,7 @@ import {
   writeHostFd,
   type HostProtocol,
 } from "./browser-hostfs.ts";
-import { putArtifact, type RetentionStore } from "./retention.ts";
+import { putArtifact, isJpeg, type RetentionStore } from "./retention.ts";
 import {
   dockerArgs,
   RUNNER_WORKSPACES_ROOT,
@@ -33,6 +40,7 @@ import {
 import {
   createParentTask,
   openApproval,
+  recordBrowserStep,
   researchAbortSignal,
   setTaskState,
   startSubagent,
@@ -64,8 +72,11 @@ export const PUBLIC_OPEN_ASSIGNMENT = "Open one public HTTPS page in the isolate
 
 const WORKER_FILE = fileURLToPath(new URL("./browser-worker.mjs", import.meta.url));
 const COOKIE_FIXTURE = fileURLToPath(new URL("../../../fixtures/browser/cookie.html", import.meta.url));
+const SENSITIVE_FIXTURE = fileURLToPath(new URL("../../../fixtures/browser/sensitive.html", import.meta.url));
 const require = createRequire(import.meta.url);
 const PLAYWRIGHT_CORE_ROOT = dirname(require.resolve("playwright-core/package.json"));
+export const MAX_BROWSER_SHOTS_PER_JOB = 12;
+export const BROWSER_HEARTBEAT_MS = 2_000;
 
 export type BrowserOp =
   | { op: "open"; url: string }
@@ -91,6 +102,9 @@ export type BrowserOpResult = {
   scrollY?: number;
   file?: string;
   bytes?: number;
+  maskedFields?: number;
+  coveredSurfaces?: number;
+  projected?: { name: string; autocomplete: string; value: string; title: string; ariaLabel: string }[];
 };
 
 export type BrowserSessionResult = {
@@ -106,6 +120,8 @@ export type BrowserDeps = WebResearchDeps & {
   driver?: BrowserDriver;
   retention?: RetentionStore;
   owner?: OwnerContext;
+  onStep?: (step: BrowserStep) => void;
+  onCard?: (card: SubagentCard) => void;
 };
 
 export function isApprovedBrowserFetch(raw: string, approved: readonly string[]): boolean {
@@ -170,9 +186,15 @@ export async function runCookieBrowser(
     assignment: COOKIE_ASSIGNMENT,
     role: "research",
   });
-  const cards = [subagentCard(started)];
+  const cards: SubagentCard[] = [];
+  const emit = (card: SubagentCard): SubagentCard => {
+    cards.push(card);
+    deps.onCard?.(card);
+    return card;
+  };
+  emit(subagentCard(started));
   try {
-    cards.push(subagentCard(setTaskState(store, owner, started.id, "working")));
+    emit(subagentCard(setTaskState(store, owner, started.id, "working")));
     startTool(store, owner, started.id);
     const session = await runBrowserSession(
       {
@@ -182,23 +204,22 @@ export async function runCookieBrowser(
           { op: "find", text: COOKIE_FIND_TOKEN },
           { op: "scroll", dy: 800 },
           { op: "read" },
-          { op: "screenshot" },
         ],
         approved: [],
       },
       store,
       owner,
       started.id,
-      deps,
+      { ...deps, onCard: emit },
     );
     const result = formatBrowserResult(session);
-    cards.push(subagentCard(setTaskState(store, owner, started.id, "completed", result)));
+    emit(subagentCard(setTaskState(store, owner, started.id, "completed", result)));
     setTaskState(store, owner, parent.id, "completed", result);
     return { cards, result };
   } catch {
     failBrowser(store, owner, started.id, parent.id);
     const failed = store.tasks.get(started.id);
-    if (failed !== undefined && failed.role === "research") cards.push(subagentCard(failed));
+    if (failed !== undefined && failed.role === "research") emit(subagentCard(failed));
     return { cards };
   }
 }
@@ -215,25 +236,31 @@ export async function runPublicBrowserOpen(
     assignment: PUBLIC_OPEN_ASSIGNMENT,
     role: "research",
   });
-  const cards = [subagentCard(started)];
+  const cards: SubagentCard[] = [];
+  const emit = (card: SubagentCard): SubagentCard => {
+    cards.push(card);
+    deps.onCard?.(card);
+    return card;
+  };
   try {
     if (needsDisclosureConsent({ url }, pinnedColorFixtureCommit(deps))) {
       openApproval(store, owner, started.id, browserOpenAction({ url }));
       const opened = store.tasks.get(started.id);
       if (opened === undefined) throw new Error("Task not found");
-      return { cards: [subagentCard(opened)] };
+      return { cards: [emit(subagentCard(opened))] };
     }
-    cards.push(subagentCard(setTaskState(store, owner, started.id, "working")));
+    emit(subagentCard(started));
+    emit(subagentCard(setTaskState(store, owner, started.id, "working")));
     startTool(store, owner, started.id);
-    const session = await openApprovedInBrowser(url, store, owner, started.id, deps);
+    const session = await openApprovedInBrowser(url, store, owner, started.id, { ...deps, onCard: emit });
     const result = formatBrowserResult(session);
-    cards.push(subagentCard(setTaskState(store, owner, started.id, "completed", result)));
+    emit(subagentCard(setTaskState(store, owner, started.id, "completed", result)));
     setTaskState(store, owner, parent.id, "completed", result);
     return { cards, result };
   } catch {
     failBrowser(store, owner, started.id, parent.id);
     const failed = store.tasks.get(started.id);
-    if (failed !== undefined && failed.role === "research") cards.push(subagentCard(failed));
+    if (failed !== undefined && failed.role === "research") emit(subagentCard(failed));
     return { cards };
   }
 }
@@ -260,6 +287,14 @@ export async function runBrowserSession(
     ...deps,
     owner,
     signal: mergeSignals(deps.signal, researchAbortSignal(store, taskId)),
+    onStep: (step) => {
+      const safe = sanitizeTimelineStep(step);
+      deps.onStep?.(safe);
+      const recorded = recordBrowserStep(store, owner, taskId, safe);
+      if (recorded.role === "research" && recorded.parentTaskId !== undefined) {
+        deps.onCard?.(subagentCard(recorded));
+      }
+    },
   });
 }
 
@@ -292,7 +327,6 @@ async function openApprovedInBrowser(
         { op: "open", url: approved },
         { op: "dismissCookies" },
         { op: "read" },
-        { op: "screenshot" },
       ],
       approved: [approved],
     },
@@ -305,6 +339,7 @@ async function openApprovedInBrowser(
 
 function browserOpenAction(request: { url: string }, actionId: string = randomUUID()): ApprovalAction {
   const url = parsePublicHttpsUrl(request.url);
+  assertPublicUrlProjection(url.href);
   return {
     actionId,
     actionClass: "data_disclosure",
@@ -336,9 +371,12 @@ const dockerBrowserDriver: BrowserDriver = {
     await mkdir(RUNNER_WORKSPACES_ROOT, { recursive: true, mode: 0o700 });
     const workspace = await mkdtemp(join(RUNNER_WORKSPACES_ROOT, "browser-"));
     let proto: HostProtocol | undefined;
+    let lastScreenshotId: string | undefined;
     try {
       proto = await prepareBrowserWorkspace(workspace, plan);
-      const stopBroker = brokerBrowserFetches(proto, plan, deps);
+      const stopBroker = brokerBrowserFetches(proto, plan, deps, (screenshotId) => {
+        lastScreenshotId = screenshotId;
+      });
       try {
         await runIsolatedJob({
           id: randomUUID(),
@@ -358,7 +396,10 @@ const dockerBrowserDriver: BrowserDriver = {
       if (typeof parsed !== "object" || parsed === null || !("results" in parsed) || !Array.isArray(parsed.results)) {
         throw new Error("Browser job failed");
       }
-      const session: BrowserSessionResult = { results: parsed.results as BrowserOpResult[] };
+      const session: BrowserSessionResult = {
+        results: parsed.results as BrowserOpResult[],
+        ...(lastScreenshotId === undefined ? {} : { screenshotId: lastScreenshotId }),
+      };
       return attachScreenshot(session, proto, deps);
     } finally {
       if (proto !== undefined) closeHostProtocol(proto);
@@ -367,15 +408,23 @@ const dockerBrowserDriver: BrowserDriver = {
   },
 };
 
-function brokerBrowserFetches(proto: HostProtocol, plan: BrowserPlan, deps: BrowserDeps): () => void {
+function brokerBrowserFetches(
+  proto: HostProtocol,
+  plan: BrowserPlan,
+  deps: BrowserDeps,
+  onShot: (screenshotId: string) => void,
+): () => void {
   const seen = new Set<string>();
+  const seenSteps = new Set<number>();
   let ticking = false;
   const timer = setInterval(() => {
     if (ticking) return;
     ticking = true;
-    void tickHostInbox(proto, plan, deps, seen).finally(() => {
-      ticking = false;
-    });
+    void tickHostInbox(proto, plan, deps, seen)
+      .then(() => tickHostProgress(proto, deps, seenSteps, onShot))
+      .finally(() => {
+        ticking = false;
+      });
   }, 50);
   return () => clearInterval(timer);
 }
@@ -435,12 +484,75 @@ async function handleWorkerRequest(
   }
 }
 
+function tickHostProgress(
+  proto: HostProtocol,
+  deps: BrowserDeps,
+  seen: Set<number>,
+  onShot: (screenshotId: string) => void,
+): void {
+  if (deps.signal?.aborted) return;
+  let message: Record<string, unknown>;
+  try {
+    const raw = readHostFd(proto.progress, 65_536).toString("utf8").trim();
+    if (raw === "") return;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+    message = parsed as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (message.t !== "step" || typeof message.seq !== "number" || !Number.isInteger(message.seq)) return;
+  const seq = message.seq;
+  if (seen.has(seq)) {
+    try {
+      writeHostFd(proto.progressAck, `${JSON.stringify({ seq })}\n`);
+    } catch {
+      // worker will retry
+    }
+    return;
+  }
+  seen.add(seq);
+  let screenshotId: string | undefined;
+  if (message.shot === true && deps.retention !== undefined && deps.owner !== undefined && deps.signal?.aborted !== true) {
+    try {
+      const bytes = readHostFd(proto.shot, 1_048_576);
+      if (isJpeg(bytes) && bytes.byteLength > 0) {
+        const record = putArtifact(deps.retention, deps.owner, { kind: "screenshot", body: bytes });
+        screenshotId = record.id;
+        onShot(record.id);
+      }
+    } catch {
+      // persist failed; still ack so the worker is not stuck
+    }
+  }
+  try {
+    writeHostFd(proto.progressAck, `${JSON.stringify({ seq })}\n`);
+  } catch {
+    // worker will retry
+  }
+  if (deps.signal?.aborted) return;
+  let op: BrowserStep["op"];
+  try {
+    op = parseBrowserStepOp(message.op);
+  } catch {
+    return;
+  }
+  const url = typeof message.url === "string" ? sanitizeBrowserUrl(message.url) : undefined;
+  deps.onStep?.({
+    op,
+    at: Date.now(),
+    ...(url === undefined ? {} : { url }),
+    ...(screenshotId === undefined ? {} : { screenshotId }),
+  });
+}
+
 async function prepareBrowserWorkspace(workspace: string, plan: BrowserPlan): Promise<HostProtocol> {
   const root = join(workspace, ".lilith-browser");
   await mkdir(join(workspace, ".lilith-net"), { recursive: true, mode: 0o700 });
   await mkdir(join(root, "node_modules"), { recursive: true, mode: 0o700 });
   await cp(WORKER_FILE, join(root, "worker.mjs"));
   await cp(COOKIE_FIXTURE, join(workspace, COOKIE_FIXTURE_FILE));
+  await cp(SENSITIVE_FIXTURE, join(workspace, SENSITIVE_FIXTURE_FILE));
   await cp(PLAYWRIGHT_CORE_ROOT, join(root, "node_modules", "playwright-core"), {
     recursive: true,
     filter: (source) => !source.includes(".local-browsers"),
@@ -451,6 +563,13 @@ async function prepareBrowserWorkspace(workspace: string, plan: BrowserPlan): Pr
       ops: plan.ops,
       approved: plan.approved,
       allowedFiles: ALLOWED_WORKSPACE_FILES,
+      maxShots: MAX_BROWSER_SHOTS_PER_JOB,
+      heartbeatMs: BROWSER_HEARTBEAT_MS,
+      sensitive: {
+        inputSelector: SENSITIVE_INPUT_SELECTOR,
+        pixelSelector: UNSAFE_PIXEL_SELECTOR,
+        queryKeys: SENSITIVE_QUERY_KEYS,
+      },
       cookie: {
         locator: COOKIE_DIALOG_LOCATOR,
         has: COOKIE_HAS_RE,
@@ -470,10 +589,13 @@ function attachScreenshot(
   deps: BrowserDeps,
 ): BrowserSessionResult {
   if (deps.retention === undefined || deps.owner === undefined) return session;
-  if (!session.results.some((result) => result.op === "screenshot")) return session;
+  if (session.screenshotId !== undefined) return session;
+  if (!session.results.some((result) => result.op === "screenshot" || result.op === "open" || result.op === "read")) {
+    return session;
+  }
   try {
     const bytes = readHostFd(proto.shot, 1_048_576);
-    if (bytes.byteLength === 0) return session;
+    if (bytes.byteLength === 0 || !isJpeg(bytes)) return session;
     const record = putArtifact(deps.retention, deps.owner, { kind: "screenshot", body: bytes });
     return { ...session, screenshotId: record.id };
   } catch {
@@ -496,6 +618,16 @@ function mergeSignals(...signals: Array<AbortSignal | undefined>): AbortSignal |
   if (live.length === 0) return undefined;
   if (live.length === 1) return live[0];
   return AbortSignal.any(live);
+}
+
+function sanitizeTimelineStep(step: BrowserStep): BrowserStep {
+  const url = step.url === undefined ? undefined : sanitizeBrowserUrl(step.url);
+  return {
+    op: step.op,
+    at: step.at,
+    ...(url === undefined ? {} : { url }),
+    ...(step.screenshotId === undefined ? {} : { screenshotId: step.screenshotId }),
+  };
 }
 
 function failBrowser(store: TaskStore, owner: OwnerContext, childId: string, parentId: string): void {

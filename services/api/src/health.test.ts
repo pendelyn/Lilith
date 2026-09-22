@@ -13,6 +13,7 @@ import {
 } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer, loadConfig } from "./health.ts";
+import { createRetentionStore } from "./retention.ts";
 import {
   APPROVAL_PROMPT,
   COLOR_COMPARE_PROMPT,
@@ -163,6 +164,46 @@ test("subagent events reject extra fields", () => {
         assignment: "task",
         state: "working",
         log: "raw tool output",
+      }),
+    /Invalid/,
+  );
+  assert.throws(
+    () =>
+      parseSubagentCard({
+        id: "sub-1",
+        role: "research",
+        assignment: "task",
+        state: "working",
+        browser: {
+          current: { op: "open", at: 1, screenshotId: "not-a-uuid" },
+          steps: [{ op: "open", at: 1, screenshotId: "not-a-uuid" }],
+        },
+      }),
+    /Invalid/,
+  );
+  const shot = "11111111-1111-4111-8111-111111111111";
+  const card = parseSubagentCard({
+    id: "sub-1",
+    role: "research",
+    assignment: "task",
+    state: "working",
+    browser: {
+      current: { op: "open", at: 1, url: "https://example.com/", screenshotId: shot },
+      steps: [{ op: "open", at: 1, url: "https://example.com/", screenshotId: shot }],
+    },
+  });
+  assert.equal(card.browser?.current.screenshotId, shot);
+  assert.throws(
+    () =>
+      parseSubagentCard({
+        id: "sub-1",
+        role: "research",
+        assignment: "task",
+        state: "working",
+        browser: {
+          current: { op: "open", at: 1, url: "https://user:hunter2@example.com/" },
+          steps: [{ op: "open", at: 1, url: "https://user:hunter2@example.com/" }],
+        },
       }),
     /Invalid/,
   );
@@ -1142,6 +1183,307 @@ test("Öffne URL uses disclosure before any browser fetch", async () => {
   }, undefined, web);
 });
 
+test("cookie chat streams live steps and screenshot ids before done", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-chat-shot-"));
+  try {
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const retention = createRetentionStore({ filesRoot: join(dir, "files") });
+    const driver: BrowserDriver = {
+      async run(plan, deps) {
+        for (const op of plan.ops) {
+          if (op.op === "hang") continue;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          const { putArtifact } = await import("./retention.ts");
+          const record = putArtifact(retention, { ownerId: "alpha-owner" }, { kind: "screenshot", body: jpeg });
+          deps.onStep?.({
+            op: op.op,
+            at: Date.now(),
+            url: "file:///workspace/cookie.html",
+            screenshotId: record.id,
+          });
+        }
+        return { results: [{ op: "read", text: "cookies-accepted" }] };
+      },
+    };
+    const web: BrowserDeps = { ...offlineWebResearchDeps(), driver };
+    await withServer(async (base) => {
+      const response = await fetch(`${base}/chat`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify({ message: COOKIE_BROWSER_PROMPT, webResearchEnabled: true }),
+      });
+      assert.equal(response.status, 200);
+      assert.ok(response.body);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let sawLiveShot = false;
+      let finished = false;
+      while (!finished) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (line === "") continue;
+          const event = parseChatStreamEvent(JSON.parse(line));
+          if (event.type === "subagent" && event.browser?.current.screenshotId !== undefined && event.state === "working") {
+            sawLiveShot = true;
+          }
+          if (event.type === "done") finished = true;
+        }
+      }
+      assert.equal(sawLiveShot, true);
+      const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+      const card = listed.tasks[0];
+      assert.equal(card?.state, "completed");
+      const shotId = card?.browser?.current.screenshotId;
+      assert.ok(shotId);
+      const shot = await fetch(`${base}/screenshots/${shotId}`, { headers: AUTH });
+      assert.equal(shot.status, 200);
+      assert.deepEqual(Buffer.from(await shot.arrayBuffer()), jpeg);
+    }, undefined, web, retention);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cookie chat failure is failed not done", async () => {
+  const driver: BrowserDriver = {
+    async run() {
+      throw new Error("worker crashed");
+    },
+  };
+  const web: BrowserDeps = { ...offlineWebResearchDeps(), driver };
+  await withServer(async (base) => {
+    const events = await chatEvents(base, COOKIE_BROWSER_PROMPT, { webResearchEnabled: true });
+    const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+    assert.match(reply, /Isolated browser failed/);
+    const cards = events.filter((event) => event.type === "subagent");
+    assert.equal(cards[0]?.state, "waiting");
+    assert.equal(cards.some((event) => event.state === "working"), true);
+    assert.equal(cards.at(-1)?.state, "failed");
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks[0]?.state, "failed");
+    assert.equal("result" in (listed.tasks[0] ?? {}), false);
+  }, undefined, web);
+});
+
+test("Öffne URL secrets never appear on the public approval or task list", async () => {
+  const url = "https://example.com/?password=hunter2-secret&token=abc&client_secret=shh&q=ok";
+  let fetches = 0;
+  const driver: BrowserDriver = {
+    async run(plan) {
+      assert.deepEqual(plan.approved, [url]);
+      fetches += 1;
+      return { results: [{ op: "read", text: "ok" }] };
+    },
+  };
+  const web: BrowserDeps = {
+    ...offlineWebResearchDeps({
+      pages: { [url]: "ok" },
+      connect: () => {
+        fetches += 1;
+      },
+    }),
+    driver,
+  };
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Öffne ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const streamBlob = JSON.stringify(events);
+    assert.equal(streamBlob.includes("hunter2"), false);
+    assert.equal(streamBlob.includes("token=abc"), false);
+    assert.equal(streamBlob.includes("client_secret=shh"), false);
+    const listed = await readJson(await fetch(`${base}/tasks`, { headers: AUTH }));
+    const listedBlob = JSON.stringify(listed);
+    assert.equal(listedBlob.includes("hunter2"), false);
+    assert.equal(listedBlob.includes("token=abc"), false);
+    const updated = parseSubagentCard(
+      await readJson(
+        await fetch(`${base}/tasks/${card.id}/approve`, {
+          method: "POST",
+          headers: { ...AUTH, "Content-Type": "application/json" },
+          body: JSON.stringify({ approval: card.approval, consent: true }),
+        }),
+      ),
+    );
+    assert.equal(updated.approval?.state, "consumed");
+    assert.match(updated.result ?? "", /ok/);
+    assert.equal(JSON.stringify(updated).includes("hunter2"), false);
+    assert.equal(fetches, 1);
+  }, undefined, web);
+});
+
+test("unmatched You said echo redacts URL query secrets", async () => {
+  const url = "https://example.com/?password=hunter2-secret&token=abc&client_secret=shh&q=ok";
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `please open ${url}`);
+    const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+    assert.match(reply, /You said:/);
+    assert.equal(reply.includes("hunter2"), false);
+    assert.equal(reply.includes("token=abc"), false);
+    assert.equal(reply.includes("client_secret=shh"), false);
+    assert.match(reply, /password=%5Bredacted%5D/);
+    assert.match(reply, /q=ok/);
+  });
+});
+
+test("Lies approved GET /tasks result redacts URL secrets and still fetches the bound URL", async () => {
+  const url = "https://example.com/notes?password=hunter2-secret&token=abc&q=ok";
+  let fetched = "";
+  const web = offlineWebResearchDeps({
+    pages: { [url]: "ok-notes" },
+    get: async (input) => {
+      fetched = input.url.href;
+      return {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+        body: "ok-notes",
+      };
+    },
+  });
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Lies ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const streamBlob = JSON.stringify(events);
+    assert.equal(streamBlob.includes("hunter2"), false);
+    const updated = parseSubagentCard(
+      await readJson(
+        await fetch(`${base}/tasks/${card.id}/approve`, {
+          method: "POST",
+          headers: { ...AUTH, "Content-Type": "application/json" },
+          body: JSON.stringify({ approval: card.approval, consent: true }),
+        }),
+      ),
+    );
+    assert.equal(updated.approval?.state, "consumed");
+    assert.match(updated.result ?? "", /ok-notes/);
+    assert.equal((updated.result ?? "").includes("hunter2"), false);
+    assert.equal((updated.result ?? "").includes("token=abc"), false);
+    const listed = await readJson(await fetch(`${base}/tasks`, { headers: AUTH }));
+    const listedBlob = JSON.stringify(listed);
+    assert.equal(listedBlob.includes("hunter2"), false);
+    assert.equal(listedBlob.includes("token=abc"), false);
+    assert.match(listedBlob, /ok-notes/);
+    assert.equal(fetched, url);
+  }, undefined, web);
+});
+
+test("cookie hang stop is stopped not failed in chat text", async () => {
+  const driver: BrowserDriver = {
+    async run(_plan, deps) {
+      deps.onStep?.({
+        op: "open",
+        at: Date.now(),
+        url: "file:///workspace/cookie.html",
+      });
+      await new Promise<never>((_, reject) => {
+        const onAbort = (): void => reject(new Error("Docker job cancelled"));
+        if (deps.signal?.aborted) {
+          onAbort();
+          return;
+        }
+        deps.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      return { results: [] };
+    },
+  };
+  const web: BrowserDeps = { ...offlineWebResearchDeps(), driver };
+  const store = createTaskStore();
+  await withServer(async (base) => {
+    const response = await fetch(`${base}/chat`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: COOKIE_BROWSER_PROMPT, webResearchEnabled: true }),
+    });
+    assert.equal(response.status, 200);
+    assert.ok(response.body);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let childId: string | undefined;
+    const events: ReturnType<typeof parseChatStreamEvent>[] = [];
+    const drain = (async () => {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (line === "") continue;
+          const event = parseChatStreamEvent(JSON.parse(line));
+          events.push(event);
+          if (event.type === "subagent") childId = event.id;
+        }
+      }
+    })();
+    for (let i = 0; i < 80 && (childId === undefined || !store.aborts.has(childId)); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(childId);
+    assert.equal(store.aborts.has(childId), true);
+    const stopped = await fetch(`${base}/tasks/${childId}/stop`, { method: "POST", headers: AUTH });
+    assert.equal(stopped.status, 200);
+    await drain;
+    const reply = events.flatMap((event) => (event.type === "delta" ? [event.text] : [])).join("");
+    assert.equal(reply.includes("Isolated browser failed"), false);
+    assert.match(reply, /Isolated browser stopped/);
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks[0]?.state, "stopped");
+    assert.equal("result" in (listed.tasks[0] ?? {}), false);
+  }, store, web);
+});
+
+test("Stop during an in-flight browser approve does not succeed later", async () => {
+  const url = "https://example.com/approve-stop";
+  const driver: BrowserDriver = {
+    async run(_plan, deps) {
+      await new Promise<never>((_, reject) => {
+        const onAbort = (): void => reject(new Error("Docker job cancelled"));
+        if (deps.signal?.aborted) {
+          onAbort();
+          return;
+        }
+        deps.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      return { results: [] };
+    },
+  };
+  const web: BrowserDeps = {
+    ...offlineWebResearchDeps({ pages: { [url]: "late" } }),
+    driver,
+  };
+  const store = createTaskStore();
+  await withServer(async (base) => {
+    const events = await chatEvents(base, `Öffne ${url}`, { webResearchEnabled: true });
+    const card = events.find((event) => event.type === "subagent");
+    assert.ok(card?.approval);
+    const approve = fetch(`${base}/tasks/${card.id}/approve`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ approval: card.approval, consent: true }),
+    });
+    for (let i = 0; i < 80; i += 1) {
+      const live = store.tasks.get(card.id);
+      if (live?.state === "working" && store.aborts.has(card.id)) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const stopped = await fetch(`${base}/tasks/${card.id}/stop`, { method: "POST", headers: AUTH });
+    assert.equal(stopped.status, 200);
+    assert.equal(parseSubagentCard(await stopped.json()).state, "stopped");
+    const approveRes = await approve;
+    assert.notEqual(approveRes.status, 200);
+    const listed = parseTaskListResponse(await readJson(await fetch(`${base}/tasks`, { headers: AUTH })));
+    assert.equal(listed.tasks[0]?.state, "stopped");
+    assert.equal("result" in (listed.tasks[0] ?? {}), false);
+  }, store, web);
+});
+
 async function chatEvents(
   base: string,
   message: string,
@@ -1183,8 +1525,15 @@ async function withServer(
   run: (base: string) => Promise<void>,
   store?: TaskStore,
   web: BrowserDeps = offlineWebResearchDeps(),
+  retention?: ReturnType<typeof createRetentionStore>,
 ): Promise<void> {
-  const server = createHealthServer({ token: "secret-token", ownerId: "alpha-owner" }, store, undefined, web);
+  const server = createHealthServer(
+    { token: "secret-token", ownerId: "alpha-owner" },
+    store,
+    undefined,
+    web,
+    retention,
+  );
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());
   });

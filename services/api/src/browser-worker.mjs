@@ -9,14 +9,19 @@ const SESSION = "/workspace/.lilith-browser/session.json";
 const RESULT = "/workspace/.lilith-browser/result.json";
 const SHOT = "/workspace/.lilith-browser/shot.jpg";
 const READY = "/workspace/.lilith-browser/ready";
+const PROGRESS = "/workspace/.lilith-browser/progress";
+const PROGRESS_ACK = "/workspace/.lilith-browser/progress-ack";
 const INBOX = "/workspace/.lilith-net/inbox";
 const REPLY = "/workspace/.lilith-net/reply";
 const BODY = "/workspace/.lilith-net/body";
-const ALLOWED_FILE = "/workspace/cookie.html";
 const COOKIE_DIALOG_LOCATOR =
   '[role="dialog"], [role="alertdialog"], [id*="cookie" i], [class*="cookie" i]';
+const MASKED_INPUT_VALUE = "••••••••";
 
 let seq = 0;
+let stepSeq = 0;
+let shots = 0;
+let captureBusy = false;
 
 async function askHost(url, method) {
   const id = String(++seq);
@@ -33,7 +38,7 @@ async function askHost(url, method) {
   return { t: "deny", id };
 }
 
-function workspaceFilePath(raw) {
+function workspaceFilePath(raw, allowed) {
   let url;
   try {
     url = new URL(raw);
@@ -41,11 +46,13 @@ function workspaceFilePath(raw) {
     return undefined;
   }
   if (url.protocol !== "file:") return undefined;
+  if (url.username || url.password) return undefined;
   if (url.hostname !== "" && url.hostname !== "localhost") return undefined;
   const path = decodeURIComponent(url.pathname);
   if (!path.startsWith("/")) return undefined;
   const normalized = posix.normalize(path);
-  if (normalized !== ALLOWED_FILE) return undefined;
+  const files = Array.isArray(allowed) ? allowed : [];
+  if (!files.includes(normalized)) return undefined;
   return normalized;
 }
 
@@ -98,7 +105,125 @@ async function dismissCookies(page, policy) {
   return { dismissed: true, name: chosen.name };
 }
 
-async function handleRoute(route) {
+function sanitizeUrl(raw, session) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol === "file:") {
+    const path = workspaceFilePath(raw, session.allowedFiles);
+    return path === undefined ? undefined : `file://${path}`;
+  }
+  if (url.protocol !== "https:") return undefined;
+  url.username = "";
+  url.password = "";
+  if (url.port !== "" && url.port !== "443") return undefined;
+  const keys = Array.isArray(session.sensitive?.queryKeys) ? session.sensitive.queryKeys : [];
+  for (const key of [...url.searchParams.keys()]) {
+    if (keys.includes(key.toLowerCase())) url.searchParams.set(key, "[redacted]");
+  }
+  if (url.hash !== "") {
+    try {
+      const params = new URLSearchParams(url.hash.slice(1));
+      let changed = false;
+      for (const key of [...params.keys()]) {
+        if (keys.includes(key.toLowerCase())) {
+          params.set(key, "[redacted]");
+          changed = true;
+        }
+      }
+      if (changed) url.hash = params.toString();
+    } catch {
+      url.hash = "";
+    }
+  }
+  return `${url.origin}${url.pathname}${url.search}${url.hash}`.slice(0, 500);
+}
+
+async function projectSafePage(page, session) {
+  const selector =
+    typeof session.sensitive?.inputSelector === "string" && session.sensitive.inputSelector !== ""
+      ? session.sensitive.inputSelector
+      : 'input[type="password"]';
+  const pixelSelector =
+    typeof session.sensitive?.pixelSelector === "string" && session.sensitive.pixelSelector !== ""
+      ? session.sensitive.pixelSelector
+      : "canvas, video, iframe";
+  return page.evaluate(
+    ({ selector: sel, pixelSelector: pixels, masked }) => {
+      let maskedFields = 0;
+      let coveredSurfaces = 0;
+      const projected = [];
+      for (const el of document.querySelectorAll(sel)) {
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          const original = el.value;
+          const originalTitle = el.getAttribute("title") ?? "";
+          const originalAria = el.getAttribute("aria-label") ?? "";
+          if (original !== "") {
+            el.value = masked;
+            maskedFields += 1;
+          }
+          el.setAttribute("value", el.value === "" ? "" : masked);
+          if (originalTitle !== "" && originalTitle === original) el.setAttribute("title", masked);
+          if (originalAria !== "" && originalAria === original) el.setAttribute("aria-label", masked);
+          projected.push({
+            name: el.name,
+            autocomplete: el.getAttribute("autocomplete") ?? "",
+            value: el.value,
+            title: el.getAttribute("title") ?? "",
+            ariaLabel: el.getAttribute("aria-label") ?? "",
+          });
+        }
+      }
+      for (const el of document.querySelectorAll(pixels)) {
+        if (el instanceof HTMLElement) {
+          el.style.visibility = "hidden";
+          coveredSurfaces += 1;
+        }
+      }
+      return { maskedFields, coveredSurfaces, projected };
+    },
+    { selector, pixelSelector, masked: MASKED_INPUT_VALUE },
+  );
+}
+
+async function reportStep(page, session, op, shot) {
+  const seqNo = ++stepSeq;
+  const url = sanitizeUrl(page.url(), session);
+  await writeFile(PROGRESS, `${JSON.stringify({ t: "step", seq: seqNo, op, url, shot })}\n`);
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      const ack = JSON.parse(await readFile(PROGRESS_ACK, "utf8"));
+      if (ack && ack.seq === seqNo) return;
+    } catch {
+      // ack not ready or torn by a host rewrite
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+async function captureStep(page, session, op) {
+  const maxShots = Number(session.maxShots) > 0 ? Number(session.maxShots) : 12;
+  captureBusy = true;
+  try {
+    const projection = await projectSafePage(page, session);
+    let shot = false;
+    if (shots < maxShots) {
+      const bytes = await page.screenshot({ type: "jpeg", quality: 40, fullPage: false });
+      await writeFile(SHOT, bytes);
+      shots += 1;
+      shot = true;
+    }
+    await reportStep(page, session, op, shot);
+    return { ...projection, shot };
+  } finally {
+    captureBusy = false;
+  }
+}
+
+async function handleRoute(route, session) {
   const request = route.request();
   const method = request.method();
   if (method !== "GET") {
@@ -117,7 +242,7 @@ async function handleRoute(route) {
     return;
   }
   if (parsed.protocol === "file:") {
-    if (workspaceFilePath(request.url()) === undefined) {
+    if (workspaceFilePath(request.url(), session.allowedFiles) === undefined) {
       await route.abort("blockedbyclient");
       return;
     }
@@ -144,36 +269,52 @@ async function handleRoute(route) {
   });
 }
 
-async function runOp(page, op, policy) {
+async function runOp(page, op, session) {
   if (op.op === "open") {
     await page.goto(op.url, { waitUntil: "domcontentloaded", timeout: 20_000 });
     await writeFile(READY, "page-ready\n");
-    return { op: "open", url: page.url() };
+    const capture = await captureStep(page, session, "open");
+    return { op: "open", url: sanitizeUrl(page.url(), session), maskedFields: capture.maskedFields, coveredSurfaces: capture.coveredSurfaces, projected: capture.projected };
   }
   if (op.op === "dismissCookies") {
-    return { op: "dismissCookies", ...(await dismissCookies(page, policy)) };
+    const dismissed = await dismissCookies(page, session.cookie);
+    const capture = await captureStep(page, session, "dismissCookies");
+    return { op: "dismissCookies", ...dismissed, maskedFields: capture.maskedFields, coveredSurfaces: capture.coveredSurfaces, projected: capture.projected };
   }
   if (op.op === "read") {
+    const capture = await captureStep(page, session, "read");
     const text = ((await page.locator("body").innerText()) ?? "").slice(0, 256 * 1024);
-    return { op: "read", text };
+    return { op: "read", text, maskedFields: capture.maskedFields, coveredSurfaces: capture.coveredSurfaces, projected: capture.projected };
   }
   if (op.op === "find") {
+    const capture = await captureStep(page, session, "find");
     const text = (await page.locator("body").innerText()) ?? "";
-    return { op: "find", text: op.text, found: text.includes(op.text) };
+    return { op: "find", text: op.text, found: text.includes(op.text), maskedFields: capture.maskedFields, coveredSurfaces: capture.coveredSurfaces };
   }
   if (op.op === "scroll") {
     const dy = Number(op.dy) || 800;
     await page.evaluate((delta) => window.scrollBy(0, delta), dy);
     const scrollY = await page.evaluate(() => window.scrollY);
-    return { op: "scroll", scrollY };
+    const capture = await captureStep(page, session, "scroll");
+    return { op: "scroll", scrollY, maskedFields: capture.maskedFields, coveredSurfaces: capture.coveredSurfaces };
   }
   if (op.op === "screenshot") {
-    const bytes = await page.screenshot({ type: "jpeg", quality: 40, fullPage: false });
-    await writeFile(SHOT, bytes);
-    return { op: "screenshot", file: SHOT, bytes: bytes.length };
+    const capture = await captureStep(page, session, "screenshot");
+    return { op: "screenshot", file: SHOT, bytes: 0, maskedFields: capture.maskedFields, coveredSurfaces: capture.coveredSurfaces };
   }
   if (op.op === "hang") {
-    await new Promise(() => {});
+    const heartbeatMs = Number(session.heartbeatMs) > 0 ? Number(session.heartbeatMs) : 2_000;
+    const heartbeat = setInterval(() => {
+      if (captureBusy) return;
+      void captureStep(page, session, "screenshot").catch(() => {
+        // hang aborted or page closed
+      });
+    }, heartbeatMs);
+    try {
+      await new Promise(() => {});
+    } finally {
+      clearInterval(heartbeat);
+    }
   }
   throw new Error("Unsupported browser op");
 }
@@ -204,11 +345,11 @@ async function main() {
     if (typeof context.routeWebSocket === "function") {
       await context.routeWebSocket(/.*/, (ws) => ws.close());
     }
-    await context.route("**/*", handleRoute);
+    await context.route("**/*", (route) => handleRoute(route, session));
     const page = await context.newPage();
     const results = [];
     for (const op of session.ops ?? []) {
-      results.push(await runOp(page, op, session.cookie));
+      results.push(await runOp(page, op, session));
     }
     await writeFile(RESULT, `${JSON.stringify({ results })}\n`);
   } finally {

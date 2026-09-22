@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseAccountDeleteResponse, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type QuestionAnswer, type TaskState } from "@lilith/contracts";
+import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseAccountDeleteResponse, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type BrowserTimeline, type QuestionAnswer, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   SafeAreaProvider,
   SafeAreaView,
@@ -10,7 +10,9 @@ import {
   AccessibilityInfo,
   ActivityIndicator,
   Alert,
+  AppState,
   FlatList,
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -69,11 +71,27 @@ import {
   type AccountPurge,
   type PersistQueue,
 } from "./privacy";
-
+import {
+  jpegBytesToDataUri,
+  nextScreenshotExpiryDelayMs,
+  pruneShotCache,
+  rememberShot,
+  screenshotExpired,
+  shouldFetchScreenshot,
+  shotStillVisible,
+  type ShotCacheEntry,
+} from "./screenshots";
+import {
+  isStoppableState,
+  isTaskDecisionDisabled,
+  isTaskStopDisabled,
+  type PendingTaskControl,
+} from "./task-controls";
 import { colors } from "./theme";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
+const BROWSER_APPROVE_TIMEOUT_MS = 90_000;
 
 const TOOL_LABELS: Record<OptionalTool, string> = {
   webResearch: "Web research",
@@ -97,6 +115,15 @@ const TASK_STATE_LABEL: Record<TaskState, string> = {
   completed: "Completed",
   stopped: "Stopped",
   failed: "Failed",
+};
+
+const BROWSER_OP_LABEL: Record<string, string> = {
+  open: "Opened",
+  dismissCookies: "Cookie dialog",
+  read: "Reading page",
+  find: "Find on page",
+  scroll: "Scrolled",
+  screenshot: "Screenshot",
 };
 
 const STATUS_TEXT: Record<ConnectionState, string> = {
@@ -282,8 +309,9 @@ function Home({
   const [screen, setScreen] = useState<"chat" | "memories" | "privacy">("chat");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
-  const [pendingTaskId, setPendingTaskId] = useState<string | null>(null);
-  const pendingTaskLock = useRef<string | null>(null);
+  const [pendingControl, setPendingControl] = useState<PendingTaskControl>(null);
+  const pendingTaskLock = useRef<PendingTaskControl>(null);
+  const decisionAbort = useRef<AbortController | null>(null);
   const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const saveRevision = useRef(0);
   const request = useRef<XMLHttpRequest | null>(null);
@@ -649,18 +677,8 @@ function Home({
             spokenReply += event.text;
             setMessages((current) => appendReply(current, userId, event.text));
           } else if (event.type === "subagent") {
-            setMessages((current) =>
-              upsertSubagent(current, userId, {
-                id: event.id,
-                role: event.role,
-                assignment: event.assignment,
-                state: event.state,
-                ...(event.result === undefined ? {} : { result: event.result }),
-                ...(event.pauseReason === undefined ? {} : { pauseReason: event.pauseReason }),
-                ...(event.question === undefined ? {} : { question: event.question }),
-                ...(event.approval === undefined ? {} : { approval: event.approval }),
-              }),
-            );
+            const { type: _type, ...card } = event;
+            setMessages((current) => upsertSubagent(current, userId, card));
           } else {
             AccessibilityInfo.announceForAccessibility(
               `${identity.name}: ${spokenReply || "Reply complete"}`,
@@ -711,10 +729,37 @@ function Home({
     }
   }
 
+  const loadScreenshot = useCallback(async (id: string, createdAt: number): Promise<string | undefined> => {
+    if (screenshotExpired(createdAt, Date.now()) || token.trim() === "") return undefined;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/screenshots/${encodeURIComponent(id)}`, {
+        headers: { Authorization: `Bearer ${token.trim()}` },
+        signal: controller.signal,
+      });
+      if (response.status !== 200) return undefined;
+      return jpegBytesToDataUri(new Uint8Array(await response.arrayBuffer()));
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  }, [token]);
+
   async function controlTask(taskId: string, action: "stop" | "resume") {
-    if (pendingTaskLock.current !== null || state !== "success") return;
-    pendingTaskLock.current = taskId;
-    setPendingTaskId(taskId);
+    if (action === "resume" && (pendingTaskLock.current !== null || state !== "success")) return;
+    if (action === "stop") {
+      if (state !== "success" && state !== "streaming") return;
+      if (pendingTaskLock.current?.action === "stop") return;
+      decisionAbort.current?.abort();
+    }
+    const pending: Exclude<PendingTaskControl, null> = {
+      taskId,
+      action: action === "stop" ? "stop" : "decision",
+    };
+    pendingTaskLock.current = pending;
+    setPendingControl(pending);
     setControlError(false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -732,23 +777,41 @@ function Home({
       const card = parseSubagentCard(await response.json());
       setMessages((current) => applyServerCards(current, [card]));
     } catch {
-      if (pendingTaskLock.current === taskId) setControlError(true);
+      if (pendingTaskLock.current === pending) setControlError(true);
     } finally {
       clearTimeout(timer);
-      if (pendingTaskLock.current === taskId) {
+      if (pendingTaskLock.current === pending) {
         pendingTaskLock.current = null;
-        setPendingTaskId(null);
+        setPendingControl(null);
       }
     }
   }
 
   async function submitTaskDecision(taskId: string, answer: QuestionAnswer | { approval: ApprovalRequest; consent: boolean }) {
     if (pendingTaskLock.current !== null || state !== "success") return;
-    pendingTaskLock.current = taskId;
-    setPendingTaskId(taskId);
+    const pending: Exclude<PendingTaskControl, null> = { taskId, action: "decision" };
+    pendingTaskLock.current = pending;
+    setPendingControl(pending);
     setControlError(false);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    decisionAbort.current = controller;
+    const timeoutMs = "approval" in answer ? BROWSER_APPROVE_TIMEOUT_MS : TIMEOUT_MS;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const poll = setInterval(() => {
+      void (async () => {
+        try {
+          const listed = await fetch(`${API_URL}/tasks`, {
+            headers: { Authorization: `Bearer ${token.trim()}` },
+          });
+          if (listed.status !== 200) return;
+          const body = parseTaskListResponse(await listed.json());
+          const live = body.tasks.find((card) => card.id === taskId);
+          if (live !== undefined) setMessages((current) => applyServerCards(current, [live]));
+        } catch {
+          // keep waiting for the decision POST
+        }
+      })();
+    }, 500);
     try {
       const response = await fetch(`${API_URL}/tasks/${encodeURIComponent(taskId)}/${"approval" in answer ? "approve" : "answer"}`, {
         method: "POST",
@@ -766,12 +829,14 @@ function Home({
         return card.result === undefined ? next : setTaskReply(next, card.id, card.result);
       });
     } catch {
-      if (pendingTaskLock.current === taskId) setControlError(true);
+      if (pendingTaskLock.current === pending && !controller.signal.aborted) setControlError(true);
     } finally {
+      clearInterval(poll);
       clearTimeout(timer);
-      if (pendingTaskLock.current === taskId) {
+      if (decisionAbort.current === controller) decisionAbort.current = null;
+      if (pendingTaskLock.current === pending) {
         pendingTaskLock.current = null;
-        setPendingTaskId(null);
+        setPendingControl(null);
       }
     }
   }
@@ -950,13 +1015,14 @@ function Home({
             message={item}
             assistantName={identity.name}
             canRetry={state === "success" && activeUserId === null}
-            canControl={state === "success"}
-            pendingTaskId={pendingTaskId}
+            canControl={state === "success" || state === "streaming"}
+            pendingControl={pendingControl}
             onRetry={retry}
             onStop={(taskId) => void controlTask(taskId, "stop")}
             onResume={(taskId) => void controlTask(taskId, "resume")}
             onAnswer={(taskId, answer) => void submitTaskDecision(taskId, answer)}
             onApproval={(approval, consent) => void submitTaskDecision(approval.taskId, { approval, consent })}
+            onScreenshot={loadScreenshot}
           />
         )}
         contentContainerStyle={messages.length === 0 ? styles.emptyChat : styles.messageList}
@@ -1236,23 +1302,25 @@ function MessageBubble({
   assistantName,
   canRetry,
   canControl,
-  pendingTaskId,
+  pendingControl,
   onRetry,
   onStop,
   onResume,
   onAnswer,
   onApproval,
+  onScreenshot,
 }: {
   message: ChatMessage;
   assistantName: string;
   canRetry: boolean;
   canControl: boolean;
-  pendingTaskId: string | null;
+  pendingControl: PendingTaskControl;
   onRetry: (userId: string) => void;
   onStop: (taskId: string) => void;
   onResume: (taskId: string) => void;
   onAnswer: (taskId: string, answer: QuestionAnswer) => void;
   onApproval: (approval: ApprovalRequest, consent: boolean) => void;
+  onScreenshot: (id: string, createdAt: number) => Promise<string | undefined>;
 }) {
   const assistant = message.role === "assistant";
   const spoken =
@@ -1268,12 +1336,13 @@ function MessageBubble({
           <SubagentStatusCard
             key={card.id}
             card={card}
-            disabled={!canControl || pendingTaskId !== null}
-            pending={pendingTaskId === card.id}
+            canControl={canControl}
+            pendingControl={pendingControl}
             onStop={onStop}
             onResume={onResume}
             onAnswer={onAnswer}
             onApproval={onApproval}
+            onScreenshot={onScreenshot}
           />
         ))}
         {visible !== "" ? (
@@ -1300,31 +1369,49 @@ function MessageBubble({
 
 function SubagentStatusCard({
   card,
-  disabled,
-  pending,
+  canControl,
+  pendingControl,
   onStop,
   onResume,
   onAnswer,
   onApproval,
+  onScreenshot,
 }: {
   card: SubagentCard;
-  disabled: boolean;
-  pending: boolean;
+  canControl: boolean;
+  pendingControl: PendingTaskControl;
   onStop: (taskId: string) => void;
   onResume: (taskId: string) => void;
   onAnswer: (taskId: string, answer: QuestionAnswer) => void;
   onApproval: (approval: ApprovalRequest, consent: boolean) => void;
+  onScreenshot: (id: string, createdAt: number) => Promise<string | undefined>;
 }) {
   const question = card.question;
   const lockedText = question?.answer !== undefined && "text" in question.answer ? question.answer.text : "";
   const [draft, setDraft] = useState(lockedText);
   const answerLocked = question?.answer !== undefined;
-  const answerDisabled = disabled || pending || card.state !== "needs_input" || answerLocked;
-  const canStop =
-    card.state === "waiting" ||
-    card.state === "working" ||
-    card.state === "needs_input" ||
-    card.state === "paused";
+  const decisionDisabled = isTaskDecisionDisabled({
+    canControl,
+    pending: pendingControl,
+    state: card.state,
+  });
+  const approvalDisabled = isTaskDecisionDisabled({
+    canControl,
+    pending: pendingControl,
+    state: card.state,
+    expired: card.approval !== undefined && Date.now() >= card.approval.expiresAt,
+  });
+  const stopDisabled = isTaskStopDisabled({
+    canControl,
+    state: card.state,
+    pending: pendingControl,
+    cardId: card.id,
+  });
+  const resumeDisabled = isTaskDecisionDisabled({ canControl, pending: pendingControl });
+  const answerDisabled = decisionDisabled || answerLocked;
+  const canStop = isStoppableState(card.state);
+  const stopBusy = pendingControl?.action === "stop" && pendingControl.taskId === card.id;
+  const decisionBusy = pendingControl?.action === "decision" && pendingControl.taskId === card.id;
   const detail =
     card.state === "paused" && card.pauseReason === "time"
       ? "Paused after 15 minutes"
@@ -1337,6 +1424,7 @@ function SubagentStatusCard({
     <View style={styles.subagentCard}>
       <Text style={styles.subagentRole}>Research</Text>
       <Text style={styles.subagentAssignment}>{card.assignment}</Text>
+      {card.browser ? <BrowserTimelineView timeline={card.browser} loadShot={onScreenshot} /> : null}
       <Text style={styles.subagentState}>{detail}</Text>
       {card.approval ? (
         <View style={styles.approvalCard}>
@@ -1362,7 +1450,7 @@ function SubagentStatusCard({
                   : "If expired, send the simulation prompt again for a new preview."}
               </Text>
               {[true, false].map((consent) => {
-                const locked = disabled || card.state !== "needs_input" || Date.now() >= card.approval!.expiresAt;
+                const locked = approvalDisabled;
                 return (
                   <Pressable
                     key={String(consent)}
@@ -1377,7 +1465,7 @@ function SubagentStatusCard({
                           : "Runs the mocked write once. Nothing is sent externally."
                         : "Makes no call."
                     }
-                    accessibilityState={{ disabled: locked, busy: pending }}
+                    accessibilityState={{ disabled: locked, busy: decisionBusy }}
                     style={[styles.taskControl, locked && styles.buttonDisabled]}
                   >
                     <Text style={consent ? styles.taskControlLabel : styles.destructiveLabel}>{consent ? "Approve once" : "Reject"}</Text>
@@ -1450,14 +1538,14 @@ function SubagentStatusCard({
       {canStop ? (
         <Pressable
           onPress={() => onStop(card.id)}
-          disabled={disabled}
+          disabled={stopDisabled}
           accessibilityRole="button"
           accessibilityLabel="Stop task"
-          accessibilityState={{ disabled, busy: pending }}
+          accessibilityState={{ disabled: stopDisabled, busy: stopBusy }}
           style={({ pressed }) => [
             styles.taskControl,
-            disabled && styles.buttonDisabled,
-            pressed && !disabled && styles.buttonPressed,
+            stopDisabled && styles.buttonDisabled,
+            pressed && !stopDisabled && styles.buttonPressed,
           ]}
         >
           <Text style={styles.destructiveLabel}>Stop</Text>
@@ -1466,20 +1554,149 @@ function SubagentStatusCard({
       {card.state === "paused" ? (
         <Pressable
           onPress={() => onResume(card.id)}
-          disabled={disabled}
+          disabled={resumeDisabled}
           accessibilityRole="button"
           accessibilityLabel="Resume task"
           accessibilityHint="Continues with a new 15 minute and 1 dollar budget"
-          accessibilityState={{ disabled, busy: pending }}
+          accessibilityState={{ disabled: resumeDisabled, busy: decisionBusy }}
           style={({ pressed }) => [
             styles.taskControl,
-            disabled && styles.buttonDisabled,
-            pressed && !disabled && styles.buttonPressed,
+            resumeDisabled && styles.buttonDisabled,
+            pressed && !resumeDisabled && styles.buttonPressed,
           ]}
         >
           <Text style={styles.taskControlLabel}>Resume</Text>
         </Pressable>
       ) : null}
+    </View>
+  );
+}
+
+function BrowserTimelineView({
+  timeline,
+  loadShot,
+}: {
+  timeline: BrowserTimeline;
+  loadShot: (id: string, createdAt: number) => Promise<string | undefined>;
+}) {
+  const [shots, setShots] = useState<Record<string, ShotCacheEntry>>({});
+  const [missing, setMissing] = useState<Record<string, true>>({});
+  const [now, setNow] = useState(() => Date.now());
+  const expiryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const current = timeline.current;
+  const currentLabel = `${BROWSER_OP_LABEL[current.op] ?? current.op}${current.url !== undefined ? ` · ${current.url}` : ""}`;
+
+  useEffect(() => {
+    const clearExpiryTimer = () => {
+      if (expiryTimer.current !== undefined) clearTimeout(expiryTimer.current);
+      expiryTimer.current = undefined;
+    };
+    const sub = AppState.addEventListener("change", (next) => {
+      if (next === "active") setNow(Date.now());
+      else clearExpiryTimer();
+    });
+    return () => {
+      sub.remove();
+      clearExpiryTimer();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (expiryTimer.current !== undefined) clearTimeout(expiryTimer.current);
+    expiryTimer.current = undefined;
+    if (AppState.currentState !== "active") return;
+    const delay = nextScreenshotExpiryDelayMs(timeline.steps, shots, Date.now());
+    if (delay === undefined) return;
+    expiryTimer.current = setTimeout(() => {
+      expiryTimer.current = undefined;
+      const tick = Date.now();
+      setNow(tick);
+      setShots((cache) => pruneShotCache(cache, tick));
+    }, delay);
+    return () => {
+      if (expiryTimer.current !== undefined) clearTimeout(expiryTimer.current);
+      expiryTimer.current = undefined;
+    };
+  }, [now, shots, timeline]);
+
+  useEffect(() => {
+    setShots((cache) => pruneShotCache(cache, now));
+  }, [now]);
+
+  useEffect(() => {
+    let active = true;
+    const checkedAt = Date.now();
+    setNow(checkedAt);
+    setShots((cache) => pruneShotCache(cache, checkedAt));
+    for (const step of timeline.steps) {
+      const id = step.screenshotId;
+      if (id === undefined) continue;
+      if (!shouldFetchScreenshot(step, checkedAt)) {
+        setMissing((currentMissing) => ({ ...currentMissing, [id]: true }));
+        setShots((cache) => {
+          const next = { ...cache };
+          delete next[id];
+          return pruneShotCache(next, checkedAt);
+        });
+        continue;
+      }
+      void loadShot(id, step.at).then((uri) => {
+        if (!active) return;
+        const appliedAt = Date.now();
+        const expired = screenshotExpired(step.at, appliedAt);
+        if (uri === undefined || expired) {
+          setShots((cache) => {
+            const next = { ...cache };
+            delete next[id];
+            return pruneShotCache(next, appliedAt);
+          });
+          if (expired) setNow(appliedAt);
+          else setMissing((currentMissing) => ({ ...currentMissing, [id]: true }));
+          return;
+        }
+        setMissing((currentMissing) => {
+          if (currentMissing[id] !== true) return currentMissing;
+          const next = { ...currentMissing };
+          delete next[id];
+          return next;
+        });
+        setShots((cache) => rememberShot(cache, id, uri, step.at, appliedAt));
+      });
+    }
+    return () => {
+      active = false;
+    };
+  }, [loadShot, timeline]);
+
+  return (
+    <View>
+      <Text accessibilityLiveRegion="polite" style={styles.subagentState}>
+        Step: {currentLabel}
+      </Text>
+      {timeline.steps.map((step, index) => {
+        const label = `${BROWSER_OP_LABEL[step.op] ?? step.op}${step.url !== undefined ? ` · ${step.url}` : ""}`;
+        const id = step.screenshotId;
+        const entry = id === undefined ? undefined : shots[id];
+        return (
+          <View key={`${step.op}-${step.at}-${index}`} style={styles.browserStep}>
+            <Text style={styles.subagentState}>{label}</Text>
+            {id === undefined ? null : screenshotExpired(step.at, now) || (entry !== undefined && !shotStillVisible(entry, step.at, now)) ? (
+              <Text style={styles.subagentState}>Screenshot expired</Text>
+            ) : missing[id] === true ? (
+              <Text style={styles.subagentState}>Screenshot unavailable</Text>
+            ) : entry?.uri !== undefined ? (
+              <Image
+                source={{ uri: entry.uri }}
+                accessibilityLabel={`Browser screenshot: ${label}`}
+                resizeMode="contain"
+                style={styles.browserShot}
+              />
+            ) : (
+              <Text style={styles.subagentState}>Loading screenshot</Text>
+            )}
+          </View>
+        );
+      })}
     </View>
   );
 }
@@ -1754,6 +1971,16 @@ const styles = StyleSheet.create({
   subagentState: {
     color: colors.muted,
     fontSize: 13,
+  },
+  browserStep: {
+    gap: 4,
+    marginTop: 6,
+  },
+  browserShot: {
+    width: 240,
+    height: 180,
+    borderRadius: 8,
+    backgroundColor: colors.inset,
   },
   questionPrompt: {
     color: colors.text,

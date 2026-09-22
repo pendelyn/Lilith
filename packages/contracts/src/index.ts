@@ -1,6 +1,12 @@
 import { parseApprovalRequest, type ApprovalRequest } from "./approvals.ts";
 export { parseApprovalAction, parseApprovalRequest, parseApprovalDecision, type ApprovalAction, type ApprovalRequest } from "./approvals.ts";
 export {
+  SENSITIVE_QUERY_KEYS,
+  isSensitiveQueryKey,
+  redactSensitiveQueryParts,
+  redactSensitiveUrlsInText,
+} from "./sensitive-url.ts";
+export {
   MAX_MEMORY_CONTENT,
   MEMORY_CONFIRM_REPLY,
   MEMORY_ORIGIN,
@@ -100,6 +106,33 @@ export type QuestionCard = {
   answer?: QuestionAnswer;
 };
 
+export const BROWSER_STEP_OPS = [
+  "open",
+  "dismissCookies",
+  "read",
+  "find",
+  "scroll",
+  "screenshot",
+] as const;
+export type BrowserStepOp = (typeof BROWSER_STEP_OPS)[number];
+
+export const MAX_BROWSER_STEPS = 20;
+export const MAX_BROWSER_URL_CHARS = 500;
+export const ARTIFACT_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export type BrowserStep = {
+  op: BrowserStepOp;
+  at: number;
+  url?: string;
+  screenshotId?: string;
+};
+
+export type BrowserTimeline = {
+  current: BrowserStep;
+  steps: BrowserStep[];
+};
+
 export type SubagentCard = {
   id: string;
   role: SubagentRole;
@@ -109,6 +142,7 @@ export type SubagentCard = {
   pauseReason?: PauseReason;
   question?: QuestionCard;
   approval?: ApprovalRequest;
+  browser?: BrowserTimeline;
 };
 
 export type ChatStreamEvent =
@@ -270,7 +304,8 @@ export function parseSubagentCard(value: unknown): SubagentCard {
       key !== "result" &&
       key !== "pauseReason" &&
       key !== "question" &&
-      key !== "approval"
+      key !== "approval" &&
+      key !== "browser"
     ) {
       throw new Error("Invalid SubagentCard");
     }
@@ -297,10 +332,12 @@ export function parseSubagentCard(value: unknown): SubagentCard {
   if (state === "completed" && question !== undefined && question.answer === undefined) {
     throw new Error("Invalid SubagentCard");
   }
+  const browser = "browser" in value ? parseBrowserTimeline(value.browser) : undefined;
   const extra = {
     ...(pauseReason === undefined ? {} : { pauseReason }),
     ...(question === undefined ? {} : { question }),
     ...(approval === undefined ? {} : { approval }),
+    ...(browser === undefined ? {} : { browser }),
   };
   if ("result" in value) {
     if (typeof value.result !== "string" || value.result === "") {
@@ -322,6 +359,77 @@ export function parseSubagentCard(value: unknown): SubagentCard {
     state,
     ...extra,
   };
+}
+
+export function parseBrowserStepOp(value: unknown): BrowserStepOp {
+  if (typeof value === "string") {
+    for (const op of BROWSER_STEP_OPS) {
+      if (value === op) return op;
+    }
+  }
+  throw new Error("Invalid BrowserStep");
+}
+
+export function parseBrowserStep(value: unknown): BrowserStep {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid BrowserStep");
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "op" && key !== "at" && key !== "url" && key !== "screenshotId") {
+      throw new Error("Invalid BrowserStep");
+    }
+  }
+  if (!("op" in value) || !("at" in value) || typeof value.at !== "number" || !Number.isSafeInteger(value.at) || value.at < 0) {
+    throw new Error("Invalid BrowserStep");
+  }
+  const op = parseBrowserStepOp(value.op);
+  const url =
+    "url" in value && typeof value.url === "string" && value.url !== "" ? value.url : undefined;
+  if ("url" in value && url === undefined) throw new Error("Invalid BrowserStep");
+  if (url !== undefined) {
+    if ([...url].length > MAX_BROWSER_URL_CHARS || url.includes("data:") || url.includes("\0")) {
+      throw new Error("Invalid BrowserStep");
+    }
+    try {
+      const parsed = new URL(url);
+      if (parsed.username !== "" || parsed.password !== "") throw new Error("Invalid BrowserStep");
+    } catch {
+      throw new Error("Invalid BrowserStep");
+    }
+  }
+  const screenshotId =
+    "screenshotId" in value && typeof value.screenshotId === "string" && ARTIFACT_ID_RE.test(value.screenshotId)
+      ? value.screenshotId
+      : undefined;
+  if ("screenshotId" in value && screenshotId === undefined) throw new Error("Invalid BrowserStep");
+  return {
+    op,
+    at: value.at,
+    ...(url === undefined ? {} : { url }),
+    ...(screenshotId === undefined ? {} : { screenshotId }),
+  };
+}
+
+export function parseBrowserTimeline(value: unknown): BrowserTimeline {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid BrowserTimeline");
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "current" && key !== "steps") throw new Error("Invalid BrowserTimeline");
+  }
+  if (!("current" in value) || !("steps" in value) || !Array.isArray(value.steps)) {
+    throw new Error("Invalid BrowserTimeline");
+  }
+  if (value.steps.length < 1 || value.steps.length > MAX_BROWSER_STEPS) {
+    throw new Error("Invalid BrowserTimeline");
+  }
+  const steps = value.steps.map((entry) => parseBrowserStep(entry));
+  const current = parseBrowserStep(value.current);
+  const last = steps[steps.length - 1];
+  if (last === undefined || last.op !== current.op || last.at !== current.at || last.url !== current.url || last.screenshotId !== current.screenshotId) {
+    throw new Error("Invalid BrowserTimeline");
+  }
+  return { current, steps };
 }
 
 function parsePauseReason(value: object, state: TaskState): PauseReason | undefined {

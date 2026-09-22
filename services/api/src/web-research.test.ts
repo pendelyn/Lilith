@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decideApproval, mockApprovalAction, researchAbortSignal, stopTask, createTaskStore } from "./tasks.ts";
+import { decideApproval, createTaskStore, listResearchCards, mockApprovalAction, researchAbortSignal, stopTask } from "./tasks.ts";
 import type { ApprovalRequest } from "@lilith/contracts";
 import { PUBLIC_HTTPS_TIMEOUT_MS, type DnsAddress, type PublicHttpsGet } from "./ssrf.ts";
 import {
@@ -599,6 +599,35 @@ test("arbitrary user HTTPS URLs wait for bound consent before DNS or HTTPS", asy
   );
   assert.equal(ssrfLookups, 1);
   assert.equal(ssrfConnects, 0);
+});
+
+test("Lies URL secrets stay off the public card and still fetch the bound URL", async () => {
+  const url = "https://example.com/notes?password=hunter2-secret&token=abc&q=ok";
+  const net = countingNetwork({ [url]: "ok-notes" });
+  const store = createTaskStore();
+  const preview = await runPublicPageRead(store, owner, url, net.deps);
+  const approval = preview.cards[0]?.approval;
+  assert.ok(approval);
+  assert.equal(JSON.stringify(approval).includes("hunter2"), false);
+  assert.equal(JSON.stringify(approval).includes("token=abc"), false);
+  const stored = store.tasks.get(approval.taskId)?.approval;
+  assert.ok(stored);
+  assert.equal(stored.payload.includes("hunter2-secret"), true);
+  const approved = await decideApproval(
+    store,
+    owner,
+    approval.taskId,
+    { approval, consent: true },
+    boundAction(stored),
+    (action, key) => invokeDataDisclosure(action, key, net.deps),
+  );
+  assert.match(approved.result ?? "", /ok-notes/);
+  assert.equal((approved.result ?? "").includes("hunter2"), false);
+  assert.equal((approved.result ?? "").includes("token=abc"), false);
+  assert.match(approved.result ?? "", /password=%5Bredacted%5D/);
+  assert.equal(JSON.stringify(listResearchCards(store, owner)).includes("hunter2"), false);
+  assert.equal(net.connects(), 1);
+  assert.equal(stored.payload.includes("hunter2-secret"), true);
 });
 
 test("mock write action class is unchanged by disclosure helpers", () => {
