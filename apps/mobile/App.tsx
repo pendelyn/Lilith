@@ -91,6 +91,7 @@ import {
   isTaskStopDisabled,
   type PendingTaskControl,
 } from "./task-controls";
+import { PixelMascot } from "./pixel-mascot";
 import { colors } from "./theme";
 import { agentOverviewDestination, type HomeScreen } from "./navigation";
 
@@ -1027,7 +1028,7 @@ function Home({
       {screen === "chat" ? <View style={styles.composerDock}>
         {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
         <View style={styles.composerRow}>
-        <Text accessible={false} importantForAccessibility="no" style={styles.mascotSpace}>✦</Text>
+        <PixelMascot activity={{ connection: state, messages }} />
         <View style={[styles.composer, composerFocused && styles.composerFocused]}>
         <TextInput
           value={draft}
@@ -2070,7 +2071,6 @@ const styles = StyleSheet.create({
     borderRadius: 26,
   },
   composerFocused: { borderWidth: 2 },
-  mascotSpace: { width: 30, color: colors.muted, fontSize: 18, textAlign: "center" },
   composerInput: {
     flex: 1,
     minHeight: 48,
