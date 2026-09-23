@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseAccountDeleteResponse, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type BrowserTimeline, type QuestionAnswer, type TaskState } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   SafeAreaProvider,
   SafeAreaView,
@@ -23,6 +23,11 @@ import {
   View,
 } from "react-native";
 import {
+  ACCENT_COLOR,
+  ACCENT_LABEL,
+  ACCENTS,
+  APPEARANCE_LABEL,
+  APPEARANCES,
   DEFAULT_NAME,
   IDENTITY_STORAGE_KEY,
   MAX_NAME_LENGTH,
@@ -30,7 +35,9 @@ import {
   parsePersistedIdentity,
   serializeIdentity,
   webResearchEnabledFromIdentity,
+  type AccentId,
   type AgentIdentity,
+  type AppearanceId,
   type OptionalTool,
   type SetupMode,
 } from "./identity";
@@ -332,6 +339,8 @@ function Home({
       : identity.tools.map((tool) => TOOL_LABELS[tool]).join(", ");
   const memoryEnabled = memoryEnabledFromIdentity(identity);
   const webResearchEnabled = webResearchEnabledFromIdentity(identity);
+  const accent = ACCENT_COLOR[identity.accent];
+  const appearance = identity.appearance;
 
   useEffect(() => {
     let active = true;
@@ -367,9 +376,15 @@ function Home({
   }, [accountPurge, chatReady, messages]);
 
   function commitName(raw: string) {
-    const next = identityFromChoice(raw, identity.mode);
+    const next = identityFromChoice(raw, identity.mode, identity);
     setName(next.name);
     if (next.name !== identity.name || persistError) onIdentityChange(next);
+  }
+
+  function commitLook(accentId: AccentId, appearanceId: AppearanceId) {
+    if (accountBusy || serverDeleted) return;
+    if (accentId === identity.accent && appearanceId === identity.appearance && !persistError) return;
+    onIdentityChange(identityFromChoice(identity.name, identity.mode, { accent: accentId, appearance: appearanceId }));
   }
 
   async function checkConnection() {
@@ -879,21 +894,58 @@ function Home({
       {screen === "agents" ? (
         <View style={styles.navigationPanel}>
           <Text style={styles.sectionLabel} accessibilityRole="header">Your agents</Text>
-          <Pressable onPress={() => setScreen("chat")} accessibilityRole="button" accessibilityLabel={`Open ${name}, main agent`} style={styles.navigationCard}>
+          <Pressable onPress={() => setScreen("chat")} accessibilityRole="button" accessibilityLabel={`Open ${name}, main agent`} style={[styles.navigationCard, { borderColor: accent }]}>
+            <PixelMascot activity={{ connection: state, messages }} appearance={appearance} accent={accent} />
             <Text style={styles.navigationTitle}>{name}</Text><Text style={styles.memoryMeta}>Main agent · research, tools, and coordination</Text>
           </Pressable>
         </View>
       ) : screen === "account" ? (
         <View style={styles.navigationPanel}>
           <Text style={styles.sectionLabel} accessibilityRole="header">Account</Text>
-          <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Settings</Text><Text style={styles.memoryMeta}>Name and starting setup</Text></Pressable>
+          <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Settings</Text><Text style={styles.memoryMeta}>Name, accent, appearance, and setup</Text></Pressable>
           <Pressable onPress={() => { setScreen("memories"); if (state === "success") void refreshMemories(); }} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Memory</Text><Text style={styles.memoryMeta}>Review, edit, pause, or delete saved memories</Text></Pressable>
           <Pressable onPress={() => setScreen("privacy")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Privacy and deletion</Text><Text style={styles.memoryMeta}>Retention and account deletion</Text></Pressable>
         </View>
       ) : screen === "settings" ? (
-        <ScrollView contentContainerStyle={styles.navigationPanel} keyboardShouldPersistTaps="handled">
+        <ScrollView style={styles.chatScreen} contentContainerStyle={styles.navigationPanel} keyboardShouldPersistTaps="handled">
           <Text style={styles.sectionLabel} accessibilityRole="header">Settings</Text>
           <NameField value={name} onChangeText={setName} onEndEditing={() => commitName(name)} editable={!accountBusy && !serverDeleted} />
+          <Text style={styles.fieldLabel}>Accent</Text>
+          <View accessibilityRole="radiogroup" accessibilityLabel="Accent" style={styles.modeGroup}>
+            {ACCENTS.map((id) => (
+              <LookOption
+                key={id}
+                title={ACCENT_LABEL[id]}
+                label={`${ACCENT_LABEL[id]} accent`}
+                selected={identity.accent === id}
+                disabled={accountBusy || serverDeleted}
+                border={ACCENT_COLOR[id]}
+                onPress={() => commitLook(id, identity.appearance)}
+              >
+                <View
+                  accessible={false}
+                  importantForAccessibility="no"
+                  style={[styles.accentSwatch, { backgroundColor: ACCENT_COLOR[id] }]}
+                />
+              </LookOption>
+            ))}
+          </View>
+          <Text style={styles.fieldLabel}>Appearance</Text>
+          <View accessibilityRole="radiogroup" accessibilityLabel="Appearance" style={styles.modeGroup}>
+            {APPEARANCES.map((id) => (
+              <LookOption
+                key={id}
+                title={APPEARANCE_LABEL[id]}
+                label={`${APPEARANCE_LABEL[id]} cat`}
+                selected={identity.appearance === id}
+                disabled={accountBusy || serverDeleted}
+                border={accent}
+                onPress={() => commitLook(identity.accent, id)}
+              >
+                <PixelMascot activity={{ connection: "idle", messages: [] }} appearance={id} accent={accent} />
+              </LookOption>
+            ))}
+          </View>
           <Text style={styles.memoryMeta} accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}>{toolsSummary}</Text>
           <View style={styles.connectionRow}>
             <TextInput
@@ -934,10 +986,11 @@ function Home({
           {accountError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not delete the account. Try again.</Text> : null}
         </ScrollView>
       ) : screen === "workspace" ? (
-        <ScrollView contentContainerStyle={styles.navigationPanel}>
+        <ScrollView style={styles.chatScreen} contentContainerStyle={styles.navigationPanel}>
           <Text style={styles.sectionLabel} accessibilityRole="header">Workspace</Text>
+          <PixelMascot activity={{ connection: state, messages }} appearance={appearance} accent={accent} />
           {messages.flatMap((message) => message.subagents ?? []).filter((card) => card.browser !== undefined).map((card) => (
-            <View key={card.id} style={styles.navigationCard}>
+            <View key={card.id} style={[styles.navigationCard, { borderColor: accent }]}>
               <Text style={styles.navigationTitle}>{TASK_STATE_LABEL[card.state]}</Text>
               <Text style={styles.memoryMeta}>{card.assignment}</Text>
               <BrowserTimelineView timeline={card.browser!} loadShot={loadScreenshot} />
@@ -990,6 +1043,7 @@ function Home({
           <MessageBubble
             message={item}
             assistantName={identity.name}
+            accent={accent}
             canRetry={state === "success" && activeUserId === null}
             canControl={state === "success" || state === "streaming"}
             pendingControl={pendingControl}
@@ -1006,7 +1060,7 @@ function Home({
           chatReady ? (
             <Text style={styles.emptyText}>Start a conversation</Text>
           ) : (
-            <ActivityIndicator color={colors.accent} />
+            <ActivityIndicator color={accent} />
           )
         }
         keyboardDismissMode="interactive"
@@ -1028,8 +1082,8 @@ function Home({
       {screen === "chat" ? <View style={styles.composerDock}>
         {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
         <View style={styles.composerRow}>
-        <PixelMascot activity={{ connection: state, messages }} />
-        <View style={[styles.composer, composerFocused && styles.composerFocused]}>
+        <PixelMascot activity={{ connection: state, messages }} appearance={appearance} accent={accent} />
+        <View style={[styles.composer, { borderColor: accent }, composerFocused && styles.composerFocused]}>
         <TextInput
           value={draft}
           onChangeText={setDraft}
@@ -1054,8 +1108,7 @@ function Home({
           }}
           style={({ pressed }) => [
             styles.sendButton,
-            (draft.trim() === "" || state !== "success" || activeUserId !== null) &&
-              styles.buttonDisabled,
+            { backgroundColor: accent },
             pressed && styles.buttonPressed,
           ]}
         >
@@ -1287,6 +1340,7 @@ function messageTime(id: string): string | undefined {
 function MessageBubble({
   message,
   assistantName,
+  accent,
   canRetry,
   canControl,
   pendingControl,
@@ -1299,6 +1353,7 @@ function MessageBubble({
 }: {
   message: ChatMessage;
   assistantName: string;
+  accent: string;
   canRetry: boolean;
   canControl: boolean;
   pendingControl: PendingTaskControl;
@@ -1318,11 +1373,12 @@ function MessageBubble({
     (message.status === "streaming" ? "…" : message.status === "failed" ? "Reply interrupted." : "");
   return (
     <View style={[styles.messageRow, !assistant && styles.userMessageRow]}>
-      <View style={[styles.bubble, assistant ? styles.assistantBubble : styles.userBubble]}>
+      <View style={[styles.bubble, assistant ? styles.assistantBubble : styles.userBubble, !assistant && { borderColor: accent }]}>
         {message.subagents?.map((card) => (
           <SubagentStatusCard
             key={card.id}
             card={card}
+            accent={accent}
             canControl={canControl}
             pendingControl={pendingControl}
             onStop={onStop}
@@ -1347,7 +1403,7 @@ function MessageBubble({
             accessibilityState={{ disabled: !canRetry }}
             style={styles.retryButton}
           >
-            <Text style={styles.retryLabel}>Retry</Text>
+            <Text style={[styles.retryLabel, { color: accent }]}>Retry</Text>
           </Pressable>
         ) : null}
       </View>
@@ -1357,6 +1413,7 @@ function MessageBubble({
 
 function SubagentStatusCard({
   card,
+  accent,
   canControl,
   pendingControl,
   onStop,
@@ -1366,6 +1423,7 @@ function SubagentStatusCard({
   onScreenshot,
 }: {
   card: SubagentCard;
+  accent: string;
   canControl: boolean;
   pendingControl: PendingTaskControl;
   onStop: (taskId: string) => void;
@@ -1409,13 +1467,13 @@ function SubagentStatusCard({
           ? `${TASK_STATE_LABEL[card.state]}. ${card.result}`
           : TASK_STATE_LABEL[card.state];
   return (
-    <View style={styles.subagentCard}>
-      <Text style={styles.subagentRole}>Research</Text>
+    <View style={[styles.subagentCard, { borderColor: accent }]}>
+      <Text style={[styles.subagentRole, { color: accent }]}>Research</Text>
       <Text style={styles.subagentAssignment}>{card.assignment}</Text>
       {card.browser ? <BrowserTimelineView timeline={card.browser} loadShot={onScreenshot} /> : null}
       <Text style={styles.subagentState}>{detail}</Text>
       {card.approval ? (
-        <View style={styles.approvalCard}>
+        <View style={[styles.approvalCard, { borderColor: accent }]}>
           <Text style={styles.questionPrompt}>One-time approval</Text>
           <Text style={styles.subagentAssignment}>Origin: {card.approval.origin}</Text>
           <Text style={styles.subagentAssignment}>Operation: {card.approval.operation}</Text>
@@ -1444,9 +1502,9 @@ function SubagentStatusCard({
                     accessibilityLabel={consent ? "Approve once" : "Reject action"}
                     accessibilityHint={approvalConsentHint(card.approval!, consent)}
                     accessibilityState={{ disabled: locked, busy: decisionBusy }}
-                    style={[styles.taskControl, locked && styles.buttonDisabled]}
+                    style={styles.taskControl}
                   >
-                    <Text style={consent ? styles.taskControlLabel : styles.destructiveLabel}>{consent ? "Approve once" : "Reject"}</Text>
+                    <Text style={consent ? [styles.taskControlLabel, { color: accent }] : styles.destructiveLabel}>{consent ? "Approve once" : "Reject"}</Text>
                   </Pressable>
                 );
               })}
@@ -1473,11 +1531,11 @@ function SubagentStatusCard({
                 style={({ pressed }) => [
                   styles.questionOption,
                   selected && styles.questionOptionSelected,
-                  answerDisabled && styles.buttonDisabled,
+                  selected && { borderColor: accent },
                   pressed && !answerDisabled && styles.buttonPressed,
                 ]}
               >
-                <Text style={styles.questionOptionLabel}>{option.label}</Text>
+                <Text style={[styles.questionOptionLabel, { color: accent }]}>{option.label}</Text>
               </Pressable>
             );
           })}
@@ -1505,7 +1563,7 @@ function SubagentStatusCard({
             accessibilityState={{ disabled: answerDisabled || draft.trim() === "" }}
             style={({ pressed }) => [
               styles.questionSend,
-              (answerDisabled || draft.trim() === "") && styles.buttonDisabled,
+              { backgroundColor: accent },
               pressed && !answerDisabled && styles.buttonPressed,
             ]}
           >
@@ -1539,11 +1597,10 @@ function SubagentStatusCard({
           accessibilityState={{ disabled: resumeDisabled, busy: decisionBusy }}
           style={({ pressed }) => [
             styles.taskControl,
-            resumeDisabled && styles.buttonDisabled,
             pressed && !resumeDisabled && styles.buttonPressed,
           ]}
         >
-          <Text style={styles.taskControlLabel}>Resume</Text>
+          <Text style={[styles.taskControlLabel, { color: accent }]}>Resume</Text>
         </Pressable>
       ) : null}
     </View>
@@ -1713,6 +1770,43 @@ function NameField({
         style={styles.input}
       />
     </View>
+  );
+}
+
+function LookOption({
+  title,
+  label,
+  selected,
+  disabled,
+  onPress,
+  border,
+  children,
+}: {
+  title: string;
+  label: string;
+  selected: boolean;
+  disabled: boolean;
+  onPress: () => void;
+  border: string;
+  children: ReactNode;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      accessibilityRole="radio"
+      accessibilityLabel={label}
+      accessibilityState={{ checked: selected, disabled }}
+      style={({ pressed }) => [
+        styles.choice,
+        selected && styles.choiceSelected,
+        selected && { borderColor: border },
+        pressed && !disabled && styles.choicePressed,
+      ]}
+    >
+      {children}
+      <Text style={styles.choiceTitle}>{title}</Text>
+    </Pressable>
   );
 }
 
@@ -2175,6 +2269,13 @@ const styles = StyleSheet.create({
     borderRadius: 11,
     borderWidth: 1.5,
     borderColor: colors.muted,
+  },
+  accentSwatch: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 1,
+    borderColor: colors.outline,
   },
   choiceMarkSelected: {
     borderColor: colors.accent,
