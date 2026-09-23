@@ -510,6 +510,16 @@ export function listResearchCards(store: TaskStore, owner: OwnerContext): Subage
   return cards;
 }
 
+export function abortOwnerTasks(store: TaskStore, owner: OwnerContext): void {
+  for (const task of store.tasks.values()) {
+    if (task.ownerId !== owner.ownerId) continue;
+    const controller = store.aborts.get(task.id);
+    if (controller === undefined) continue;
+    controller.abort();
+    store.aborts.delete(task.id);
+  }
+}
+
 export function deleteOwnerTasks(store: TaskStore, owner: OwnerContext): void {
   const abortedIds = transact(store, () => {
     const ids: string[] = [];

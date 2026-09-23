@@ -465,6 +465,12 @@ test(
       const base = `http://127.0.0.1:${address.port}`;
       const auth = { Authorization: "Bearer secret-token" };
       try {
+        const allowed = await fetch(`${base}/tools`, {
+          method: "PUT",
+          headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({ tools: ["webResearch"] }),
+        });
+        assert.equal(allowed.status, 200);
         const response = await fetch(`${base}/chat`, {
           method: "POST",
           headers: { ...auth, "Content-Type": "application/json" },

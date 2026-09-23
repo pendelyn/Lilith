@@ -263,6 +263,79 @@ test("approved form posts still refuse private DNS and do not follow redirects",
   }, redirect.web);
 });
 
+test("blank during in-flight browser approval does not POST", async () => {
+  const gate = harness();
+  await withServer(async (base) => {
+    const card = await pendingCard(base, `${FORM_SUBMIT_PROMPT_PREFIX}Hallo`);
+    let release: () => void = () => {};
+    let opened: () => void = () => {};
+    const openedAt = new Promise<void>((resolve) => {
+      opened = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const driver = gate.web.driver;
+    assert.ok(driver);
+    gate.web.driver = {
+      async run(plan: BrowserPlan, deps: BrowserDeps) {
+        opened();
+        await held;
+        return driver.run(plan, deps);
+      },
+    };
+    const decision = decide(base, card, true);
+    await openedAt;
+    const blank = await fetch(`${base}/tools`, {
+      method: "PUT",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ preset: "blank" }),
+    });
+    assert.equal(blank.status, 200);
+    release();
+    const result = await decision;
+    assert.equal(result.status, 409);
+    assert.equal(gate.posts.length, 0);
+    const task = (await listed(base)).find((item) => item.id === card.taskId);
+    assert.equal(task?.approval?.state, "pending");
+    assert.equal(task?.state, "needs_input");
+  }, gate.web);
+});
+
+test("blank during the pre-POST lookup does not send", async () => {
+  const gate = harness();
+  await withServer(async (base) => {
+    const card = await pendingCard(base, `${FORM_SUBMIT_PROMPT_PREFIX}Hallo`);
+    let release: () => void = () => {};
+    let opened: () => void = () => {};
+    const openedAt = new Promise<void>((resolve) => {
+      opened = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const lookup = gate.web.lookupAll;
+    assert.ok(lookup);
+    gate.web.lookupAll = async (hostname: string) => {
+      opened();
+      await held;
+      return lookup(hostname);
+    };
+    const decision = decide(base, card, true);
+    await openedAt;
+    const blank = await fetch(`${base}/tools`, {
+      method: "PUT",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ preset: "blank" }),
+    });
+    assert.equal(blank.status, 200);
+    release();
+    const result = await decision;
+    assert.notEqual(result.status, 200);
+    assert.equal(gate.posts.length, 0);
+  }, gate.web);
+});
+
 test("a blocked form action and stop never send", async () => {
   const blocked = harness();
   const submit = blocked.model.nodes.find((node) => node.id === "submit");
@@ -365,6 +438,14 @@ function reply(events: ReturnType<typeof parseChatStreamEvent>[]): string {
 }
 
 async function chatEvents(base: string, message: string, webResearchEnabled = false) {
+  if (webResearchEnabled) {
+    const allowed = await fetch(`${base}/tools`, {
+      method: "PUT",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ tools: ["webResearch"] }),
+    });
+    assert.equal(allowed.status, 200);
+  }
   const response = await fetch(`${base}/chat`, {
     method: "POST",
     headers: { ...AUTH, "Content-Type": "application/json" },

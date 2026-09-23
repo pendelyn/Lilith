@@ -83,11 +83,11 @@ Recommended setup enables Memory; Blank leaves it off. After connect, **Memories
 
 Send `Merk dir: Antwortsprache Deutsch` in chat. The API stores that content before any reply and does not fall through to the “You said: …” test echo. Passwords, tokens, and payment-authentication data — including German **Kennwort** and **Geheimzahl** labels — are rejected on create and on edit, even with confirmation. A refused `Merk dir` is stored locally as `Merk dir: [redacted]`; the secret is not kept in the user bubble or AsyncStorage. Multiline `Merk dir` is still treated as remember and never falls through to the echo fixture.
 
-Other sensitive content (email, phone, IBAN, address/health/ID cues) is not stored until the user confirms. The server binds that consent to the pending content digest, expires it, and ignores stale or replayed confirmation. Pause and a disabled Memory flag still block capture; confirming while paused or disabled does not persist.
+Other sensitive content (email, phone, IBAN, address/health/ID cues) is not stored until the user confirms. The server binds that consent to the pending content digest, expires it, and ignores stale or replayed confirmation. Pause and a Memory tool that is off still block capture and provider retrieval; confirming a new memory while paused or while Memory is off does not persist. The chat `memoryEnabled` flag is not authorization.
 
 `POST /memories/retrieve` is the provider boundary: it returns only task-relevant memories for the query, nothing when paused or disabled, the new value after edit, and no id after delete. There is **no live provider**. Issue #8 stays deactivated; chat does not inject memories into a model. Retrieval is tested against the existing color-compare fixture so an unrelated language memory is not selected.
 
-Memories persist in `.lilith-memories.json` with the same atomic replace/rollback pattern as tasks. The file is gitignored. Reconnect reloads the owner-scoped list; a stale Blank identity cannot enable Memory from a tampered tools array.
+Memories persist in `.lilith-memories.json` with the same atomic replace/rollback pattern as tasks. The file is gitignored. Reconnect reloads the owner-scoped list. Which optional tools may run is a per-owner allow-set in `.lilith-tools.json` (also gitignored). A missing owner record fails closed. A `.lilith-tools.json.bak` crash copy is not loaded. Reconnect does not upload a tool set restored from the phone onto that missing record; only a setup choice made in the current session is sent. A client `webResearchEnabled` or `memoryEnabled` flag cannot turn a disabled tool on, including while a browser approval is still pending.
 
 ## Web research (Issue #15)
 

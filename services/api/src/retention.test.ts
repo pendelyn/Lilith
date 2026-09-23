@@ -27,6 +27,7 @@ import {
 } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer } from "./health.ts";
+import { createToolAllowStore } from "./tool-allow.ts";
 import {
   captureExplicitMemory,
   createMemoryStore,
@@ -176,7 +177,7 @@ test("account deletion removes active data immediately and leaves backups until 
     const backup = putArtifact(retention, owner, { kind: "backup", body: "snap" });
     const foreignBackup = putArtifact(retention, other, { kind: "backup", body: "other" });
 
-    deleteAccount(retention, tasks, memories, owner);
+    deleteAccount(retention, tasks, memories, owner, createToolAllowStore());
 
     assert.deepEqual(listMemories(memories, owner), []);
     assert.equal(listMemories(memories, other).length, 1);
@@ -360,8 +361,8 @@ test("account deletion tombstone finishes after persist failure and restart", ()
     putArtifact(retention, owner, { kind: "screenshot", body: "shot" });
 
     (tasks as { persistPath?: string }).persistPath = join(tasksPath, "blocked.json");
-    assert.throws(() => deleteAccount(retention, tasks, memories, owner));
-    assert.equal(signal.aborted, false);
+    assert.throws(() => deleteAccount(retention, tasks, memories, owner, createToolAllowStore()));
+    assert.equal(signal.aborted, true);
     assert.equal(tasks.tasks.has(task.id), true);
     assert.equal(retention.pendingOwnerDeletes.has(owner.ownerId), true);
     assert.equal(existsSync(workspace), false);
@@ -381,7 +382,7 @@ test("account deletion tombstone finishes after persist failure and restart", ()
     assert.equal(pending.pendingOwnerDeletes.has(owner.ownerId), true);
 
     (tasks as { persistPath?: string }).persistPath = tasksPath;
-    finishPendingDeletes(retention, tasks, memories);
+    finishPendingDeletes(retention, tasks, memories, createToolAllowStore());
     assert.equal(signal.aborted, true);
     assert.equal(tasks.tasks.has(task.id), false);
     assert.equal(retention.pendingOwnerDeletes.has(owner.ownerId), false);
@@ -429,7 +430,7 @@ test("pending delete fails closed for HTTP owner ops and restart until explicit 
       assert.equal(retention.pendingOwnerDeletes.has(owner.ownerId), true);
       assert.deepEqual(listMemories(memories, owner), []);
       assert.equal(tasks.tasks.has(task.id), true);
-      assert.throws(() => finishPendingDeletes(retention, tasks, memories));
+      assert.throws(() => finishPendingDeletes(retention, tasks, memories, createToolAllowStore()));
       assert.equal(retention.pendingOwnerDeletes.has(owner.ownerId), true);
 
       const health = await fetch(`${base}/health`, { headers: AUTH });
@@ -516,7 +517,7 @@ test("pending delete fails closed for HTTP owner ops and restart until explicit 
     }, resurrectedTasks, resurrectedMemories, pending);
 
     (tasks as { persistPath?: string }).persistPath = tasksPath;
-    finishPendingDeletes(retention, tasks, memories);
+    finishPendingDeletes(retention, tasks, memories, createToolAllowStore());
     assert.equal(retention.pendingOwnerDeletes.size, 0);
     assert.equal(
       listMemories(memories, owner).some((item) => item.content.includes("New after failed delete")),
@@ -690,7 +691,7 @@ test("screenshot read loses a deletion race and refuses a swapped path", () => {
     const tasks = createTaskStore();
     const memories = createMemoryStore();
     store.pendingOwnerDeletes.delete(owner.ownerId);
-    deleteAccount(store, tasks, memories, owner);
+    deleteAccount(store, tasks, memories, owner, createToolAllowStore());
     assert.throws(() => readScreenshot(store, owner, shot.id), /Artifact not found|Resource access denied/);
     assert.equal(existsSync(dest), false);
   } finally {

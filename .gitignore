@@ -9,6 +9,8 @@ node_modules/
 .lilith-tasks.json.*
 .lilith-memories.json
 .lilith-memories.json.*
+.lilith-tools.json
+.lilith-tools.json.*
 .lilith-retention.json
 .lilith-retention.json.*
 .lilith-retention/

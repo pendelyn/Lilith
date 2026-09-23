@@ -21,7 +21,8 @@ import {
 } from "@lilith/contracts";
 import { type OwnerContext } from "./auth.ts";
 import { deleteOwnerMemories, type MemoryStore } from "./memory.ts";
-import { deleteOwnerTasks, type TaskStore } from "./tasks.ts";
+import { abortOwnerTasks, deleteOwnerTasks, type TaskStore } from "./tasks.ts";
+import { deleteOwnerToolAllow, type ToolAllowStore } from "./tool-allow.ts";
 
 const MAX_ARTIFACT_BYTES = 1_048_576;
 export const CRASH_BACKUP_FILES = [".lilith-tasks.json.bak", ".lilith-memories.json.bak"] as const;
@@ -39,6 +40,9 @@ export type RetentionRecord = {
 export type RetentionStore = {
   readonly records: Map<string, RetentionRecord>;
   readonly pendingOwnerDeletes: Set<string>;
+  // In-memory only. Bumped when a delete begins so a request that already passed
+  // the gate cannot write after that delete. Not persisted: a restart has no in-flight request.
+  readonly ownerEpochs: Map<string, number>;
   readonly now: () => number;
   readonly persistPath?: string;
   readonly filesRoot?: string;
@@ -62,6 +66,7 @@ export function createRetentionStore(options?: {
   const store: RetentionStore = {
     records: new Map(),
     pendingOwnerDeletes: new Set(),
+    ownerEpochs: new Map(),
     now: options?.now ?? Date.now,
     ...(options?.persistPath === undefined ? {} : { persistPath: options.persistPath }),
     ...(options?.filesRoot === undefined ? {} : { filesRoot: options.filesRoot }),
@@ -201,22 +206,29 @@ export function deleteAccount(
   tasks: TaskStore,
   memories: MemoryStore,
   owner: OwnerContext,
+  tools: ToolAllowStore,
 ): void {
   beginOwnerDelete(retention, owner);
-  applyOwnerDelete(retention, tasks, memories, owner);
+  applyOwnerDelete(retention, tasks, memories, owner, tools);
 }
 
 export function finishPendingDeletes(
   retention: RetentionStore,
   tasks: TaskStore,
   memories: MemoryStore,
+  tools: ToolAllowStore,
 ): void {
   for (const ownerId of [...retention.pendingOwnerDeletes]) {
-    applyOwnerDelete(retention, tasks, memories, { ownerId });
+    applyOwnerDelete(retention, tasks, memories, { ownerId }, tools);
   }
 }
 
+export function ownerDeleteEpoch(store: RetentionStore, ownerId: string): number {
+  return store.ownerEpochs.get(ownerId) ?? 0;
+}
+
 function beginOwnerDelete(store: RetentionStore, owner: OwnerContext): void {
+  if (store.pendingOwnerDeletes.has(owner.ownerId)) return;
   transact(store, () => {
     if (store.pendingOwnerDeletes.has(owner.ownerId)) return;
     store.pendingOwnerDeletes.add(owner.ownerId);
@@ -228,6 +240,9 @@ function beginOwnerDelete(store: RetentionStore, owner: OwnerContext): void {
       createdAt: store.now(),
     });
   });
+  // Pending is cleared when the wipe finishes, so an in-flight handler cannot
+  // see it. The epoch stays bumped for that handler's post-await recheck.
+  store.ownerEpochs.set(owner.ownerId, ownerDeleteEpoch(store, owner.ownerId) + 1);
 }
 
 function applyOwnerDelete(
@@ -235,11 +250,15 @@ function applyOwnerDelete(
   tasks: TaskStore,
   memories: MemoryStore,
   owner: OwnerContext,
+  tools: ToolAllowStore,
 ): void {
+  // Abort before any fallible wipe so an in-flight DNS wait cannot GET if deletion throws.
+  abortOwnerTasks(tasks, owner);
   adoptManagedArtifacts(retention);
   deleteActiveArtifacts(retention, owner);
   deleteOwnerMemories(memories, owner);
   deleteOwnerTasks(tasks, owner);
+  deleteOwnerToolAllow(tools, owner);
   adoptManagedArtifacts(retention);
   transact(retention, () => {
     retention.pendingOwnerDeletes.delete(owner.ownerId);

@@ -26,6 +26,7 @@ import {
   type TaskStore,
 } from "./tasks.ts";
 import type { OwnerContext } from "./auth.ts";
+import { toolAllowed, type ToolAllowStore } from "./tool-allow.ts";
 
 export const WEB_RESEARCH_OFF_REPLY = "Web research is off.";
 export const PUBLIC_READ_PROMPT_PREFIX = "Lies ";
@@ -351,7 +352,7 @@ export function offlineWebResearchDeps(options?: {
 
 async function fetchPublicPage(
   request: PublicReadRequest,
-  deps: WebResearchDeps,
+  deps: WebResearchDeps & { toolAllow?: ToolAllowStore; owner?: OwnerContext },
 ): Promise<{ url: string; status: number; headers: Record<string, string>; text: string }> {
   // Generic HTTPS reader. Chat and memories are never attached. User-facing
   // dispatch must apply disclosure policy before DNS or HTTPS; this path is the
@@ -360,6 +361,8 @@ async function fetchPublicPage(
   if (deps.signal?.aborted) throw new Error("Web research cancelled");
   const resolved = await resolvePublicHttps(prepared.url.href, deps.lookupAll, deps.signal);
   if (deps.signal?.aborted) throw new Error("Web research cancelled");
+  // Last await is above. Blank during DNS must not GET.
+  assertApprovalGetAllowed(deps);
   const get = deps.get ?? pinnedHttpsGet;
   const response = await get({
     url: prepared.url,
@@ -373,6 +376,12 @@ async function fetchPublicPage(
   if (response.status >= 300 && response.status < 400) throw new Error("Redirect rejected");
   if (response.status !== 200) throw new Error("Fetch failed");
   return { url: prepared.url.href, status: response.status, headers: response.headers, text: response.body };
+}
+
+function assertApprovalGetAllowed(deps: WebResearchDeps & { toolAllow?: ToolAllowStore; owner?: OwnerContext }): void {
+  // Callers that are not the approval gate omit the store. The gate always passes it.
+  if (deps.toolAllow === undefined || deps.owner === undefined) return;
+  if (!toolAllowed(deps.toolAllow, deps.owner, "webResearch")) throw new Error("Web research is off");
 }
 
 function prepareRequest(request: PublicReadRequest): {

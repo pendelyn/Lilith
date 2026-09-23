@@ -57,8 +57,8 @@ test("accent and appearance persist inside the identity record account deletion 
     parsePersistedIdentity(JSON.stringify({ mode: "blank", name: "Nyx", accent: "nope", appearance: "siamese", tools: ["memory"] })),
     {
       name: "Nyx",
-      mode: "blank",
-      tools: [],
+      mode: "custom",
+      tools: ["memory"],
       accent: DEFAULT_ACCENT,
       appearance: "siamese",
     },

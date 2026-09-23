@@ -15,7 +15,10 @@ import {
   parseResumeRequest,
   parseSubagentCard,
   parseTaskListResponse,
+  parseToolAllowResponse,
+  parseToolAllowUpdate,
   redactSensitiveUrlsInText,
+  type ApprovalAction,
   type ChatStreamEvent,
   type SubagentCard,
 } from "@lilith/contracts";
@@ -50,7 +53,15 @@ import {
   subagentCard,
   type TaskStore,
 } from "./tasks.ts";
-import { createRetentionStore, deleteAccount, readScreenshot, type RetentionStore } from "./retention.ts";
+import { createRetentionStore, deleteAccount, ownerDeleteEpoch, readScreenshot, type RetentionStore } from "./retention.ts";
+import {
+  applyToolPreset,
+  createToolAllowStore,
+  readToolAllow,
+  replaceToolAllow,
+  toolAllowed,
+  type ToolAllowStore,
+} from "./tool-allow.ts";
 import {
   WEB_RESEARCH_OFF_REPLY,
   invokeDataDisclosure,
@@ -111,9 +122,10 @@ export function createHealthServer(
   memories: MemoryStore = createMemoryStore(),
   web: BrowserDeps = {},
   retention: RetentionStore = createRetentionStore(),
+  toolAllow: ToolAllowStore = createToolAllowStore(),
 ): Server {
   return createServer((req, res) => {
-    handleRequest(req, res, auth, store, memories, web, retention);
+    handleRequest(req, res, auth, store, memories, web, retention, toolAllow);
   });
 }
 
@@ -125,6 +137,7 @@ function handleRequest(
   memories: MemoryStore,
   web: BrowserDeps,
   retention: RetentionStore,
+  toolAllow: ToolAllowStore,
 ): void {
   try {
     const owner = authenticateOwner(req.headers.authorization, auth);
@@ -160,7 +173,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void streamChatReply(req, res, owner, store, memories, web, retention);
+      void streamChatReply(req, res, owner, store, memories, web, retention, toolAllow);
       return;
     }
 
@@ -175,7 +188,21 @@ function handleRequest(
       return;
     }
 
-    if (handleMemoryRoute(req, res, owner, memories, pathname)) {
+    if (handleMemoryRoute(req, res, owner, memories, pathname, toolAllow, retention)) {
+      return;
+    }
+
+    if (pathname === "/tools") {
+      if (req.method === "GET") {
+        writeJson(res, parseToolAllowResponse(readToolAllow(toolAllow, owner)));
+        return;
+      }
+      if (req.method !== "PUT") {
+        res.writeHead(405, { Allow: "GET, PUT" });
+        res.end();
+        return;
+      }
+      void handleToolAllowPut(req, res, owner, toolAllow, retention);
       return;
     }
 
@@ -185,7 +212,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void handleAccountDelete(req, res, owner, store, memories, retention);
+      void handleAccountDelete(req, res, owner, store, memories, retention, toolAllow);
       return;
     }
 
@@ -206,7 +233,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void handleTaskAction(req, res, owner, store, action, web, retention);
+      void handleTaskAction(req, res, owner, store, action, web, retention, toolAllow);
       return;
     }
 
@@ -228,9 +255,18 @@ async function streamChatReply(
   memories: MemoryStore,
   web: BrowserDeps,
   retention: RetentionStore,
+  toolAllow: ToolAllowStore,
 ): Promise<void> {
+  const admittedEpoch = ownerDeleteEpoch(retention, owner.ownerId);
   try {
     const value = await readJsonBody(req);
+    if (blocksOwnerApi("/chat", retention, owner, admittedEpoch)) {
+      if (!res.headersSent) {
+        res.writeHead(409);
+        res.end();
+      }
+      return;
+    }
     if (
       typeof value !== "object" ||
       value === null ||
@@ -250,10 +286,22 @@ async function streamChatReply(
     }
 
     const message = value.message.trim();
-    const memoryEnabled = "memoryEnabled" in value && value.memoryEnabled === true;
-    const webResearchEnabled = "webResearchEnabled" in value && value.webResearchEnabled === true;
+    // Client flags are not an authorization. A missing owner record fails closed.
+    const memoryEnabled = toolAllowed(toolAllow, owner, "memory");
+    const webResearchEnabled = toolAllowed(toolAllow, owner, "webResearch");
+    // Live allow-set travels with the web client so a post-DNS GET rechecks it.
     streamNdjson(res, (emit) =>
-      emitChatEvents(message, owner, store, memories, memoryEnabled, webResearchEnabled, web, retention, emit),
+      emitChatEvents(
+        message,
+        owner,
+        store,
+        memories,
+        memoryEnabled,
+        webResearchEnabled,
+        { ...web, toolAllow, owner },
+        retention,
+        emit,
+      ),
     );
   } catch {
     if (!res.headersSent) res.writeHead(400);
@@ -269,9 +317,19 @@ async function handleTaskAction(
   action: { id: string; kind: "stop" | "resume" | "answer" | "approve" },
   web: BrowserDeps,
   retention: RetentionStore,
+  toolAllow: ToolAllowStore,
 ): Promise<void> {
+  const admittedEpoch = ownerDeleteEpoch(retention, owner.ownerId);
+  const taskPath = `/tasks/${action.id}/${action.kind}`;
   try {
     const body = await readJsonBody(req);
+    if (blocksOwnerApi(taskPath, retention, owner, admittedEpoch)) {
+      if (!res.headersSent) {
+        res.writeHead(409);
+        res.end();
+      }
+      return;
+    }
     const task = store.tasks.get(action.id);
     if (task === undefined || task.ownerId !== owner.ownerId || task.role !== "research") {
       res.writeHead(404);
@@ -295,6 +353,9 @@ async function handleTaskAction(
         maxCostCents: task.approval.maxCostCents,
       };
       const decision = parseApprovalDecision(body);
+      const webResearchOff = (): boolean =>
+        decision.consent && requiresWebResearch(stored) && !toolAllowed(toolAllow, owner, "webResearch");
+      if (webResearchOff()) throw new Error("Web research is off");
       const browserDeps = {
         ...web,
         ...webResearchDepsForTask(store, task.id, web),
@@ -302,9 +363,19 @@ async function handleTaskAction(
         owner,
         taskId: task.id,
         retention,
+        toolAllow,
       };
       const actual =
         decision.consent && isBrowserEffectAction(stored) ? await inspectBrowserEffect(stored, browserDeps) : stored;
+      // inspectBrowserEffect awaits. Blank or deletion during that wait must not consume consent.
+      if (webResearchOff()) throw new Error("Web research is off");
+      if (blocksOwnerApi(taskPath, retention, owner, admittedEpoch)) {
+        if (!res.headersSent) {
+          res.writeHead(409);
+          res.end();
+        }
+        return;
+      }
       const invoke =
         stored.actionClass === "data_disclosure"
           ? (actionArg: typeof stored, key: string) =>
@@ -329,6 +400,7 @@ async function handleTaskAction(
       message === "Task is not paused" ||
       message === "Answer conflict" ||
       message === "Task is not waiting for input" ||
+      message === "Web research is off" ||
       message.startsWith("Approval ") || message === "Action already consumed"
         ? 409
         : message === "Resource access denied" || message === "Task not found"
@@ -618,10 +690,11 @@ async function handleAccountDelete(
   store: TaskStore,
   memories: MemoryStore,
   retention: RetentionStore,
+  toolAllow: ToolAllowStore,
 ): Promise<void> {
   try {
     parseAccountDeleteRequest(await readJsonBody(req));
-    deleteAccount(retention, store, memories, owner);
+    deleteAccount(retention, store, memories, owner, toolAllow);
     writeJson(res, parseAccountDeleteResponse({ deleted: true }));
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
@@ -680,6 +753,8 @@ function handleMemoryRoute(
   owner: OwnerContext,
   memories: MemoryStore,
   pathname: string,
+  toolAllow: ToolAllowStore,
+  retention: RetentionStore,
 ): boolean {
   if (pathname === "/memories") {
     if (req.method !== "GET") {
@@ -703,7 +778,7 @@ function handleMemoryRoute(
       res.end();
       return true;
     }
-    void handleMemoryRetrieve(req, res, owner, memories);
+    void handleMemoryRetrieve(req, res, owner, memories, toolAllow);
     return true;
   }
 
@@ -713,7 +788,7 @@ function handleMemoryRoute(
       res.end();
       return true;
     }
-    void handleMemoryPause(req, res, owner, memories);
+    void handleMemoryPause(req, res, owner, memories, retention);
     return true;
   }
 
@@ -723,7 +798,7 @@ function handleMemoryRoute(
       res.end();
       return true;
     }
-    void handleMemoryConfirm(req, res, owner, memories);
+    void handleMemoryConfirm(req, res, owner, memories, toolAllow, retention);
     return true;
   }
 
@@ -734,7 +809,7 @@ function handleMemoryRoute(
     res.end();
     return true;
   }
-  void handleMemoryItem(req, res, owner, memories, decodeURIComponent(item[1]), req.method);
+  void handleMemoryItem(req, res, owner, memories, decodeURIComponent(item[1]), req.method, retention);
   return true;
 }
 
@@ -743,12 +818,18 @@ async function handleMemoryRetrieve(
   res: ServerResponse,
   owner: OwnerContext,
   memories: MemoryStore,
+  toolAllow: ToolAllowStore,
 ): Promise<void> {
   try {
     const input = parseMemoryRetrieveRequest(await readJsonBody(req));
     writeJson(
       res,
-      parseMemoryRetrieveResponse({ memories: memoriesForProvider(memories, owner, input) }),
+      parseMemoryRetrieveResponse({
+        memories: memoriesForProvider(memories, owner, {
+          query: input.query,
+          memoryEnabled: toolAllowed(toolAllow, owner, "memory"),
+        }),
+      }),
     );
   } catch (error) {
     writeMemoryError(res, error);
@@ -760,9 +841,19 @@ async function handleMemoryPause(
   res: ServerResponse,
   owner: OwnerContext,
   memories: MemoryStore,
+  retention: RetentionStore,
 ): Promise<void> {
+  const admittedEpoch = ownerDeleteEpoch(retention, owner.ownerId);
   try {
-    const input = parseMemoryPauseRequest(await readJsonBody(req));
+    const body = await readJsonBody(req);
+    if (blocksOwnerApi("/memories/pause", retention, owner, admittedEpoch)) {
+      if (!res.headersSent) {
+        res.writeHead(409);
+        res.end();
+      }
+      return;
+    }
+    const input = parseMemoryPauseRequest(body);
     writeJson(res, parseMemoryPauseRequest({ paused: setMemoryPaused(memories, owner, input.paused) }));
   } catch (error) {
     writeMemoryError(res, error);
@@ -774,11 +865,28 @@ async function handleMemoryConfirm(
   res: ServerResponse,
   owner: OwnerContext,
   memories: MemoryStore,
+  toolAllow: ToolAllowStore,
+  retention: RetentionStore,
 ): Promise<void> {
+  const admittedEpoch = ownerDeleteEpoch(retention, owner.ownerId);
   try {
+    const body = await readJsonBody(req);
+    if (blocksOwnerApi("/memories/confirm", retention, owner, admittedEpoch)) {
+      if (!res.headersSent) {
+        res.writeHead(409);
+        res.end();
+      }
+      return;
+    }
+    const request = parseMemoryConfirmRequest(body);
     writeJson(
       res,
-      parseMemoryConfirmResponse(confirmMemory(memories, owner, parseMemoryConfirmRequest(await readJsonBody(req)))),
+      parseMemoryConfirmResponse(
+        confirmMemory(memories, owner, {
+          ...request,
+          memoryEnabled: toolAllowed(toolAllow, owner, "memory"),
+        }),
+      ),
     );
   } catch (error) {
     writeMemoryError(res, error);
@@ -792,10 +900,20 @@ async function handleMemoryItem(
   memories: MemoryStore,
   id: string,
   method: string,
+  retention: RetentionStore,
 ): Promise<void> {
+  const admittedEpoch = ownerDeleteEpoch(retention, owner.ownerId);
+  const itemPath = `/memories/${id}`;
   try {
     if (method === "DELETE") {
       const body = await readJsonBody(req);
+      if (blocksOwnerApi(itemPath, retention, owner, admittedEpoch)) {
+        if (!res.headersSent) {
+          res.writeHead(409);
+          res.end();
+        }
+        return;
+      }
       if (body !== undefined && !isEmptyObject(body)) throw new Error("Invalid memory");
       deleteMemory(memories, owner, id);
       writeJson(
@@ -807,12 +925,15 @@ async function handleMemoryItem(
       );
       return;
     }
-    const updated = updateMemory(
-      memories,
-      owner,
-      id,
-      parseMemoryUpdateRequest(await readJsonBody(req)).content,
-    );
+    const body = await readJsonBody(req);
+    if (blocksOwnerApi(itemPath, retention, owner, admittedEpoch)) {
+      if (!res.headersSent) {
+        res.writeHead(409);
+        res.end();
+      }
+      return;
+    }
+    const updated = updateMemory(memories, owner, id, parseMemoryUpdateRequest(body).content);
     writeJson(res, parseMemoryItem(updated));
   } catch (error) {
     writeMemoryError(res, error);
@@ -842,6 +963,41 @@ function writeMemoryError(res: ServerResponse, error: unknown): void {
   res.end();
 }
 
+async function handleToolAllowPut(
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: OwnerContext,
+  toolAllow: ToolAllowStore,
+  retention: RetentionStore,
+): Promise<void> {
+  const admittedEpoch = ownerDeleteEpoch(retention, owner.ownerId);
+  try {
+    const update = parseToolAllowUpdate(await readJsonBody(req));
+    if (blocksOwnerApi("/tools", retention, owner, admittedEpoch)) {
+      if (!res.headersSent) {
+        res.writeHead(409);
+        res.end();
+      }
+      return;
+    }
+    const tools =
+      "preset" in update
+        ? applyToolPreset(toolAllow, owner, update.preset)
+        : replaceToolAllow(toolAllow, owner, update.tools);
+    writeJson(res, parseToolAllowResponse({ configured: true, tools }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const status =
+      message === "Invalid tools" || message === "Request too large" || error instanceof SyntaxError ? 400 : 500;
+    if (!res.headersSent) res.writeHead(status);
+    res.end();
+  }
+}
+
+function requiresWebResearch(action: ApprovalAction): boolean {
+  return action.actionClass === "data_disclosure" || isBrowserEffectAction(action);
+}
+
 function isEmptyObject(value: unknown): boolean {
   return typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).length === 0;
 }
@@ -851,7 +1007,14 @@ function writeJson(res: ServerResponse, value: unknown): void {
   res.end(JSON.stringify(value));
 }
 
-function blocksOwnerApi(pathname: string, retention: RetentionStore, owner: OwnerContext): boolean {
+function blocksOwnerApi(
+  pathname: string,
+  retention: RetentionStore,
+  owner: OwnerContext,
+  admittedEpoch?: number,
+): boolean {
   // /health has no owner payload; authenticated POST /account/delete is the explicit retry.
-  return pathname !== "/health" && pathname !== "/account/delete" && retention.pendingOwnerDeletes.has(owner.ownerId);
+  if (pathname === "/health" || pathname === "/account/delete") return false;
+  if (retention.pendingOwnerDeletes.has(owner.ownerId)) return true;
+  return admittedEpoch !== undefined && admittedEpoch !== ownerDeleteEpoch(retention, owner.ownerId);
 }
