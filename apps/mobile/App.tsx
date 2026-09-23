@@ -1029,6 +1029,7 @@ function Home({
       )}
       {screen === "chat" ? <View style={styles.composerDock}>
         {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
+        <View style={styles.composerRow}>
         <Text accessible={false} importantForAccessibility="no" style={styles.mascotSpace}>✦</Text>
         <View style={styles.composer}>
         <TextInput
@@ -1060,6 +1061,7 @@ function Home({
         >
           <Text allowFontScaling={false} style={styles.sendLabel}>↑</Text>
         </Pressable>
+        </View>
         </View>
       </View> : null}
     </KeyboardAvoidingView>
@@ -1802,7 +1804,7 @@ const styles = StyleSheet.create({
   chatScreen: {
     flex: 1,
   },
-  connectionPrompt: { alignSelf: "center", paddingHorizontal: 16, paddingVertical: 6 },
+  connectionPrompt: { paddingHorizontal: 16, paddingVertical: 6 },
   connectionRow: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -2064,7 +2066,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  composerDock: { flexDirection: "row", alignItems: "center", gap: 8, marginHorizontal: 16, marginTop: 8, marginBottom: 12 },
+  composerDock: { gap: 8, marginHorizontal: 16, marginTop: 8, marginBottom: 12 },
+  composerRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   composer: {
     flex: 1,
     flexDirection: "row",
