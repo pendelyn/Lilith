@@ -105,6 +105,10 @@ import {
 import { PixelMascot } from "./pixel-mascot";
 import { colors } from "./theme";
 import { agentOverviewDestination, type HomeScreen } from "./navigation";
+import { GRID_SPRITE, SEND_SPRITE, SPARK_SPRITE } from "./sprites";
+
+// CLI-flavoured type for the chat surface only; functional screens stay on the system font.
+const mono = Platform.select({ ios: "Menlo", default: "monospace" });
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
@@ -973,11 +977,11 @@ function Home({
     >
       <View style={styles.topBar}>
         <Pressable onPress={() => setScreen(agentOverviewDestination(screen))} accessibilityRole="button" accessibilityLabel="Agent overview" style={styles.iconButton}>
-          <Text style={styles.gridIcon} accessible={false}>▦</Text>
+          <Pixel rows={GRID_SPRITE} size={3} color={colors.accent} />
         </Pressable>
         <View style={styles.topBarSpacer} />
         <Pressable onPress={() => setScreen("workspace")} accessibilityRole="button" accessibilityLabel="Computer workspace" style={styles.iconButton}>
-          <Text style={styles.workspaceIcon} accessible={false}>✦</Text>
+          <Pixel rows={SPARK_SPRITE} size={3} color={colors.accent} />
         </Pressable>
         <Pressable onPress={() => setScreen("account")} accessibilityRole="button" accessibilityLabel="Account and settings" style={styles.accountBadge}>
           <Text style={styles.accountInitials}>ME</Text>
@@ -1203,8 +1207,9 @@ function Home({
           onDelete={(id) => void deleteMemoryItem(id)}
         />
       ) : (
+      <View style={styles.chatSurface}>
       <FlatList
-        style={styles.chatSurface}
+        style={styles.chatList}
         ref={list}
         data={messages}
         keyExtractor={(message) => message.id}
@@ -1247,16 +1252,26 @@ function Home({
           if (shouldAutoScroll.current) list.current?.scrollToEnd({ animated: true });
         }}
       />
+      {/* ponytail: one cat in the chat corner. Streaming dots are a static glyph; pose frames do not animate. */}
+      <View
+        style={styles.mascot}
+        accessible={false}
+        importantForAccessibility="no-hide-descendants"
+        accessibilityElementsHidden
+        pointerEvents="none"
+      >
+        <PixelMascot activity={{ connection: state, messages }} appearance={appearance} accent={accent} />
+        {state === "streaming" ? <Text style={styles.mascotActivity}>...</Text> : null}
+      </View>
+      </View>
       )}
       {screen === "chat" ? <View style={styles.composerDock}>
         {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
-        <View style={styles.composerRow}>
-        <PixelMascot activity={{ connection: state, messages }} appearance={appearance} accent={accent} />
         <View style={[styles.composer, { borderColor: accent }, composerFocused && styles.composerFocused]}>
         <TextInput
           value={draft}
           onChangeText={setDraft}
-          placeholder="Message…"
+          placeholder="Message..."
           placeholderTextColor={colors.muted}
           onFocus={() => setComposerFocused(true)}
           onBlur={() => setComposerFocused(false)}
@@ -1281,9 +1296,8 @@ function Home({
             pressed && styles.buttonPressed,
           ]}
         >
-          <Text allowFontScaling={false} style={styles.sendLabel}>↑</Text>
+          <Pixel rows={SEND_SPRITE} size={2} color={colors.canvas} />
         </Pressable>
-        </View>
         </View>
       </View> : null}
     </KeyboardAvoidingView>
@@ -1499,6 +1513,20 @@ function MemoriesPanel({
   );
 }
 
+function Pixel({ rows, size, color }: { rows: readonly string[]; size: number; color: string }) {
+  return (
+    <View accessible={false} importantForAccessibility="no-hide-descendants">
+      {rows.map((row, y) => (
+        <View key={y} style={styles.pixelRow}>
+          {[...row].map((cell, x) => (
+            <View key={x} style={{ width: size, height: size, backgroundColor: cell === "#" ? color : "transparent" }} />
+          ))}
+        </View>
+      ))}
+    </View>
+  );
+}
+
 function messageTime(id: string): string | undefined {
   const timestamp = messageTimestamp(id);
   return timestamp === undefined
@@ -1540,8 +1568,10 @@ function MessageBubble({
   const visible =
     message.text ||
     (message.status === "streaming" ? "…" : message.status === "failed" ? "Reply interrupted." : "");
+  const time = messageTime(message.id);
   return (
     <View style={[styles.messageRow, !assistant && styles.userMessageRow]}>
+      {time !== undefined ? <Text style={styles.messageTime}>{time}</Text> : null}
       <View style={[styles.bubble, assistant ? styles.assistantBubble : styles.userBubble, !assistant && { borderColor: accent }]}>
         {message.subagents?.map((card) => (
           <SubagentStatusCard
@@ -1562,7 +1592,6 @@ function MessageBubble({
             {visible}
           </Text>
         ) : null}
-        {messageTime(message.id) !== undefined ? <Text style={styles.messageTime}>{messageTime(message.id)}</Text> : null}
         {message.status === "failed" && message.replyTo ? (
           <Pressable
             onPress={() => onRetry(message.replyTo!)}
@@ -2025,20 +2054,19 @@ const styles = StyleSheet.create({
   },
   shellContent: { paddingBottom: 8 },
   topBar: {
-    minHeight: 64,
-    paddingHorizontal: 16,
+    minHeight: 56,
+    paddingHorizontal: 14,
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
+    gap: 10,
   },
   topBarSpacer: { flex: 1 },
-  iconButton: { width: 48, height: 48, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.outline, borderRadius: 12 },
-  gridIcon: { color: colors.accent, fontSize: 27, lineHeight: 31 },
-  workspaceIcon: { color: colors.accent, fontSize: 25 },
-  accountBadge: { width: 48, height: 48, borderRadius: 24, backgroundColor: colors.accent, alignItems: "center", justifyContent: "center" },
-  accountInitials: { color: colors.canvas, fontSize: 15, fontWeight: "700" },
+  iconButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.accentSoft, borderRadius: 8, backgroundColor: colors.surface },
+  accountBadge: { width: 44, height: 44, borderRadius: 22, backgroundColor: colors.accent, alignItems: "center", justifyContent: "center" },
+  accountInitials: { color: colors.canvas, fontSize: 14, fontWeight: "700", fontFamily: mono },
+  pixelRow: { flexDirection: "row" },
   navigationPanel: { flexGrow: 1, paddingHorizontal: 18, paddingVertical: 16, gap: 12 },
-  navigationCard: { padding: 16, gap: 6, borderWidth: 1, borderColor: colors.outline, borderRadius: 10, backgroundColor: colors.surface },
+  navigationCard: { padding: 16, gap: 6, borderWidth: 1, borderColor: colors.outline, borderRadius: 8, backgroundColor: colors.surface },
   navigationTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
   welcomeMark: { color: colors.accent, fontSize: 48, textAlign: "center" },
   approvalCard: {
@@ -2046,7 +2074,7 @@ const styles = StyleSheet.create({
     gap: 8,
     borderWidth: 1,
     borderColor: colors.accent,
-    borderRadius: 18,
+    borderRadius: 8,
     backgroundColor: colors.surface,
   },
   destructiveLabel: { color: colors.danger, fontSize: 15, fontWeight: "600" },
@@ -2071,7 +2099,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.outline,
     minHeight: 48,
-    borderRadius: 16,
+    borderRadius: 8,
     backgroundColor: colors.inset,
     color: colors.text,
     paddingHorizontal: 12,
@@ -2084,7 +2112,7 @@ const styles = StyleSheet.create({
     minHeight: 48,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: 16,
+    borderRadius: 8,
     backgroundColor: colors.accent,
   },
   connectLabel: {
@@ -2100,11 +2128,16 @@ const styles = StyleSheet.create({
     paddingTop: 6,
   },
   messageList: {
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    gap: 12,
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    // ponytail: keeps the last bubble clear of the mascot corner.
+    paddingBottom: 56,
+    gap: 14,
   },
-  chatSurface: { marginHorizontal: 14, flex: 1, borderWidth: 1, borderColor: "#34333F", borderRadius: 16, backgroundColor: "#19191F" },
+  chatSurface: { marginHorizontal: 14, flex: 1, borderWidth: 1, borderColor: colors.hairline, borderRadius: 12, backgroundColor: colors.chat, overflow: "hidden" },
+  chatList: { flex: 1 },
+  mascot: { position: "absolute", left: 12, bottom: 10, flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  mascotActivity: { color: colors.accentSoft, fontFamily: mono, fontSize: 14, lineHeight: 18 },
   emptyChat: {
     flexGrow: 1,
     alignItems: "center",
@@ -2113,40 +2146,40 @@ const styles = StyleSheet.create({
   },
   emptyText: {
     color: colors.muted,
-    fontSize: 16,
-    lineHeight: 22,
+    fontFamily: mono,
+    fontSize: 14,
+    lineHeight: 20,
     textAlign: "center",
   },
   messageRow: {
-    flexDirection: "row",
-    justifyContent: "flex-start",
+    alignItems: "flex-start",
+    gap: 4,
   },
   userMessageRow: {
-    justifyContent: "flex-end",
+    alignItems: "flex-end",
   },
   bubble: {
-    maxWidth: "94%",
+    maxWidth: "80%",
     flexShrink: 1,
-    borderRadius: 9,
+    borderRadius: 6,
     borderWidth: 1,
-    borderColor: colors.outline,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
+    borderColor: colors.hairline,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   assistantBubble: {
     backgroundColor: colors.surface,
-    borderBottomLeftRadius: 5,
   },
   userBubble: {
     backgroundColor: colors.user,
-    borderColor: colors.accent,
-    borderBottomRightRadius: 5,
+    borderColor: colors.accentSoft,
   },
-  messageTime: { color: colors.muted, fontSize: 11, textAlign: "right", marginTop: 4 },
+  messageTime: { color: colors.muted, fontFamily: mono, fontSize: 11, lineHeight: 14, paddingHorizontal: 2 },
   messageText: {
     color: colors.text,
-    fontSize: 17,
-    lineHeight: 23,
+    fontFamily: mono,
+    fontSize: 14,
+    lineHeight: 20,
   },
   retryButton: {
     alignSelf: "flex-start",
@@ -2164,7 +2197,7 @@ const styles = StyleSheet.create({
     gap: 8,
     marginBottom: 8,
     padding: 12,
-    borderRadius: 18,
+    borderRadius: 6,
     borderWidth: 1,
     borderColor: colors.outline,
     backgroundColor: colors.inset,
@@ -2209,7 +2242,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginTop: 4,
     paddingHorizontal: 8,
-    borderRadius: 16,
+    borderRadius: 8,
   },
   questionOptionSelected: {
     borderColor: colors.accent,
@@ -2225,7 +2258,7 @@ const styles = StyleSheet.create({
     borderColor: colors.outline,
     minHeight: 48,
     marginTop: 8,
-    borderRadius: 18,
+    borderRadius: 8,
     backgroundColor: colors.inset,
     color: colors.text,
     fontSize: 16,
@@ -2236,7 +2269,7 @@ const styles = StyleSheet.create({
     alignSelf: "flex-start",
     paddingHorizontal: 16,
     paddingVertical: 10,
-    borderRadius: 16,
+    borderRadius: 8,
     backgroundColor: colors.accent,
     minHeight: 48,
     minWidth: 48,
@@ -2254,7 +2287,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderWidth: 1,
     borderColor: colors.outline,
-    borderRadius: 16,
+    borderRadius: 8,
     backgroundColor: colors.surface,
     minHeight: 48,
     minWidth: 48,
@@ -2275,7 +2308,7 @@ const styles = StyleSheet.create({
     gap: 10,
     padding: 16,
     borderWidth: 1,
-    borderRadius: 22,
+    borderRadius: 8,
     borderColor: colors.outline,
     backgroundColor: colors.surface,
   },
@@ -2295,7 +2328,7 @@ const styles = StyleSheet.create({
     alignSelf: "flex-start",
     paddingHorizontal: 16,
     paddingVertical: 10,
-    borderRadius: 18,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: colors.accent,
     backgroundColor: colors.surface,
@@ -2312,52 +2345,45 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.outline,
     minHeight: 48,
-    borderRadius: 18,
+    borderRadius: 8,
     backgroundColor: colors.inset,
     color: colors.text,
     fontSize: 16,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  composerDock: { gap: 8, marginHorizontal: 16, marginTop: 8, marginBottom: 12 },
-  composerRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  composerDock: { gap: 6, marginHorizontal: 14, marginTop: 10, marginBottom: 12 },
   composer: {
-    flex: 1,
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-end",
     gap: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    paddingLeft: 6,
+    paddingRight: 6,
+    paddingVertical: 6,
     backgroundColor: colors.surface,
     borderWidth: 1,
-    borderColor: colors.accent,
-    borderRadius: 26,
+    borderColor: colors.accentSoft,
+    borderRadius: 14,
   },
   composerFocused: { borderWidth: 2 },
   composerInput: {
     flex: 1,
-    minHeight: 48,
+    minHeight: 44,
     maxHeight: 120,
-    borderRadius: 12,
-    backgroundColor: colors.inset,
     color: colors.text,
-    fontSize: 17,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    fontFamily: mono,
+    fontSize: 14,
+    lineHeight: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
   },
   sendButton: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: colors.accent,
-  },
-  sendLabel: {
-    color: colors.canvas,
-    fontSize: 26,
-    fontWeight: "600",
-    lineHeight: 30,
   },
   loading: {
     flex: 1,
@@ -2406,7 +2432,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.inset,
     borderColor: colors.outline,
     borderWidth: 1,
-    borderRadius: 18,
+    borderRadius: 10,
     color: colors.text,
     fontSize: 17,
     minHeight: 48,
@@ -2421,7 +2447,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.inset,
     borderColor: colors.outline,
     borderWidth: 1,
-    borderRadius: 18,
+    borderRadius: 10,
     paddingHorizontal: 14,
     paddingVertical: 14,
   },
@@ -2475,7 +2501,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingVertical: 14,
     backgroundColor: colors.accent,
-    borderRadius: 18,
+    borderRadius: 10,
     minHeight: 48,
     alignItems: "center",
     justifyContent: "center",

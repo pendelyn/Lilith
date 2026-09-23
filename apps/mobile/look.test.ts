@@ -81,7 +81,7 @@ test("selectable accents stay readable on the dark surfaces and as button fills"
   }
   const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
   const accentControls = [
-    ['accessibilityLabel="Send message"', "styles.sendLabel"],
+    ['accessibilityLabel="Send message"', "styles.sendButton"],
     ['accessibilityLabel={consent ? "Approve once"', "styles.taskControlLabel"],
     ["accessibilityLabel={option.label}", "styles.questionOptionLabel"],
     ['accessibilityLabel="Send answer"', "styles.questionSendLabel"],
@@ -168,7 +168,8 @@ test("appearance and accent stay on the main cat, the settings preview, and card
   const agents = section('screen === "agents"', 'screen === "account"');
   const settings = section('screen === "settings"', 'screen === "workspace"');
   const workspace = section('screen === "workspace"', 'screen === "privacy"');
-  const messages = section("renderItem={({ item }) => (", 'screen === "chat" ? <View style={styles.composerDock}>');
+  const messageList = section("renderItem={({ item }) => (", "styles.mascot");
+  const chatMascot = section("styles.mascot", 'screen === "chat" ? <View style={styles.composerDock}>');
   const composer = section("styles.composerDock", "function PrivacyPanel");
   const bubble = section("function MessageBubble", "function SubagentStatusCard");
   const taskCard = section("function SubagentStatusCard", "function BrowserTimelineView");
@@ -183,11 +184,13 @@ test("appearance and accent stay on the main cat, the settings preview, and card
   assert.match(workspace, /accessibilityRole="header">Workspace<\/Text>\s*<PixelMascot activity=\{\{ connection: state, messages \}\} appearance=\{appearance\} accent=\{accent\} \/>/);
   assert.match(workspace, /navigationCard, \{ borderColor: accent \}/);
   assert.equal(workspace.slice(workspace.indexOf("navigationCard")).includes("PixelMascot"), false);
-  assert.equal(composer.includes(main), true);
-  for (const region of [agents, settings, workspace, composer]) {
+  assert.equal(chatMascot.includes(main), true);
+  assert.match(chatMascot, /state === "streaming" \? <Text style=\{styles\.mascotActivity\}>\.\.\.<\/Text>/);
+  assert.equal(composer.includes("PixelMascot"), false);
+  for (const region of [agents, settings, workspace, chatMascot]) {
     assert.equal((region.match(/<PixelMascot /g) ?? []).length, 1);
   }
-  assert.equal(messages.includes("PixelMascot"), false);
+  assert.equal(messageList.includes("PixelMascot"), false);
   assert.equal(bubble.includes("PixelMascot"), false);
   assert.equal(taskCard.includes("PixelMascot"), false);
   assert.match(taskCard, /borderColor: accent/);
