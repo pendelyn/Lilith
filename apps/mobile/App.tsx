@@ -856,7 +856,7 @@ function Home({
         <Pressable onPress={() => setScreen(agentOverviewDestination(screen))} accessibilityRole="button" accessibilityLabel="Agent overview" style={styles.iconButton}>
           <Text style={styles.gridIcon} accessible={false}>▦</Text>
         </Pressable>
-        <Text style={styles.topBarTitle}>{screen === "chat" ? identity.name : screen === "workspace" ? "Workspace" : screen === "agents" ? "Agents" : screen === "account" ? "Account" : screen === "settings" ? "Settings" : screen === "memories" ? "Memory" : "Privacy"}</Text>
+        <View style={styles.topBarSpacer} />
         <Pressable onPress={() => setScreen("workspace")} accessibilityRole="button" accessibilityLabel="Computer workspace" style={styles.iconButton}>
           <Text style={styles.workspaceIcon} accessible={false}>✦</Text>
         </Pressable>
@@ -1767,7 +1767,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 12,
   },
-  topBarTitle: { flex: 1, color: colors.text, fontSize: 18, fontWeight: "600" },
+  topBarSpacer: { flex: 1 },
   iconButton: { width: 48, height: 48, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.outline, borderRadius: 12 },
   gridIcon: { color: colors.accent, fontSize: 27, lineHeight: 31 },
   workspaceIcon: { color: colors.accent, fontSize: 25 },
