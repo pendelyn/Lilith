@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   DEFAULT_NAME,
@@ -7,6 +8,12 @@ import {
   serializeIdentity,
   webResearchEnabledFromIdentity,
 } from "./identity.ts";
+
+test("settings name field stays disabled during account deletion and after server deletion", () => {
+  const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  assert.match(app, /<NameField value=\{name\} onChangeText=\{setName\} onEndEditing=\{\(\) => commitName\(name\)\} editable=\{!accountBusy && !serverDeleted\} \/>/);
+  assert.match(app, /onEndEditing=\{onEndEditing\}\s+editable=\{editable\}/);
+});
 
 test("persistence parsing applies defaults and mode tools", () => {
   assert.equal(parsePersistedIdentity(null), null);

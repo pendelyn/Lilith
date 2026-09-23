@@ -41,6 +41,7 @@ import {
   applyServerCards,
   beginReply,
   finishReply,
+  messageTimestamp,
   parsePersistedChat,
   redactRefusedSecrets,
   retryReply,
@@ -91,7 +92,7 @@ import {
   type PendingTaskControl,
 } from "./task-controls";
 import { colors } from "./theme";
-import { accountInitials, agentOverviewDestination, type HomeScreen } from "./navigation";
+import { agentOverviewDestination, type HomeScreen } from "./navigation";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
@@ -859,97 +860,20 @@ function Home({
           <Text style={styles.workspaceIcon} accessible={false}>✦</Text>
         </Pressable>
         <Pressable onPress={() => setScreen("account")} accessibilityRole="button" accessibilityLabel="Account and settings" style={styles.accountBadge}>
-          <Text style={styles.accountInitials}>{accountInitials(name)}</Text>
+          <Text style={styles.accountInitials}>ME</Text>
         </Pressable>
       </View>
-      {screen === "chat" ? <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent} keyboardShouldPersistTaps="handled">
-      {screen === "chat" ? <View style={styles.chatHeader}>
-        <Text style={styles.headerMeta} accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}>{toolsSummary}</Text>
-      </View> : null}
-      <View style={styles.connectionRow}>
-        <TextInput
-          value={token}
-          onChangeText={(value) => {
-            setToken(value);
-            setState("idle");
-            setHydrateError(false);
-            setControlError(false);
-            setMemoryError(false);
-            setAccountError(false);
-            setMemories([]);
-            setMemoryPaused(false);
-            setMemoryReady(false);
-            setScreen("chat");
-            setEditingId(null);
-          }}
-          placeholder="Local API token"
-          placeholderTextColor={colors.muted}
-          secureTextEntry
-          autoCapitalize="none"
-          autoCorrect={false}
-          autoComplete="off"
-          textContentType="none"
-          editable={!busy}
-          accessibilityLabel="Local API token"
-          style={styles.connectionInput}
-        />
-        <Pressable
-          onPress={() => void checkConnection()}
-          disabled={busy || token.trim() === ""}
-          accessibilityRole="button"
-          accessibilityLabel="Connect"
-          accessibilityState={{ disabled: busy || token.trim() === "", busy }}
-          style={({ pressed }) => [
-            styles.connectButton,
-            (busy || token.trim() === "") && styles.buttonDisabled,
-            pressed && styles.buttonPressed,
-          ]}
-        >
-          {state === "loading" ? (
-            <ActivityIndicator color={colors.canvas} />
-          ) : (
-            <Text style={styles.connectLabel}>Connect</Text>
-          )}
-        </Pressable>
-      </View>
-      <Text
-        accessibilityLiveRegion="polite"
-        style={[
-          styles.connectionStatus,
-          state === "success" && styles.statusSuccess,
-          (state === "unauthorized" || state === "unreachable" || state === "unexpected") &&
-            styles.statusError,
-        ]}
-      >
-        {STATUS_TEXT[state]}
-      </Text>
-      <Text style={styles.privacyNotice}>{PROVIDER_SIDE_LIMIT}</Text>
-      {persistError || chatPersistError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not save locally. Try again.
-        </Text>
-      ) : null}
-      {hydrateError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not load tasks. Try again.
-        </Text>
-      ) : null}
-      {controlError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not update the task. Try again.
-        </Text>
-      ) : null}
-      {memoryError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not load or update memories. Try again.
-        </Text>
-      ) : null}
-      {accountError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not delete the account. Try again.
-        </Text>
-      ) : null}
-      </ScrollView> : null}
+      {screen === "chat" ? <>
+        {(persistError || chatPersistError || hydrateError || controlError || memoryError || accountError) ? (
+          <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent}>
+            {persistError || chatPersistError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not save locally. Try again.</Text> : null}
+            {hydrateError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load tasks. Try again.</Text> : null}
+            {controlError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update the task. Try again.</Text> : null}
+            {memoryError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load or update memories. Try again.</Text> : null}
+            {accountError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not delete the account. Try again.</Text> : null}
+          </ScrollView>
+        ) : null}
+      </> : null}
       {screen === "agents" ? (
         <View style={styles.navigationPanel}>
           <Text style={styles.sectionLabel} accessibilityRole="header">Your agents</Text>
@@ -965,11 +889,48 @@ function Home({
           <Pressable onPress={() => setScreen("privacy")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Privacy and deletion</Text><Text style={styles.memoryMeta}>Retention and account deletion</Text></Pressable>
         </View>
       ) : screen === "settings" ? (
-        <View style={styles.navigationPanel}>
+        <ScrollView contentContainerStyle={styles.navigationPanel} keyboardShouldPersistTaps="handled">
           <Text style={styles.sectionLabel} accessibilityRole="header">Settings</Text>
-          <NameField value={name} onChangeText={setName} onEndEditing={() => commitName(name)} />
+          <NameField value={name} onChangeText={setName} onEndEditing={() => commitName(name)} editable={!accountBusy && !serverDeleted} />
           <Text style={styles.memoryMeta} accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}>{toolsSummary}</Text>
-        </View>
+          <View style={styles.connectionRow}>
+            <TextInput
+              value={token}
+              onChangeText={(value) => {
+                setToken(value);
+                setState("idle");
+                setHydrateError(false);
+                setControlError(false);
+                setMemoryError(false);
+                setAccountError(false);
+                setMemories([]);
+                setMemoryPaused(false);
+                setMemoryReady(false);
+                setEditingId(null);
+              }}
+              placeholder="Local API token"
+              placeholderTextColor={colors.muted}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoComplete="off"
+              textContentType="none"
+              editable={!busy && !accountBusy && !serverDeleted}
+              accessibilityLabel="Local API token"
+              style={styles.connectionInput}
+            />
+            <Pressable onPress={() => void checkConnection()} disabled={busy || token.trim() === "" || serverDeleted} accessibilityRole="button" accessibilityLabel="Connect" accessibilityState={{ disabled: busy || token.trim() === "" || serverDeleted, busy }} style={({ pressed }) => [styles.connectButton, (busy || token.trim() === "" || serverDeleted) && styles.buttonDisabled, pressed && styles.buttonPressed]}>
+              {state === "loading" ? <ActivityIndicator color={colors.canvas} /> : <Text style={styles.connectLabel}>Connect</Text>}
+            </Pressable>
+          </View>
+          <Text accessibilityLiveRegion="polite" style={[styles.connectionStatus, state === "success" && styles.statusSuccess, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]}</Text>
+          <Text style={styles.privacyNotice}>{PROVIDER_SIDE_LIMIT}</Text>
+          {persistError || chatPersistError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not save locally. Try again.</Text> : null}
+          {hydrateError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load tasks. Try again.</Text> : null}
+          {controlError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update the task. Try again.</Text> : null}
+          {memoryError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load or update memories. Try again.</Text> : null}
+          {accountError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not delete the account. Try again.</Text> : null}
+        </ScrollView>
       ) : screen === "workspace" ? (
         <ScrollView contentContainerStyle={styles.navigationPanel}>
           <Text style={styles.sectionLabel} accessibilityRole="header">Workspace</Text>
@@ -1067,6 +1028,7 @@ function Home({
       />
       )}
       {screen === "chat" ? <View style={styles.composerDock}>
+        {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
         <Text accessible={false} importantForAccessibility="no" style={styles.mascotSpace}>✦</Text>
         <View style={styles.composer}>
         <TextInput
@@ -1313,9 +1275,11 @@ function MemoriesPanel({
   );
 }
 
-function messageTime(id: string): string {
-  const timestamp = Number(id.match(/-(\d+)-/)?.[1] ?? Date.now());
-  return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function messageTime(id: string): string | undefined {
+  const timestamp = messageTimestamp(id);
+  return timestamp === undefined
+    ? undefined
+    : new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function MessageBubble({
@@ -1371,7 +1335,7 @@ function MessageBubble({
             {visible}
           </Text>
         ) : null}
-        <Text style={styles.messageTime}>{messageTime(message.id)}</Text>
+        {messageTime(message.id) !== undefined ? <Text style={styles.messageTime}>{messageTime(message.id)}</Text> : null}
         {message.status === "failed" && message.replyTo ? (
           <Pressable
             onPress={() => onRetry(message.replyTo!)}
@@ -1717,10 +1681,12 @@ function NameField({
   value,
   onChangeText,
   onEndEditing,
+  editable = true,
 }: {
   value: string;
   onChangeText: (text: string) => void;
   onEndEditing?: () => void;
+  editable?: boolean;
 }) {
   return (
     <View style={styles.field}>
@@ -1729,6 +1695,7 @@ function NameField({
         value={value}
         onChangeText={onChangeText}
         onEndEditing={onEndEditing}
+        editable={editable}
         maxLength={MAX_NAME_LENGTH}
         placeholder={DEFAULT_NAME}
         placeholderTextColor={colors.muted}
@@ -1835,15 +1802,7 @@ const styles = StyleSheet.create({
   chatScreen: {
     flex: 1,
   },
-  chatHeader: {
-    paddingHorizontal: 16,
-    paddingTop: 4,
-    paddingBottom: 6,
-  },
-  headerMeta: {
-    color: colors.muted,
-    fontSize: 13,
-  },
+  connectionPrompt: { alignSelf: "center", paddingHorizontal: 16, paddingVertical: 6 },
   connectionRow: {
     flexDirection: "row",
     flexWrap: "wrap",
