@@ -1,7 +1,7 @@
 ---
 name: astra
 description: Medium-effort project orchestrator and planning specialist for Lilith
-model: openai-codex/gpt-6-astra
+model: openai-codex/gpt-6-luna
 thinking: medium
 tools: read, grep, find, ls, bash
 systemPromptMode: replace

@@ -40,6 +40,7 @@ import {
   type HostProtocol,
 } from "./browser-hostfs.ts";
 import { putArtifact, isJpeg, type RetentionStore } from "./retention.ts";
+import { toolAllowed, type ToolAllowStore } from "./tool-allow.ts";
 import {
   dockerArgs,
   RUNNER_WORKSPACES_ROOT,
@@ -153,6 +154,7 @@ export type BrowserDeps = WebResearchDeps & {
   driver?: BrowserDriver;
   retention?: RetentionStore;
   owner?: OwnerContext;
+  toolAllow?: ToolAllowStore;
   onStep?: (step: BrowserStep) => void;
   onCard?: (card: SubagentCard) => void;
 };
@@ -747,6 +749,8 @@ async function postBoundEffect(
   const url = parsePublicHttpsUrl(bound.url);
   const resolved = await resolvePublicHttps(url.href, deps.lookupAll, deps.signal);
   if (deps.signal?.aborted) throw new Error("Web research cancelled");
+  // Last await is above. Blank during inspect, the live DOM read, or DNS must not POST.
+  assertBrowserEffectAllowed(deps);
   const get = deps.get ?? pinnedHttpsGet;
   const response = await get({
     url,
@@ -759,6 +763,12 @@ async function postBoundEffect(
   });
   if (response.status >= 300 && response.status < 400) throw new Error("Redirect rejected");
   if (response.status !== 200) throw new Error("Fetch failed");
+}
+
+function assertBrowserEffectAllowed(deps: BrowserDeps): void {
+  // Callers that are not the HTTP gate omit the store. The gate always passes it.
+  if (deps.toolAllow === undefined || deps.owner === undefined) return;
+  if (!toolAllowed(deps.toolAllow, deps.owner, "webResearch")) throw new Error("Web research is off");
 }
 
 function formPromptValue(raw: string): string | undefined {

@@ -5,7 +5,10 @@ import {
   DEFAULT_NAME,
   identityFromChoice,
   parsePersistedIdentity,
+  sameToolSet,
   serializeIdentity,
+  toolSyncPlan,
+  toolsForMode,
   webResearchEnabledFromIdentity,
 } from "./identity.ts";
 
@@ -13,6 +16,12 @@ test("settings name field stays disabled during account deletion and after serve
   const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
   assert.match(app, /<NameField value=\{name\} onChangeText=\{setName\} onEndEditing=\{\(\) => commitName\(name\)\} editable=\{!accountBusy && !serverDeleted\} \/>/);
   assert.match(app, /onEndEditing=\{onEndEditing\}\s+editable=\{editable\}/);
+  assert.match(app, /accessibilityRole="switch"\s+accessibilityLabel=\{TOOL_LABELS\[tool\]\}/);
+  assert.match(app, /accessibilityLabel="Tool preset"/);
+  assert.match(app, /preset: plan\.preset/);
+  assert.match(app, /toolSyncPlan\(allow, identity\.tools, allowToolMigrate\)/);
+  assert.match(app, /const \[allowToolMigrate, setAllowToolMigrate\] = useState\(false\)/);
+  assert.match(app, /setAllowToolMigrate\(true\)/);
 });
 
 test("persistence parsing applies defaults and mode tools", () => {
@@ -27,6 +36,8 @@ test("persistence parsing applies defaults and mode tools", () => {
     name: DEFAULT_NAME,
     mode: "recommended",
     tools: ["webResearch", "memory"],
+    accent: "lavender",
+    appearance: "classic",
   });
 
   assert.deepEqual(
@@ -35,8 +46,10 @@ test("persistence parsing applies defaults and mode tools", () => {
     ),
     {
       name: DEFAULT_NAME,
-      mode: "recommended",
-      tools: ["webResearch", "memory"],
+      mode: "blank",
+      tools: [],
+      accent: "lavender",
+      appearance: "classic",
     },
   );
 
@@ -46,8 +59,10 @@ test("persistence parsing applies defaults and mode tools", () => {
     ),
     {
       name: "Nyx",
-      mode: "blank",
-      tools: [],
+      mode: "recommended",
+      tools: ["webResearch", "memory"],
+      accent: "lavender",
+      appearance: "classic",
     },
   );
 
@@ -60,8 +75,83 @@ test("persistence parsing applies defaults and mode tools", () => {
   assert.equal(webResearchEnabledFromIdentity(null), false);
   assert.equal(
     webResearchEnabledFromIdentity(
-      parsePersistedIdentity(JSON.stringify({ name: "Nyx", mode: "blank", tools: ["webResearch", "memory"] })),
+      parsePersistedIdentity(JSON.stringify({ name: "Nyx", mode: "blank" })),
     ),
     false,
   );
+  assert.equal(
+    webResearchEnabledFromIdentity(
+      parsePersistedIdentity(JSON.stringify({ name: "Nyx", mode: "blank", tools: ["plugin"] })),
+    ),
+    false,
+  );
+});
+
+test("custom tool subset survives rename, accent, appearance, and relaunch", () => {
+  const custom = identityFromChoice("Nyx", "recommended", {
+    accent: "rose",
+    appearance: "tuxedo",
+    tools: ["memory"],
+  });
+  assert.deepEqual(custom.tools, ["memory"]);
+  assert.equal(custom.mode, "custom");
+
+  const renamed = identityFromChoice("Other", custom.mode, {
+    ...custom,
+    accent: "sky",
+    appearance: "tabby",
+  });
+  assert.equal(renamed.name, "Other");
+  assert.equal(renamed.accent, "sky");
+  assert.equal(renamed.appearance, "tabby");
+  assert.deepEqual(renamed.tools, ["memory"]);
+  assert.deepEqual(parsePersistedIdentity(serializeIdentity(renamed)), renamed);
+
+  const blank = identityFromChoice(renamed.name, "blank", {
+    accent: renamed.accent,
+    appearance: renamed.appearance,
+  });
+  assert.deepEqual(blank.tools, []);
+  assert.equal(sameToolSet(blank.tools, toolsForMode("blank")), true);
+  assert.equal(sameToolSet(toolsForMode("recommended"), ["webResearch", "memory"]), true);
+});
+
+test("stored tools are not uploaded onto an unconfigured server", () => {
+  assert.deepEqual(toolSyncPlan({ configured: false }, ["webResearch", "memory"]), {
+    kind: "adopt",
+    tools: [],
+    mode: "blank",
+  });
+  assert.deepEqual(toolSyncPlan({ configured: false }, ["memory"]), {
+    kind: "adopt",
+    tools: [],
+    mode: "blank",
+  });
+  assert.deepEqual(toolSyncPlan({ configured: false }, []), {
+    kind: "adopt",
+    tools: [],
+    mode: "blank",
+  });
+  assert.deepEqual(toolSyncPlan({ configured: false }, ["webResearch", "memory"], true), {
+    kind: "migrate",
+    preset: "recommended",
+  });
+  assert.deepEqual(toolSyncPlan({ configured: false }, ["memory"], true), {
+    kind: "migrate",
+    tools: ["memory"],
+  });
+  assert.deepEqual(toolSyncPlan({ configured: false }, [], true), {
+    kind: "migrate",
+    preset: "blank",
+  });
+  assert.deepEqual(toolSyncPlan({ configured: true, tools: ["memory"] }, ["webResearch", "memory"]), {
+    kind: "adopt",
+    tools: ["memory"],
+    mode: "custom",
+  });
+  assert.deepEqual(toolSyncPlan({ configured: true, tools: [] }, ["webResearch", "memory"]), {
+    kind: "adopt",
+    tools: [],
+    mode: "blank",
+  });
 });

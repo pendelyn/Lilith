@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { request as httpRequest, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -18,6 +19,7 @@ import {
 } from "@lilith/contracts";
 import { test } from "node:test";
 import { createHealthServer } from "./health.ts";
+import { createRetentionStore, putArtifact, type RetentionStore } from "./retention.ts";
 import { offlineWebResearchDeps } from "./web-research.ts";
 import {
   MEMORY_CONFIRM_REPLY,
@@ -574,6 +576,52 @@ test("memory HTTP is owner-scoped and rejects invalid data", async () => {
   }, undefined, memories);
 });
 
+test("in-flight memory confirm, pause, patch, and delete do not apply after a failed account delete", async () => {
+  const address = "meine Adresse ist Berliner Straße 1";
+
+  await rejectHeldMemoryWrite(async (base, memories) => {
+    const prompt = await chatReply(base, `Merk dir: ${address}`, true);
+    assert.equal(prompt.reply, MEMORY_CONFIRM_REPLY);
+    assert.equal(memories.pendingByOwner.has(owner.ownerId), true);
+    return {
+      method: "POST",
+      path: "/memories/confirm",
+      body: JSON.stringify({ consent: true, content: address, memoryEnabled: true }),
+    };
+  });
+
+  await rejectHeldMemoryWrite(async (base) => {
+    await chatReply(base, MEMORY_REMEMBER_PROMPT, true);
+    return {
+      method: "POST",
+      path: "/memories/pause",
+      body: JSON.stringify({ paused: true }),
+    };
+  });
+
+  await rejectHeldMemoryWrite(async (base, memories) => {
+    await chatReply(base, MEMORY_REMEMBER_PROMPT, true);
+    const id = listMemories(memories, owner)[0]?.id;
+    if (id === undefined) throw new Error("expected a memory");
+    return {
+      method: "PATCH",
+      path: `/memories/${id}`,
+      body: JSON.stringify({ content: "Antwortsprache Englisch" }),
+    };
+  });
+
+  await rejectHeldMemoryWrite(async (base, memories) => {
+    await chatReply(base, MEMORY_REMEMBER_PROMPT, true);
+    const id = listMemories(memories, owner)[0]?.id;
+    if (id === undefined) throw new Error("expected a memory");
+    return {
+      method: "DELETE",
+      path: `/memories/${id}`,
+      body: "{}",
+    };
+  });
+});
+
 test("memory HTTP persistence failure returns 500 and keeps the previous snapshot", async () => {
   const dir = mkdtempSync(join(tmpdir(), "lilith-memories-http-fail-"));
   const persistPath = join(dir, "state.json");
@@ -606,7 +654,17 @@ async function postConfirm(base: string, content: string, consent: boolean, memo
   });
 }
 
+async function allowTools(base: string, tools: Array<"webResearch" | "memory">) {
+  const response = await fetch(`${base}/tools`, {
+    method: "PUT",
+    headers: { ...AUTH, "Content-Type": "application/json" },
+    body: JSON.stringify({ tools }),
+  });
+  assert.equal(response.status, 200);
+}
+
 async function chatReply(base: string, message: string, memoryEnabled: boolean) {
+  await allowTools(base, memoryEnabled ? ["webResearch", "memory"] : ["webResearch"]);
   const response = await fetch(`${base}/chat`, {
     method: "POST",
     headers: { ...AUTH, "Content-Type": "application/json" },
@@ -644,15 +702,17 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 async function withServer(
-  run: (base: string) => Promise<void>,
+  run: (base: string, server: Server) => Promise<void>,
   store?: TaskStore,
   memories?: MemoryStore,
+  retention: RetentionStore = createRetentionStore(),
 ): Promise<void> {
   const server = createHealthServer(
     { token: "secret-token", ownerId: "alpha-owner" },
     store ?? createTaskStore(),
     memories ?? createMemoryStore(),
     offlineWebResearchDeps(),
+    retention,
   );
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());
@@ -662,10 +722,106 @@ async function withServer(
     throw new Error("expected a TCP address");
   }
   try {
-    await run(`http://127.0.0.1:${address.port}`);
+    await run(`http://127.0.0.1:${address.port}`, server);
   } finally {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
   }
+}
+
+async function rejectHeldMemoryWrite(
+  setup: (
+    base: string,
+    memories: MemoryStore,
+  ) => Promise<{ method: string; path: string; body: string }>,
+): Promise<void> {
+  const stuck = retentionWithStuckArtifact();
+  const memories = createMemoryStore();
+  try {
+    await withServer(async (base, server) => {
+      const plan = await setup(base, memories);
+      const held = openHeldRequest(base, plan.method, plan.path, plan.body, server);
+      await held.started;
+      const deleted = await fetch(`${base}/account/delete`, {
+        method: "POST",
+        headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify({ consent: true }),
+      });
+      assert.equal(deleted.status, 500);
+      assert.equal(stuck.retention.pendingOwnerDeletes.has(owner.ownerId), true);
+      const afterDelete = memoryOwnerSnapshot(memories);
+      const result = await held.finish();
+      assert.equal(result.status, 409);
+      assert.equal(result.text, "");
+      assert.deepEqual(memoryOwnerSnapshot(memories), afterDelete);
+    }, undefined, memories, stuck.retention);
+  } finally {
+    rmSync(stuck.dir, { recursive: true, force: true });
+  }
+}
+
+function memoryOwnerSnapshot(memories: MemoryStore) {
+  const pending = memories.pendingByOwner.get(owner.ownerId);
+  return {
+    paused: memories.pausedOwnerIds.has(owner.ownerId),
+    pending: pending === undefined ? null : { ...pending },
+    list: listMemories(memories, owner),
+  };
+}
+
+function retentionWithStuckArtifact(): { dir: string; retention: RetentionStore } {
+  const dir = mkdtempSync(join(tmpdir(), "lilith-memory-delete-fail-"));
+  const filesRoot = join(dir, "files");
+  const retention = createRetentionStore({ persistPath: join(dir, "state.json"), filesRoot });
+  const shot = putArtifact(retention, owner, { kind: "screenshot", body: "shot" });
+  if (shot.path === undefined) throw new Error("expected a screenshot path");
+  const dest = join(filesRoot, ...shot.path.split("/"));
+  rmSync(dest);
+  mkdirSync(dest);
+  return { dir, retention };
+}
+
+function openHeldRequest(base: string, method: string, path: string, body: string, server: Server) {
+  let markStarted: () => void = () => {};
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const onRequest = (req: IncomingMessage) => {
+    const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (req.method === method && pathname === path) markStarted();
+  };
+  server.on("request", onRequest);
+  const url = new URL(path, base);
+  const req = httpRequest({
+    hostname: url.hostname,
+    port: url.port,
+    method,
+    path: url.pathname,
+    headers: {
+      ...AUTH,
+      "Content-Type": "application/json",
+      // DELETE is not chunked by default, so flushHeaders() otherwise ends the
+      // request and applies it before the account-delete attempt.
+      "Content-Length": String(Buffer.byteLength(body)),
+    },
+  });
+  req.flushHeaders();
+  return {
+    started,
+    finish() {
+      return new Promise<{ status: number; text: string }>((resolve, reject) => {
+        req.on("response", (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => {
+            server.off("request", onRequest);
+            resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") });
+          });
+        });
+        req.on("error", reject);
+        req.end(body);
+      });
+    },
+  };
 }

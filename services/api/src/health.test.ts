@@ -93,6 +93,7 @@ test("chat replies stream as validated NDJSON without raw logs", async () => {
 test("color compare test task streams one research subagent and Blau", async () => {
   await withServer(async (base) => {
     const urls = colorFixtureUrls(TEST_COLOR_FIXTURE_COMMIT);
+    await allowTools(base, ["webResearch"]);
     const response = await fetch(`${base}/chat`, {
       method: "POST",
       headers: {
@@ -1207,6 +1208,7 @@ test("cookie chat streams live steps and screenshot ids before done", async () =
     };
     const web: BrowserDeps = { ...offlineWebResearchDeps(), driver };
     await withServer(async (base) => {
+      await allowTools(base, ["webResearch"]);
       const response = await fetch(`${base}/chat`, {
         method: "POST",
         headers: { ...AUTH, "Content-Type": "application/json" },
@@ -1395,6 +1397,7 @@ test("cookie hang stop is stopped not failed in chat text", async () => {
   const web: BrowserDeps = { ...offlineWebResearchDeps(), driver };
   const store = createTaskStore();
   await withServer(async (base) => {
+    await allowTools(base, ["webResearch"]);
     const response = await fetch(`${base}/chat`, {
       method: "POST",
       headers: { ...AUTH, "Content-Type": "application/json" },
@@ -1484,11 +1487,24 @@ test("Stop during an in-flight browser approve does not succeed later", async ()
   }, store, web);
 });
 
+async function allowTools(base: string, tools: Array<"webResearch" | "memory">) {
+  const response = await fetch(`${base}/tools`, {
+    method: "PUT",
+    headers: { ...AUTH, "Content-Type": "application/json" },
+    body: JSON.stringify({ tools }),
+  });
+  assert.equal(response.status, 200);
+}
+
 async function chatEvents(
   base: string,
   message: string,
   extra: { webResearchEnabled?: boolean; memoryEnabled?: boolean } = {},
 ) {
+  const tools: Array<"webResearch" | "memory"> = [];
+  if (extra.webResearchEnabled) tools.push("webResearch");
+  if (extra.memoryEnabled) tools.push("memory");
+  if (tools.length > 0) await allowTools(base, tools);
   const response = await fetch(`${base}/chat`, {
     method: "POST",
     headers: {

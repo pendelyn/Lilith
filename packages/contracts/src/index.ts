@@ -36,6 +36,17 @@ export {
   type MemoryRetrieveResponse,
 } from "./memory.ts";
 export {
+  OPTIONAL_TOOLS,
+  TOOL_PRESETS,
+  parseToolAllowResponse,
+  parseToolAllowUpdate,
+  toolsForPreset,
+  type OptionalTool,
+  type ToolAllowResponse,
+  type ToolAllowUpdate,
+  type ToolPreset,
+} from "./tools.ts";
+export {
   ACCOUNT_DELETION_NOTICE,
   AUDIT_TTL_MS,
   BACKUP_TTL_MS,
