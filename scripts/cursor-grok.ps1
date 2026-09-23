@@ -21,7 +21,7 @@ $args = @(
     '--output-format', 'json',
     '--sandbox', 'disabled', # Cursor sandbox is unavailable on native Windows.
     '--trust',
-    '--model', 'cursor-grok-4.6-xhigh',
+    '--model', 'grok-4.7-xhigh',
     '--workspace', $Workspace
 )
 
