@@ -16,12 +16,22 @@ test("Recommended enables memory and Blank disables it", () => {
   assert.equal(memoryEnabledFromIdentity(null), false);
 });
 
-test("stale persisted tools cannot enable memory on a Blank identity", () => {
+test("a saved memory subset stays on after relaunch and unknown ids do not", () => {
   const identity = parsePersistedIdentity(
-    JSON.stringify({ name: "Nyx", mode: "blank", tools: ["webResearch", "memory"] }),
+    JSON.stringify({ name: "Nyx", mode: "blank", tools: ["memory", "plugin"] }),
   );
-  assert.equal(memoryEnabledFromIdentity(identity), false);
+  assert.equal(memoryEnabledFromIdentity(identity), true);
+  assert.equal(
+    memoryEnabledFromIdentity(
+      parsePersistedIdentity(JSON.stringify({ name: "Nyx", mode: "blank", tools: ["plugin"] })),
+    ),
+    false,
+  );
   assert.equal(memoryEnabledFromIdentity(parsePersistedIdentity("not-json")), false);
+  assert.equal(
+    memoryEnabledFromIdentity(parsePersistedIdentity(JSON.stringify({ name: "Nyx", mode: "blank" }))),
+    false,
+  );
 });
 
 test("memory list parsers reject extra keys and client helpers replace or drop rows", () => {

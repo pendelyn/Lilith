@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { createHealthServer, loadConfig } from "./health.ts";
 import { createMemoryStore } from "./memory.ts";
+import { createToolAllowStore } from "./tool-allow.ts";
 import { createRetentionStore, finishPendingDeletes, runExpiryJob } from "./retention.ts";
 import { RUNNER_WORKSPACES_ROOT } from "./runner.ts";
 import { createTaskStore } from "./tasks.ts";
@@ -12,6 +13,7 @@ try {
   const cwd = process.cwd();
   const tasks = createTaskStore({ persistPath: join(cwd, ".lilith-tasks.json") });
   const memories = createMemoryStore({ persistPath: join(cwd, ".lilith-memories.json") });
+  const tools = createToolAllowStore({ persistPath: join(cwd, ".lilith-tools.json") });
   const retention = createRetentionStore({
     persistPath: join(cwd, ".lilith-retention.json"),
     filesRoot: join(cwd, ".lilith-retention"),
@@ -21,7 +23,7 @@ try {
   });
   const retain = (): void => {
     try {
-      finishPendingDeletes(retention, tasks, memories);
+      finishPendingDeletes(retention, tasks, memories, tools);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(message);
@@ -36,7 +38,7 @@ try {
   retain();
   setInterval(retain, EXPIRY_INTERVAL_MS);
   // Listen even if the tombstone is still pending: owner APIs fail closed, delete retry stays up.
-  const server = createHealthServer(config, tasks, memories, {}, retention);
+  const server = createHealthServer(config, tasks, memories, {}, retention, tools);
   server.listen(config.port, config.host, () => {
     process.stdout.write(`API listening on http://${config.host}:${config.port}\n`);
   });

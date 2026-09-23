@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseAccountDeleteResponse, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, type ApprovalRequest, type BrowserTimeline, type QuestionAnswer, type TaskState } from "@lilith/contracts";
+import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseAccountDeleteResponse, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, parseToolAllowResponse, type ApprovalRequest, type BrowserTimeline, type OptionalTool, type QuestionAnswer, type TaskState, type ToolPreset } from "@lilith/contracts";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
@@ -31,14 +31,18 @@ import {
   DEFAULT_NAME,
   IDENTITY_STORAGE_KEY,
   MAX_NAME_LENGTH,
+  OPTIONAL_TOOLS,
   identityFromChoice,
   parsePersistedIdentity,
+  sameToolSet,
   serializeIdentity,
+  modeForTools,
+  toolSyncPlan,
+  toolsForMode,
   webResearchEnabledFromIdentity,
   type AccentId,
   type AgentIdentity,
   type AppearanceId,
-  type OptionalTool,
   type SetupMode,
 } from "./identity";
 import {
@@ -152,6 +156,7 @@ const STATUS_TEXT: Record<ConnectionState, string> = {
 export default function App() {
   const [ready, setReady] = useState(false);
   const [identity, setIdentity] = useState<AgentIdentity | null>(null);
+  const [allowToolMigrate, setAllowToolMigrate] = useState(false);
   const [persistError, setPersistError] = useState(false);
   const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const saveRevision = useRef(0);
@@ -207,13 +212,20 @@ export default function App() {
             <ActivityIndicator color={colors.accent} />
           </View>
         ) : identity === null ? (
-          <Onboarding onComplete={(next) => void persist(next)} />
+          <Onboarding
+            onComplete={(next) => {
+              setAllowToolMigrate(true);
+              void persist(next);
+            }}
+          />
         ) : (
           <Home
             identity={identity}
             persistError={persistError}
             identitySaveQueue={saveQueue}
             accountPurge={accountPurge.current}
+            allowToolMigrate={allowToolMigrate}
+            onToolMigrateDone={() => setAllowToolMigrate(false)}
             onIdentityChange={(next) => void persist(next)}
             onAccountDeleted={() => {
               const revision = ++saveRevision.current;
@@ -291,6 +303,8 @@ function Home({
   persistError,
   identitySaveQueue,
   accountPurge,
+  allowToolMigrate,
+  onToolMigrateDone,
   onIdentityChange,
   onAccountDeleted,
 }: {
@@ -298,6 +312,8 @@ function Home({
   persistError: boolean;
   identitySaveQueue: PersistQueue;
   accountPurge: AccountPurge;
+  allowToolMigrate: boolean;
+  onToolMigrateDone: () => void;
   onIdentityChange: (identity: AgentIdentity) => void;
   onAccountDeleted: () => void;
 }) {
@@ -314,6 +330,7 @@ function Home({
   const [controlError, setControlError] = useState(false);
   const [memoryError, setMemoryError] = useState(false);
   const [accountError, setAccountError] = useState(false);
+  const [toolError, setToolError] = useState(false);
   const [accountBusy, setAccountBusy] = useState(false);
   const [serverDeleted, setServerDeleted] = useState(accountPurge.serverDeleted);
   const [memories, setMemories] = useState<MemoryItem[]>([]);
@@ -329,14 +346,11 @@ function Home({
   const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const saveRevision = useRef(0);
   const request = useRef<XMLHttpRequest | null>(null);
+  const savingTools = useRef(false);
   const list = useRef<FlatList<ChatMessage> | null>(null);
   const idSequence = useRef(0);
   const shouldAutoScroll = useRef(true);
   const busy = state === "loading" || state === "streaming";
-  const toolsSummary =
-    identity.tools.length === 0
-      ? "No optional tools"
-      : identity.tools.map((tool) => TOOL_LABELS[tool]).join(", ");
   const memoryEnabled = memoryEnabledFromIdentity(identity);
   const webResearchEnabled = webResearchEnabledFromIdentity(identity);
   const accent = ACCENT_COLOR[identity.accent];
@@ -384,7 +398,91 @@ function Home({
   function commitLook(accentId: AccentId, appearanceId: AppearanceId) {
     if (accountBusy || serverDeleted) return;
     if (accentId === identity.accent && appearanceId === identity.appearance && !persistError) return;
-    onIdentityChange(identityFromChoice(identity.name, identity.mode, { accent: accentId, appearance: appearanceId }));
+    onIdentityChange(
+      identityFromChoice(identity.name, identity.mode, {
+        accent: accentId,
+        appearance: appearanceId,
+        tools: identity.tools,
+      }),
+    );
+  }
+
+  function applyServerTools(tools: readonly OptionalTool[], mode: SetupMode = identity.mode) {
+    const next = identityFromChoice(identity.name, mode, {
+      accent: identity.accent,
+      appearance: identity.appearance,
+      tools,
+    });
+    if (
+      next.name === identity.name &&
+      next.mode === identity.mode &&
+      next.accent === identity.accent &&
+      next.appearance === identity.appearance &&
+      sameToolSet(next.tools, identity.tools)
+    ) {
+      return;
+    }
+    onIdentityChange(next);
+  }
+
+  async function syncToolAllow(signal: AbortSignal): Promise<boolean> {
+    const headers = { Authorization: `Bearer ${token.trim()}` };
+    const response = await fetch(`${API_URL}/tools`, { headers, signal });
+    if (response.status !== 200) return false;
+    const allow = parseToolAllowResponse(await response.json());
+    const plan = toolSyncPlan(allow, identity.tools, allowToolMigrate);
+    if (plan.kind === "migrate") {
+      const put = await fetch(`${API_URL}/tools`, {
+        method: "PUT",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify("preset" in plan ? { preset: plan.preset } : { tools: plan.tools }),
+        signal,
+      });
+      if (put.status !== 200) return false;
+      const saved = parseToolAllowResponse(await put.json());
+      if (!saved.configured) return false;
+      applyServerTools(saved.tools, "preset" in plan ? plan.preset : modeForTools(saved.tools));
+      onToolMigrateDone();
+      return true;
+    }
+    applyServerTools(plan.tools, plan.mode);
+    onToolMigrateDone();
+    return true;
+  }
+
+  async function saveTools(body: { tools: OptionalTool[] } | { preset: ToolPreset }) {
+    if (savingTools.current || state !== "success" || accountBusy || serverDeleted) return;
+    savingTools.current = true;
+    setToolError(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_URL}/tools`, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${token.trim()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (response.status !== 200) throw new Error("tools");
+      const allow = parseToolAllowResponse(await response.json());
+      if (!allow.configured) throw new Error("tools");
+      applyServerTools(allow.tools, "preset" in body ? body.preset : identity.mode);
+    } catch {
+      setToolError(true);
+    } finally {
+      clearTimeout(timer);
+      savingTools.current = false;
+    }
+  }
+
+  function toggleTool(tool: OptionalTool) {
+    const next = identity.tools.includes(tool)
+      ? identity.tools.filter((item) => item !== tool)
+      : [...identity.tools, tool];
+    void saveTools({ tools: OPTIONAL_TOOLS.filter((item) => next.includes(item)) });
   }
 
   async function checkConnection() {
@@ -393,6 +491,7 @@ function Home({
     setControlError(false);
     setMemoryError(false);
     setAccountError(false);
+    setToolError(false);
     setMemories([]);
     setMemoryPaused(false);
     setMemoryReady(false);
@@ -415,6 +514,10 @@ function Home({
       }
       try {
         parseHealthResponse(await response.json());
+        if (!(await syncToolAllow(controller.signal))) {
+          setState("unexpected");
+          return;
+        }
       } catch {
         setState("unexpected");
         return;
@@ -881,13 +984,14 @@ function Home({
         </Pressable>
       </View>
       {screen === "chat" ? <>
-        {(persistError || chatPersistError || hydrateError || controlError || memoryError || accountError) ? (
+        {(persistError || chatPersistError || hydrateError || controlError || memoryError || accountError || toolError) ? (
           <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent}>
             {persistError || chatPersistError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not save locally. Try again.</Text> : null}
             {hydrateError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load tasks. Try again.</Text> : null}
             {controlError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update the task. Try again.</Text> : null}
             {memoryError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load or update memories. Try again.</Text> : null}
             {accountError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not delete the account. Try again.</Text> : null}
+            {toolError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update tools. Try again.</Text> : null}
           </ScrollView>
         ) : null}
       </> : null}
@@ -902,7 +1006,7 @@ function Home({
       ) : screen === "account" ? (
         <View style={styles.navigationPanel}>
           <Text style={styles.sectionLabel} accessibilityRole="header">Account</Text>
-          <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Settings</Text><Text style={styles.memoryMeta}>Name, accent, appearance, and setup</Text></Pressable>
+          <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Settings</Text><Text style={styles.memoryMeta}>Name, look, and tools</Text></Pressable>
           <Pressable onPress={() => { setScreen("memories"); if (state === "success") void refreshMemories(); }} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Memory</Text><Text style={styles.memoryMeta}>Review, edit, pause, or delete saved memories</Text></Pressable>
           <Pressable onPress={() => setScreen("privacy")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Privacy and deletion</Text><Text style={styles.memoryMeta}>Retention and account deletion</Text></Pressable>
         </View>
@@ -946,7 +1050,70 @@ function Home({
               </LookOption>
             ))}
           </View>
-          <Text style={styles.memoryMeta} accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}>{toolsSummary}</Text>
+          <Text style={styles.fieldLabel}>Tools</Text>
+          <View accessibilityLabel="Optional tools">
+            {OPTIONAL_TOOLS.map((tool) => {
+              const enabled = identity.tools.includes(tool);
+              const locked = state !== "success" || accountBusy || serverDeleted;
+              return (
+                <Pressable
+                  key={tool}
+                  onPress={() => toggleTool(tool)}
+                  disabled={locked}
+                  accessibilityRole="switch"
+                  accessibilityLabel={TOOL_LABELS[tool]}
+                  accessibilityState={{ checked: enabled, disabled: locked }}
+                  style={({ pressed }) => [
+                    styles.choice,
+                    enabled && styles.choiceSelected,
+                    pressed && !locked && styles.choicePressed,
+                  ]}
+                >
+                  <View
+                    importantForAccessibility="no"
+                    style={[styles.choiceMark, enabled && styles.choiceMarkSelected]}
+                  />
+                  <View style={styles.choiceCopy}>
+                    <Text style={styles.choiceTitle}>{TOOL_LABELS[tool]}</Text>
+                    <Text style={styles.choiceDetail}>{enabled ? "On" : "Off"}</Text>
+                  </View>
+                </Pressable>
+              );
+            })}
+          </View>
+          <View accessibilityRole="radiogroup" accessibilityLabel="Tool preset" style={styles.modeGroup}>
+            {(["recommended", "blank"] as const).map((preset) => {
+              const selected = sameToolSet(identity.tools, toolsForMode(preset));
+              const locked = state !== "success" || accountBusy || serverDeleted;
+              const title = preset === "recommended" ? "Recommended" : "Blank";
+              const detail = preset === "recommended" ? "Web research and Memory" : "No optional tools";
+              return (
+                <Pressable
+                  key={preset}
+                  onPress={() => void saveTools({ preset })}
+                  disabled={locked}
+                  accessibilityRole="radio"
+                  accessibilityLabel={`${title}. ${detail}.`}
+                  accessibilityState={{ checked: selected, disabled: locked }}
+                  style={({ pressed }) => [
+                    styles.choice,
+                    selected && styles.choiceSelected,
+                    pressed && !locked && styles.choicePressed,
+                  ]}
+                >
+                  <View
+                    importantForAccessibility="no"
+                    style={[styles.choiceMark, selected && styles.choiceMarkSelected]}
+                  />
+                  <View style={styles.choiceCopy}>
+                    <Text style={styles.choiceTitle}>{title}</Text>
+                    <Text style={styles.choiceDetail}>{detail}</Text>
+                  </View>
+                </Pressable>
+              );
+            })}
+          </View>
+          <Text style={styles.memoryMeta}>Blank turns optional tools off. Saved memories stay until you delete them.</Text>
           <View style={styles.connectionRow}>
             <TextInput
               value={token}
@@ -957,6 +1124,7 @@ function Home({
                 setControlError(false);
                 setMemoryError(false);
                 setAccountError(false);
+                setToolError(false);
                 setMemories([]);
                 setMemoryPaused(false);
                 setMemoryReady(false);
@@ -984,6 +1152,7 @@ function Home({
           {controlError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update the task. Try again.</Text> : null}
           {memoryError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load or update memories. Try again.</Text> : null}
           {accountError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not delete the account. Try again.</Text> : null}
+          {toolError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update tools. Try again.</Text> : null}
         </ScrollView>
       ) : screen === "workspace" ? (
         <ScrollView style={styles.chatScreen} contentContainerStyle={styles.navigationPanel}>
