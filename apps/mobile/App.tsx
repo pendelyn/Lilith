@@ -41,6 +41,7 @@ import {
   applyServerCards,
   beginReply,
   finishReply,
+  messageTimestamp,
   parsePersistedChat,
   redactRefusedSecrets,
   retryReply,
@@ -91,6 +92,7 @@ import {
   type PendingTaskControl,
 } from "./task-controls";
 import { colors } from "./theme";
+import { agentOverviewDestination, type HomeScreen } from "./navigation";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
@@ -294,6 +296,7 @@ function Home({
   const [name, setName] = useState(identity.name);
   const [token, setToken] = useState("");
   const [draft, setDraft] = useState("");
+  const [composerFocused, setComposerFocused] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatReady, setChatReady] = useState(false);
   const [chatPersistError, setChatPersistError] = useState(false);
@@ -309,7 +312,7 @@ function Home({
   const [memoryPaused, setMemoryPaused] = useState(false);
   const [memoryReady, setMemoryReady] = useState(false);
   const [memoryBusy, setMemoryBusy] = useState(false);
-  const [screen, setScreen] = useState<"chat" | "memories" | "privacy">("chat");
+  const [screen, setScreen] = useState<HomeScreen>("chat");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [pendingControl, setPendingControl] = useState<PendingTaskControl>(null);
@@ -849,131 +852,99 @@ function Home({
       style={styles.chatScreen}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
-      <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent} keyboardShouldPersistTaps="handled">
-      <View style={styles.chatHeader}>
-        <TextInput
-          value={name}
-          onChangeText={setName}
-          onEndEditing={() => commitName(name)}
-          maxLength={MAX_NAME_LENGTH}
-          editable={!accountBusy && !serverDeleted}
-          accessibilityLabel="Companion name"
-          accessibilityState={{ disabled: accountBusy || serverDeleted }}
-          style={styles.headerName}
-        />
-        <Text
-          style={styles.headerMeta}
-          accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}
-        >
-          {toolsSummary}
-        </Text>
-        <View accessibilityRole="tablist" accessibilityLabel="Screens" style={styles.screenTabs}>
-          {(["chat", "memories", "privacy"] as const).map((id) => {
-            const selected = screen === id;
-            const label = id === "chat" ? "Chat" : id === "memories" ? "Memories" : "Privacy";
-            return (
-              <Pressable
-                key={id}
-                onPress={() => {
-                  setScreen(id);
-                  if (id === "memories" && state === "success") void refreshMemories();
-                }}
-                accessibilityRole="tab"
-                accessibilityLabel={`Show ${label.toLowerCase()}`}
-                accessibilityState={{ selected }}
-                style={({ pressed }) => [styles.screenToggle, selected && styles.screenToggleSelected, pressed && styles.buttonPressed]}
-              >
-                <Text style={[styles.screenToggleLabel, selected && styles.screenTabSelected]}>{label}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
-      </View>
-      <View style={styles.connectionRow}>
-        <TextInput
-          value={token}
-          onChangeText={(value) => {
-            setToken(value);
-            setState("idle");
-            setHydrateError(false);
-            setControlError(false);
-            setMemoryError(false);
-            setAccountError(false);
-            setMemories([]);
-            setMemoryPaused(false);
-            setMemoryReady(false);
-            setScreen("chat");
-            setEditingId(null);
-          }}
-          placeholder="Local API token"
-          placeholderTextColor={colors.muted}
-          secureTextEntry
-          autoCapitalize="none"
-          autoCorrect={false}
-          autoComplete="off"
-          textContentType="none"
-          editable={!busy}
-          accessibilityLabel="Local API token"
-          style={styles.connectionInput}
-        />
-        <Pressable
-          onPress={() => void checkConnection()}
-          disabled={busy || token.trim() === ""}
-          accessibilityRole="button"
-          accessibilityLabel="Connect"
-          accessibilityState={{ disabled: busy || token.trim() === "", busy }}
-          style={({ pressed }) => [
-            styles.connectButton,
-            (busy || token.trim() === "") && styles.buttonDisabled,
-            pressed && styles.buttonPressed,
-          ]}
-        >
-          {state === "loading" ? (
-            <ActivityIndicator color={colors.canvas} />
-          ) : (
-            <Text style={styles.connectLabel}>Connect</Text>
-          )}
+      <View style={styles.topBar}>
+        <Pressable onPress={() => setScreen(agentOverviewDestination(screen))} accessibilityRole="button" accessibilityLabel="Agent overview" style={styles.iconButton}>
+          <Text style={styles.gridIcon} accessible={false}>▦</Text>
+        </Pressable>
+        <View style={styles.topBarSpacer} />
+        <Pressable onPress={() => setScreen("workspace")} accessibilityRole="button" accessibilityLabel="Computer workspace" style={styles.iconButton}>
+          <Text style={styles.workspaceIcon} accessible={false}>✦</Text>
+        </Pressable>
+        <Pressable onPress={() => setScreen("account")} accessibilityRole="button" accessibilityLabel="Account and settings" style={styles.accountBadge}>
+          <Text style={styles.accountInitials}>ME</Text>
         </Pressable>
       </View>
-      <Text
-        accessibilityLiveRegion="polite"
-        style={[
-          styles.connectionStatus,
-          state === "success" && styles.statusSuccess,
-          (state === "unauthorized" || state === "unreachable" || state === "unexpected") &&
-            styles.statusError,
-        ]}
-      >
-        {STATUS_TEXT[state]}
-      </Text>
-      <Text style={styles.privacyNotice}>{PROVIDER_SIDE_LIMIT}</Text>
-      {persistError || chatPersistError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not save locally. Try again.
-        </Text>
-      ) : null}
-      {hydrateError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not load tasks. Try again.
-        </Text>
-      ) : null}
-      {controlError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not update the task. Try again.
-        </Text>
-      ) : null}
-      {memoryError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not load or update memories. Try again.
-        </Text>
-      ) : null}
-      {accountError ? (
-        <Text accessibilityLiveRegion="polite" style={styles.statusError}>
-          Could not delete the account. Try again.
-        </Text>
-      ) : null}
-      </ScrollView>
-      {screen === "privacy" ? (
+      {screen === "chat" ? <>
+        {(persistError || chatPersistError || hydrateError || controlError || memoryError || accountError) ? (
+          <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent}>
+            {persistError || chatPersistError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not save locally. Try again.</Text> : null}
+            {hydrateError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load tasks. Try again.</Text> : null}
+            {controlError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update the task. Try again.</Text> : null}
+            {memoryError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load or update memories. Try again.</Text> : null}
+            {accountError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not delete the account. Try again.</Text> : null}
+          </ScrollView>
+        ) : null}
+      </> : null}
+      {screen === "agents" ? (
+        <View style={styles.navigationPanel}>
+          <Text style={styles.sectionLabel} accessibilityRole="header">Your agents</Text>
+          <Pressable onPress={() => setScreen("chat")} accessibilityRole="button" accessibilityLabel={`Open ${name}, main agent`} style={styles.navigationCard}>
+            <Text style={styles.navigationTitle}>{name}</Text><Text style={styles.memoryMeta}>Main agent · research, tools, and coordination</Text>
+          </Pressable>
+        </View>
+      ) : screen === "account" ? (
+        <View style={styles.navigationPanel}>
+          <Text style={styles.sectionLabel} accessibilityRole="header">Account</Text>
+          <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Settings</Text><Text style={styles.memoryMeta}>Name and starting setup</Text></Pressable>
+          <Pressable onPress={() => { setScreen("memories"); if (state === "success") void refreshMemories(); }} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Memory</Text><Text style={styles.memoryMeta}>Review, edit, pause, or delete saved memories</Text></Pressable>
+          <Pressable onPress={() => setScreen("privacy")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Privacy and deletion</Text><Text style={styles.memoryMeta}>Retention and account deletion</Text></Pressable>
+        </View>
+      ) : screen === "settings" ? (
+        <ScrollView contentContainerStyle={styles.navigationPanel} keyboardShouldPersistTaps="handled">
+          <Text style={styles.sectionLabel} accessibilityRole="header">Settings</Text>
+          <NameField value={name} onChangeText={setName} onEndEditing={() => commitName(name)} editable={!accountBusy && !serverDeleted} />
+          <Text style={styles.memoryMeta} accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}>{toolsSummary}</Text>
+          <View style={styles.connectionRow}>
+            <TextInput
+              value={token}
+              onChangeText={(value) => {
+                setToken(value);
+                setState("idle");
+                setHydrateError(false);
+                setControlError(false);
+                setMemoryError(false);
+                setAccountError(false);
+                setMemories([]);
+                setMemoryPaused(false);
+                setMemoryReady(false);
+                setEditingId(null);
+              }}
+              placeholder="Local API token"
+              placeholderTextColor={colors.muted}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoComplete="off"
+              textContentType="none"
+              editable={!busy && !accountBusy && !serverDeleted}
+              accessibilityLabel="Local API token"
+              style={styles.connectionInput}
+            />
+            <Pressable onPress={() => void checkConnection()} disabled={busy || token.trim() === "" || serverDeleted} accessibilityRole="button" accessibilityLabel="Connect" accessibilityState={{ disabled: busy || token.trim() === "" || serverDeleted, busy }} style={({ pressed }) => [styles.connectButton, (busy || token.trim() === "" || serverDeleted) && styles.buttonDisabled, pressed && styles.buttonPressed]}>
+              {state === "loading" ? <ActivityIndicator color={colors.canvas} /> : <Text style={styles.connectLabel}>Connect</Text>}
+            </Pressable>
+          </View>
+          <Text accessibilityLiveRegion="polite" style={[styles.connectionStatus, state === "success" && styles.statusSuccess, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]}</Text>
+          <Text style={styles.privacyNotice}>{PROVIDER_SIDE_LIMIT}</Text>
+          {persistError || chatPersistError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not save locally. Try again.</Text> : null}
+          {hydrateError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load tasks. Try again.</Text> : null}
+          {controlError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not update the task. Try again.</Text> : null}
+          {memoryError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not load or update memories. Try again.</Text> : null}
+          {accountError ? <Text accessibilityLiveRegion="polite" style={styles.statusError}>Could not delete the account. Try again.</Text> : null}
+        </ScrollView>
+      ) : screen === "workspace" ? (
+        <ScrollView contentContainerStyle={styles.navigationPanel}>
+          <Text style={styles.sectionLabel} accessibilityRole="header">Workspace</Text>
+          {messages.flatMap((message) => message.subagents ?? []).filter((card) => card.browser !== undefined).map((card) => (
+            <View key={card.id} style={styles.navigationCard}>
+              <Text style={styles.navigationTitle}>{TASK_STATE_LABEL[card.state]}</Text>
+              <Text style={styles.memoryMeta}>{card.assignment}</Text>
+              <BrowserTimelineView timeline={card.browser!} loadShot={loadScreenshot} />
+            </View>
+          ))}
+          {!messages.some((message) => message.subagents?.some((card) => card.browser !== undefined)) ? <Text style={styles.emptyText}>Computer sessions and browser screenshots will appear here.</Text> : null}
+        </ScrollView>
+      ) : screen === "privacy" ? (
         <PrivacyPanel
           connected={state === "success" || serverDeleted}
           busy={accountBusy}
@@ -1010,6 +981,7 @@ function Home({
         />
       ) : (
       <FlatList
+        style={styles.chatSurface}
         ref={list}
         data={messages}
         keyExtractor={(message) => message.id}
@@ -1031,11 +1003,7 @@ function Home({
         contentContainerStyle={messages.length === 0 ? styles.emptyChat : styles.messageList}
         ListEmptyComponent={
           chatReady ? (
-            <View style={styles.emptyCard}>
-              <Text accessible={false} importantForAccessibility="no" style={styles.welcomeMark}>✦</Text>
-              <Text style={styles.emptyTitle}>{identity.name}</Text>
-              <Text style={styles.emptyText}>Start a conversation with {identity.name}.</Text>
-            </View>
+            <Text style={styles.emptyText}>Start a conversation</Text>
           ) : (
             <ActivityIndicator color={colors.accent} />
           )
@@ -1056,12 +1024,18 @@ function Home({
         }}
       />
       )}
-      <View style={styles.composer}>
+      {screen === "chat" ? <View style={styles.composerDock}>
+        {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
+        <View style={styles.composerRow}>
+        <Text accessible={false} importantForAccessibility="no" style={styles.mascotSpace}>✦</Text>
+        <View style={[styles.composer, composerFocused && styles.composerFocused]}>
         <TextInput
           value={draft}
           onChangeText={setDraft}
-          placeholder={state === "success" ? "Message" : "Connect to send a message"}
+          placeholder="Message…"
           placeholderTextColor={colors.muted}
+          onFocus={() => setComposerFocused(true)}
+          onBlur={() => setComposerFocused(false)}
           multiline
           maxLength={MAX_MESSAGE_LENGTH}
           editable={state === "success" && activeUserId === null}
@@ -1086,7 +1060,9 @@ function Home({
         >
           <Text allowFontScaling={false} style={styles.sendLabel}>↑</Text>
         </Pressable>
-      </View>
+        </View>
+        </View>
+      </View> : null}
     </KeyboardAvoidingView>
   );
 }
@@ -1300,6 +1276,13 @@ function MemoriesPanel({
   );
 }
 
+function messageTime(id: string): string | undefined {
+  const timestamp = messageTimestamp(id);
+  return timestamp === undefined
+    ? undefined
+    : new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 function MessageBubble({
   message,
   assistantName,
@@ -1353,6 +1336,7 @@ function MessageBubble({
             {visible}
           </Text>
         ) : null}
+        {messageTime(message.id) !== undefined ? <Text style={styles.messageTime}>{messageTime(message.id)}</Text> : null}
         {message.status === "failed" && message.replyTo ? (
           <Pressable
             onPress={() => onRetry(message.replyTo!)}
@@ -1698,10 +1682,12 @@ function NameField({
   value,
   onChangeText,
   onEndEditing,
+  editable = true,
 }: {
   value: string;
   onChangeText: (text: string) => void;
   onEndEditing?: () => void;
+  editable?: boolean;
 }) {
   return (
     <View style={styles.field}>
@@ -1710,6 +1696,7 @@ function NameField({
         value={value}
         onChangeText={onChangeText}
         onEndEditing={onEndEditing}
+        editable={editable}
         maxLength={MAX_NAME_LENGTH}
         placeholder={DEFAULT_NAME}
         placeholderTextColor={colors.muted}
@@ -1768,23 +1755,28 @@ function ModeChoice({
 const styles = StyleSheet.create({
   // ponytail: scrollable chrome keeps safety copy reachable at large font sizes.
   shell: {
-    maxHeight: "48%",
+    maxHeight: "40%",
     flexGrow: 0,
     flexShrink: 0,
   },
   shellContent: { paddingBottom: 8 },
-  screenToggleSelected: { backgroundColor: colors.accent, borderColor: colors.accent },
-  welcomeMark: { color: colors.accent, fontSize: 48, textAlign: "center" },
-  emptyCard: {
-    width: "100%",
-    padding: 24,
+  topBar: {
+    minHeight: 64,
+    paddingHorizontal: 16,
+    flexDirection: "row",
+    alignItems: "center",
     gap: 12,
-    borderRadius: 28,
-    borderWidth: 1,
-    borderColor: colors.outline,
-    backgroundColor: colors.surface,
   },
-  emptyTitle: { color: colors.text, fontSize: 24, fontWeight: "700", textAlign: "center" },
+  topBarSpacer: { flex: 1 },
+  iconButton: { width: 48, height: 48, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.outline, borderRadius: 12 },
+  gridIcon: { color: colors.accent, fontSize: 27, lineHeight: 31 },
+  workspaceIcon: { color: colors.accent, fontSize: 25 },
+  accountBadge: { width: 48, height: 48, borderRadius: 24, backgroundColor: colors.accent, alignItems: "center", justifyContent: "center" },
+  accountInitials: { color: colors.canvas, fontSize: 15, fontWeight: "700" },
+  navigationPanel: { flexGrow: 1, paddingHorizontal: 18, paddingVertical: 16, gap: 12 },
+  navigationCard: { padding: 16, gap: 6, borderWidth: 1, borderColor: colors.outline, borderRadius: 10, backgroundColor: colors.surface },
+  navigationTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
+  welcomeMark: { color: colors.accent, fontSize: 48, textAlign: "center" },
   approvalCard: {
     padding: 12,
     gap: 8,
@@ -1801,48 +1793,7 @@ const styles = StyleSheet.create({
   chatScreen: {
     flex: 1,
   },
-  chatHeader: {
-    paddingHorizontal: 16,
-    paddingTop: 6,
-    paddingBottom: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.outline,
-  },
-  headerName: {
-    color: colors.text,
-    fontSize: 26,
-    fontWeight: "700",
-    minHeight: 48,
-    padding: 0,
-  },
-  headerMeta: {
-    color: colors.muted,
-    fontSize: 13,
-  },
-  screenToggle: {
-    alignSelf: "flex-start",
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: colors.outline,
-    minHeight: 48,
-    justifyContent: "center",
-    marginTop: 4,
-  },
-  screenTabs: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-  },
-  screenTabSelected: {
-    color: colors.canvas,
-  },
-  screenToggleLabel: {
-    color: colors.accent,
-    fontSize: 15,
-    fontWeight: "600",
-  },
+  connectionPrompt: { paddingHorizontal: 16, paddingVertical: 6 },
   connectionRow: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -1885,10 +1836,11 @@ const styles = StyleSheet.create({
     paddingTop: 6,
   },
   messageList: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
     paddingVertical: 12,
-    gap: 8,
+    gap: 12,
   },
+  chatSurface: { marginHorizontal: 14, flex: 1, borderWidth: 1, borderColor: "#34333F", borderRadius: 16, backgroundColor: "#19191F" },
   emptyChat: {
     flexGrow: 1,
     alignItems: "center",
@@ -1911,7 +1863,7 @@ const styles = StyleSheet.create({
   bubble: {
     maxWidth: "94%",
     flexShrink: 1,
-    borderRadius: 22,
+    borderRadius: 9,
     borderWidth: 1,
     borderColor: colors.outline,
     paddingHorizontal: 14,
@@ -1919,12 +1871,14 @@ const styles = StyleSheet.create({
   },
   assistantBubble: {
     backgroundColor: colors.surface,
-    borderBottomLeftRadius: 8,
+    borderBottomLeftRadius: 5,
   },
   userBubble: {
     backgroundColor: colors.user,
-    borderBottomRightRadius: 8,
+    borderColor: colors.accent,
+    borderBottomRightRadius: 5,
   },
+  messageTime: { color: colors.muted, fontSize: 11, textAlign: "right", marginTop: 4 },
   messageText: {
     color: colors.text,
     fontSize: 17,
@@ -2101,24 +2055,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
+  composerDock: { gap: 8, marginHorizontal: 16, marginTop: 8, marginBottom: 12 },
+  composerRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   composer: {
+    flex: 1,
     flexDirection: "row",
-    alignItems: "flex-end",
+    alignItems: "center",
     gap: 8,
-    paddingHorizontal: 12,
-    paddingTop: 8,
-    paddingBottom: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     backgroundColor: colors.surface,
-    borderTopWidth: 1,
-    borderTopColor: colors.outline,
-  },
-  composerInput: {
     borderWidth: 1,
-    borderColor: colors.outline,
+    borderColor: colors.accent,
+    borderRadius: 26,
+  },
+  composerFocused: { borderWidth: 2 },
+  mascotSpace: { width: 30, color: colors.muted, fontSize: 18, textAlign: "center" },
+  composerInput: {
     flex: 1,
     minHeight: 48,
     maxHeight: 120,
-    borderRadius: 18,
+    borderRadius: 12,
     backgroundColor: colors.inset,
     color: colors.text,
     fontSize: 17,
@@ -2128,7 +2085,7 @@ const styles = StyleSheet.create({
   sendButton: {
     width: 48,
     height: 48,
-    borderRadius: 18,
+    borderRadius: 24,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: colors.accent,

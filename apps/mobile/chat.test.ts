@@ -9,6 +9,7 @@ import {
   applyServerCards,
   beginReply,
   finishReply,
+  messageTimestamp,
   parsePersistedChat,
   redactRefusedSecrets,
   retryReply,
@@ -43,6 +44,14 @@ test("forbidden Merk dir is redacted from bubbles and serialized chat", () => {
   const multiline = beginReply([], "user-2", "assistant-2", "Merk dir: password: hunter2\nbitte merken");
   assert.equal(multiline[0]?.text, MEMORY_REDACTED_USER_TEXT);
   assert.equal(serializeChat(multiline).toLowerCase().includes("hunter2"), false);
+});
+
+test("message timestamps only come from locally generated message ids", () => {
+  assert.equal(messageTimestamp("user-1700000000123-4"), 1_700_000_000_123);
+  assert.equal(messageTimestamp("assistant-1700000000456-5"), 1_700_000_000_456);
+  assert.equal(messageTimestamp("server-sub-1"), undefined);
+  assert.equal(messageTimestamp("assistant-invalid-5"), undefined);
+  assert.equal(messageTimestamp("assistant-99999999999999999999-5"), undefined);
 });
 
 test("chat survives restart and interrupted streams become retryable", () => {

@@ -1,14 +1,14 @@
 // Shared by the native surfaces; no runtime theme switching.
 export const colors = {
-  canvas: "#100D17",
-  surface: "#211A2E",
-  inset: "#17121F",
-  outline: "#776486",
-  accent: "#C9ACFF",
-  text: "#F5EEFF",
-  secondary: "#D6C9E5",
-  muted: "#B7A5C8",
-  user: "#51376C",
+  canvas: "#171717",
+  surface: "#1D1D24",
+  inset: "#202027",
+  outline: "#807D96",
+  accent: "#D3D3FF",
+  text: "#F2F0FF",
+  secondary: "#D6D3EE",
+  muted: "#AAA8BC",
+  user: "#37364D",
   success: "#97DDB6",
   danger: "#FFABB9",
 } as const;

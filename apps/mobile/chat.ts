@@ -13,6 +13,13 @@ import { persistedChatHasScreenshotBytes } from "./screenshots.ts";
 export const CHAT_STORAGE_KEY = "lilith.chat";
 export const MAX_MESSAGE_LENGTH = 4_000;
 
+export function messageTimestamp(id: string): number | undefined {
+  const timestamp = id.match(/^(?:user|assistant)-(\d+)-\d+$/)?.[1];
+  if (timestamp === undefined) return undefined;
+  const value = Number(timestamp);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
 export type { SubagentCard } from "@lilith/contracts";
 
 export type ChatMessage = {
