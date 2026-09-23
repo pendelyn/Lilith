@@ -296,6 +296,7 @@ function Home({
   const [name, setName] = useState(identity.name);
   const [token, setToken] = useState("");
   const [draft, setDraft] = useState("");
+  const [composerFocused, setComposerFocused] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatReady, setChatReady] = useState(false);
   const [chatPersistError, setChatPersistError] = useState(false);
@@ -1002,11 +1003,7 @@ function Home({
         contentContainerStyle={messages.length === 0 ? styles.emptyChat : styles.messageList}
         ListEmptyComponent={
           chatReady ? (
-            <View style={styles.emptyCard}>
-              <Text accessible={false} importantForAccessibility="no" style={styles.welcomeMark}>✦</Text>
-              <Text style={styles.emptyTitle}>{identity.name}</Text>
-              <Text style={styles.emptyText}>Start a conversation with {identity.name}.</Text>
-            </View>
+            <Text style={styles.emptyText}>Start a conversation</Text>
           ) : (
             <ActivityIndicator color={colors.accent} />
           )
@@ -1031,12 +1028,14 @@ function Home({
         {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
         <View style={styles.composerRow}>
         <Text accessible={false} importantForAccessibility="no" style={styles.mascotSpace}>✦</Text>
-        <View style={styles.composer}>
+        <View style={[styles.composer, composerFocused && styles.composerFocused]}>
         <TextInput
           value={draft}
           onChangeText={setDraft}
-          placeholder={state === "success" ? "Message" : "Connect to send a message"}
+          placeholder="Message…"
           placeholderTextColor={colors.muted}
+          onFocus={() => setComposerFocused(true)}
+          onBlur={() => setComposerFocused(false)}
           multiline
           maxLength={MAX_MESSAGE_LENGTH}
           editable={state === "success" && activeUserId === null}
@@ -1778,16 +1777,6 @@ const styles = StyleSheet.create({
   navigationCard: { padding: 16, gap: 6, borderWidth: 1, borderColor: colors.outline, borderRadius: 10, backgroundColor: colors.surface },
   navigationTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
   welcomeMark: { color: colors.accent, fontSize: 48, textAlign: "center" },
-  emptyCard: {
-    width: "100%",
-    padding: 24,
-    gap: 12,
-    borderRadius: 28,
-    borderWidth: 1,
-    borderColor: colors.outline,
-    backgroundColor: colors.surface,
-  },
-  emptyTitle: { color: colors.text, fontSize: 24, fontWeight: "700", textAlign: "center" },
   approvalCard: {
     padding: 12,
     gap: 8,
@@ -2080,10 +2069,9 @@ const styles = StyleSheet.create({
     borderColor: colors.accent,
     borderRadius: 26,
   },
+  composerFocused: { borderWidth: 2 },
   mascotSpace: { width: 30, color: colors.muted, fontSize: 18, textAlign: "center" },
   composerInput: {
-    borderWidth: 1,
-    borderColor: colors.outline,
     flex: 1,
     minHeight: 48,
     maxHeight: 120,
