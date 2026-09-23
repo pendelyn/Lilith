@@ -110,3 +110,20 @@ test("reduced motion keeps every pose static and the seven cats distinct", () =>
   assert.ok(art("success").includes("s"));
   assert.ok(art("error").includes("r"));
 });
+
+test("thinking and working differ from idle in bright outline cells", () => {
+  const rows = (state: "idle" | "thinking" | "working") => mascotPresentation(state, true).rows;
+  const outline = (row: string) => row.replace(/[^o]/g, ".");
+  const idle = rows("idle");
+  const thinking = rows("thinking");
+  const working = rows("working");
+
+  assert.equal(thinking[0].length, 12);
+  assert.equal(working[2].length, 12);
+  assert.equal(outline(thinking[0]), "...oo.oo.ooo");
+  assert.equal(outline(idle[0]), "...oo.oo....");
+  assert.equal(outline(working[2]), "..oo...oo...");
+  assert.equal(outline(idle[2]), "..o....o....");
+  assert.equal(working[2], "..oo.e.oo...");
+  assert.notEqual(outline(thinking.join("")), outline(working.join("")));
+});

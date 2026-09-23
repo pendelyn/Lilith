@@ -64,7 +64,7 @@ const MASCOT_SPRITES: Record<MascotState, readonly string[]> = {
     ".oooo.......",
   ],
   thinking: [
-    "...oo.oo.o..",
+    "...oo.oo.ooo",
     "..oeeffo....",
     "..offffo....",
     "..offffoo...",
@@ -90,7 +90,7 @@ const MASCOT_SPRITES: Record<MascotState, readonly string[]> = {
   working: [
     "...oo.oo....",
     "..offffo....",
-    "..of.e.fo...",
+    "..oo.e.oo...",
     "..offffoo...",
     ".ooffffo....",
     "ooffffff....",
