@@ -91,6 +91,7 @@ import {
   type PendingTaskControl,
 } from "./task-controls";
 import { colors } from "./theme";
+import { accountInitials, agentOverviewDestination, type HomeScreen } from "./navigation";
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
@@ -309,7 +310,7 @@ function Home({
   const [memoryPaused, setMemoryPaused] = useState(false);
   const [memoryReady, setMemoryReady] = useState(false);
   const [memoryBusy, setMemoryBusy] = useState(false);
-  const [screen, setScreen] = useState<"chat" | "memories" | "privacy">("chat");
+  const [screen, setScreen] = useState<HomeScreen>("chat");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [pendingControl, setPendingControl] = useState<PendingTaskControl>(null);
@@ -849,46 +850,22 @@ function Home({
       style={styles.chatScreen}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
-      <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent} keyboardShouldPersistTaps="handled">
-      <View style={styles.chatHeader}>
-        <TextInput
-          value={name}
-          onChangeText={setName}
-          onEndEditing={() => commitName(name)}
-          maxLength={MAX_NAME_LENGTH}
-          editable={!accountBusy && !serverDeleted}
-          accessibilityLabel="Companion name"
-          accessibilityState={{ disabled: accountBusy || serverDeleted }}
-          style={styles.headerName}
-        />
-        <Text
-          style={styles.headerMeta}
-          accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}
-        >
-          {toolsSummary}
-        </Text>
-        <View accessibilityRole="tablist" accessibilityLabel="Screens" style={styles.screenTabs}>
-          {(["chat", "memories", "privacy"] as const).map((id) => {
-            const selected = screen === id;
-            const label = id === "chat" ? "Chat" : id === "memories" ? "Memories" : "Privacy";
-            return (
-              <Pressable
-                key={id}
-                onPress={() => {
-                  setScreen(id);
-                  if (id === "memories" && state === "success") void refreshMemories();
-                }}
-                accessibilityRole="tab"
-                accessibilityLabel={`Show ${label.toLowerCase()}`}
-                accessibilityState={{ selected }}
-                style={({ pressed }) => [styles.screenToggle, selected && styles.screenToggleSelected, pressed && styles.buttonPressed]}
-              >
-                <Text style={[styles.screenToggleLabel, selected && styles.screenTabSelected]}>{label}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
+      <View style={styles.topBar}>
+        <Pressable onPress={() => setScreen(agentOverviewDestination(screen))} accessibilityRole="button" accessibilityLabel="Agent overview" style={styles.iconButton}>
+          <Text style={styles.gridIcon} accessible={false}>▦</Text>
+        </Pressable>
+        <Text style={styles.topBarTitle}>{screen === "chat" ? identity.name : screen === "workspace" ? "Workspace" : screen === "agents" ? "Agents" : screen === "account" ? "Account" : screen === "settings" ? "Settings" : screen === "memories" ? "Memory" : "Privacy"}</Text>
+        <Pressable onPress={() => setScreen("workspace")} accessibilityRole="button" accessibilityLabel="Computer workspace" style={styles.iconButton}>
+          <Text style={styles.workspaceIcon} accessible={false}>✦</Text>
+        </Pressable>
+        <Pressable onPress={() => setScreen("account")} accessibilityRole="button" accessibilityLabel="Account and settings" style={styles.accountBadge}>
+          <Text style={styles.accountInitials}>{accountInitials(name)}</Text>
+        </Pressable>
       </View>
+      {screen === "chat" ? <ScrollView style={styles.shell} contentContainerStyle={styles.shellContent} keyboardShouldPersistTaps="handled">
+      {screen === "chat" ? <View style={styles.chatHeader}>
+        <Text style={styles.headerMeta} accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}>{toolsSummary}</Text>
+      </View> : null}
       <View style={styles.connectionRow}>
         <TextInput
           value={token}
@@ -972,8 +949,40 @@ function Home({
           Could not delete the account. Try again.
         </Text>
       ) : null}
-      </ScrollView>
-      {screen === "privacy" ? (
+      </ScrollView> : null}
+      {screen === "agents" ? (
+        <View style={styles.navigationPanel}>
+          <Text style={styles.sectionLabel} accessibilityRole="header">Your agents</Text>
+          <Pressable onPress={() => setScreen("chat")} accessibilityRole="button" accessibilityLabel={`Open ${name}, main agent`} style={styles.navigationCard}>
+            <Text style={styles.navigationTitle}>{name}</Text><Text style={styles.memoryMeta}>Main agent · research, tools, and coordination</Text>
+          </Pressable>
+        </View>
+      ) : screen === "account" ? (
+        <View style={styles.navigationPanel}>
+          <Text style={styles.sectionLabel} accessibilityRole="header">Account</Text>
+          <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Settings</Text><Text style={styles.memoryMeta}>Name and starting setup</Text></Pressable>
+          <Pressable onPress={() => { setScreen("memories"); if (state === "success") void refreshMemories(); }} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Memory</Text><Text style={styles.memoryMeta}>Review, edit, pause, or delete saved memories</Text></Pressable>
+          <Pressable onPress={() => setScreen("privacy")} accessibilityRole="button" style={styles.navigationCard}><Text style={styles.navigationTitle}>Privacy and deletion</Text><Text style={styles.memoryMeta}>Retention and account deletion</Text></Pressable>
+        </View>
+      ) : screen === "settings" ? (
+        <View style={styles.navigationPanel}>
+          <Text style={styles.sectionLabel} accessibilityRole="header">Settings</Text>
+          <NameField value={name} onChangeText={setName} onEndEditing={() => commitName(name)} />
+          <Text style={styles.memoryMeta} accessibilityLabel={`Setup ${identity.mode}. ${toolsSummary}.`}>{toolsSummary}</Text>
+        </View>
+      ) : screen === "workspace" ? (
+        <ScrollView contentContainerStyle={styles.navigationPanel}>
+          <Text style={styles.sectionLabel} accessibilityRole="header">Workspace</Text>
+          {messages.flatMap((message) => message.subagents ?? []).filter((card) => card.browser !== undefined).map((card) => (
+            <View key={card.id} style={styles.navigationCard}>
+              <Text style={styles.navigationTitle}>{TASK_STATE_LABEL[card.state]}</Text>
+              <Text style={styles.memoryMeta}>{card.assignment}</Text>
+              <BrowserTimelineView timeline={card.browser!} loadShot={loadScreenshot} />
+            </View>
+          ))}
+          {!messages.some((message) => message.subagents?.some((card) => card.browser !== undefined)) ? <Text style={styles.emptyText}>Computer sessions and browser screenshots will appear here.</Text> : null}
+        </ScrollView>
+      ) : screen === "privacy" ? (
         <PrivacyPanel
           connected={state === "success" || serverDeleted}
           busy={accountBusy}
@@ -1010,6 +1019,7 @@ function Home({
         />
       ) : (
       <FlatList
+        style={styles.chatSurface}
         ref={list}
         data={messages}
         keyExtractor={(message) => message.id}
@@ -1056,7 +1066,9 @@ function Home({
         }}
       />
       )}
-      <View style={styles.composer}>
+      {screen === "chat" ? <View style={styles.composerDock}>
+        <Text accessible={false} importantForAccessibility="no" style={styles.mascotSpace}>✦</Text>
+        <View style={styles.composer}>
         <TextInput
           value={draft}
           onChangeText={setDraft}
@@ -1086,7 +1098,8 @@ function Home({
         >
           <Text allowFontScaling={false} style={styles.sendLabel}>↑</Text>
         </Pressable>
-      </View>
+        </View>
+      </View> : null}
     </KeyboardAvoidingView>
   );
 }
@@ -1300,6 +1313,11 @@ function MemoriesPanel({
   );
 }
 
+function messageTime(id: string): string {
+  const timestamp = Number(id.match(/-(\d+)-/)?.[1] ?? Date.now());
+  return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 function MessageBubble({
   message,
   assistantName,
@@ -1353,6 +1371,7 @@ function MessageBubble({
             {visible}
           </Text>
         ) : null}
+        <Text style={styles.messageTime}>{messageTime(message.id)}</Text>
         {message.status === "failed" && message.replyTo ? (
           <Pressable
             onPress={() => onRetry(message.replyTo!)}
@@ -1768,12 +1787,27 @@ function ModeChoice({
 const styles = StyleSheet.create({
   // ponytail: scrollable chrome keeps safety copy reachable at large font sizes.
   shell: {
-    maxHeight: "48%",
+    maxHeight: "40%",
     flexGrow: 0,
     flexShrink: 0,
   },
   shellContent: { paddingBottom: 8 },
-  screenToggleSelected: { backgroundColor: colors.accent, borderColor: colors.accent },
+  topBar: {
+    minHeight: 64,
+    paddingHorizontal: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  topBarTitle: { flex: 1, color: colors.text, fontSize: 18, fontWeight: "600" },
+  iconButton: { width: 48, height: 48, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.outline, borderRadius: 12 },
+  gridIcon: { color: colors.accent, fontSize: 27, lineHeight: 31 },
+  workspaceIcon: { color: colors.accent, fontSize: 25 },
+  accountBadge: { width: 48, height: 48, borderRadius: 24, backgroundColor: colors.accent, alignItems: "center", justifyContent: "center" },
+  accountInitials: { color: colors.canvas, fontSize: 15, fontWeight: "700" },
+  navigationPanel: { flexGrow: 1, paddingHorizontal: 18, paddingVertical: 16, gap: 12 },
+  navigationCard: { padding: 16, gap: 6, borderWidth: 1, borderColor: colors.outline, borderRadius: 10, backgroundColor: colors.surface },
+  navigationTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
   welcomeMark: { color: colors.accent, fontSize: 48, textAlign: "center" },
   emptyCard: {
     width: "100%",
@@ -1803,45 +1837,12 @@ const styles = StyleSheet.create({
   },
   chatHeader: {
     paddingHorizontal: 16,
-    paddingTop: 6,
-    paddingBottom: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.outline,
-  },
-  headerName: {
-    color: colors.text,
-    fontSize: 26,
-    fontWeight: "700",
-    minHeight: 48,
-    padding: 0,
+    paddingTop: 4,
+    paddingBottom: 6,
   },
   headerMeta: {
     color: colors.muted,
     fontSize: 13,
-  },
-  screenToggle: {
-    alignSelf: "flex-start",
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: colors.outline,
-    minHeight: 48,
-    justifyContent: "center",
-    marginTop: 4,
-  },
-  screenTabs: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-  },
-  screenTabSelected: {
-    color: colors.canvas,
-  },
-  screenToggleLabel: {
-    color: colors.accent,
-    fontSize: 15,
-    fontWeight: "600",
   },
   connectionRow: {
     flexDirection: "row",
@@ -1885,10 +1886,11 @@ const styles = StyleSheet.create({
     paddingTop: 6,
   },
   messageList: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
     paddingVertical: 12,
-    gap: 8,
+    gap: 12,
   },
+  chatSurface: { marginHorizontal: 14, flex: 1, borderWidth: 1, borderColor: "#34333F", borderRadius: 16, backgroundColor: "#19191F" },
   emptyChat: {
     flexGrow: 1,
     alignItems: "center",
@@ -1911,7 +1913,7 @@ const styles = StyleSheet.create({
   bubble: {
     maxWidth: "94%",
     flexShrink: 1,
-    borderRadius: 22,
+    borderRadius: 9,
     borderWidth: 1,
     borderColor: colors.outline,
     paddingHorizontal: 14,
@@ -1919,12 +1921,14 @@ const styles = StyleSheet.create({
   },
   assistantBubble: {
     backgroundColor: colors.surface,
-    borderBottomLeftRadius: 8,
+    borderBottomLeftRadius: 5,
   },
   userBubble: {
     backgroundColor: colors.user,
-    borderBottomRightRadius: 8,
+    borderColor: colors.accent,
+    borderBottomRightRadius: 5,
   },
+  messageTime: { color: colors.muted, fontSize: 11, textAlign: "right", marginTop: 4 },
   messageText: {
     color: colors.text,
     fontSize: 17,
@@ -2101,24 +2105,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
+  composerDock: { flexDirection: "row", alignItems: "center", gap: 8, marginHorizontal: 16, marginTop: 8, marginBottom: 12 },
   composer: {
+    flex: 1,
     flexDirection: "row",
-    alignItems: "flex-end",
+    alignItems: "center",
     gap: 8,
-    paddingHorizontal: 12,
-    paddingTop: 8,
-    paddingBottom: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     backgroundColor: colors.surface,
-    borderTopWidth: 1,
-    borderTopColor: colors.outline,
+    borderWidth: 1,
+    borderColor: colors.accent,
+    borderRadius: 26,
   },
+  mascotSpace: { width: 30, color: colors.muted, fontSize: 18, textAlign: "center" },
   composerInput: {
     borderWidth: 1,
     borderColor: colors.outline,
     flex: 1,
     minHeight: 48,
     maxHeight: 120,
-    borderRadius: 18,
+    borderRadius: 12,
     backgroundColor: colors.inset,
     color: colors.text,
     fontSize: 17,
@@ -2128,7 +2135,7 @@ const styles = StyleSheet.create({
   sendButton: {
     width: 48,
     height: 48,
-    borderRadius: 18,
+    borderRadius: 24,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: colors.accent,
