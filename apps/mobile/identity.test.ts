@@ -27,6 +27,8 @@ test("persistence parsing applies defaults and mode tools", () => {
     name: DEFAULT_NAME,
     mode: "recommended",
     tools: ["webResearch", "memory"],
+    accent: "lavender",
+    appearance: "classic",
   });
 
   assert.deepEqual(
@@ -37,6 +39,8 @@ test("persistence parsing applies defaults and mode tools", () => {
       name: DEFAULT_NAME,
       mode: "recommended",
       tools: ["webResearch", "memory"],
+      accent: "lavender",
+      appearance: "classic",
     },
   );
 
@@ -48,6 +52,8 @@ test("persistence parsing applies defaults and mode tools", () => {
       name: "Nyx",
       mode: "blank",
       tools: [],
+      accent: "lavender",
+      appearance: "classic",
     },
   );
 

@@ -1,4 +1,5 @@
 import type { TaskState } from "@lilith/contracts";
+import type { AppearanceId } from "./identity.ts";
 
 export const MASCOT_STATES = [
   "idle",
@@ -47,6 +48,15 @@ export const MASCOT_PIXELS = {
 } as const;
 
 export type MascotPixel = keyof typeof MASCOT_PIXELS;
+
+export const MASCOT_MARK_COLOR = {
+  w: "#F7F4FF",
+  k: "#2A2A33",
+  b: "#E4C39A",
+  t: "#6A4324",
+  c: "#F4E7D6",
+  d: "#5C4033",
+} as const;
 
 // Side-view sitting cat. States share the body and tail; eyes, ears, and the
 // delegating paw are the differences. 12×10.
@@ -209,4 +219,23 @@ export function mascotPresentation(state: MascotState, reduceMotion: boolean): M
     rows: MASCOT_SPRITES[state],
     animate: reduceMotion ? false : NONESSENTIAL_ANIMATION,
   };
+}
+
+// ponytail: coat masks reuse the seven state sprites. Tuxedo body stays dark; the accent outline and white chest carry the read.
+function appearanceMark(appearance: Exclude<AppearanceId, "classic">, y: number): string {
+  switch (appearance) {
+    case "tuxedo":
+      return y >= 5 && y <= 6 ? "w" : "k";
+    case "tabby":
+      return y % 2 === 0 ? "t" : "b";
+    case "siamese":
+      return y <= 2 ? "d" : "c";
+  }
+}
+
+export function paintMascotAppearance(rows: readonly string[], appearance: AppearanceId): readonly string[] {
+  if (appearance === "classic") return rows;
+  return rows.map((row, y) =>
+    Array.from(row, (pixel) => (pixel === "f" ? appearanceMark(appearance, y) : pixel)).join(""),
+  );
 }
