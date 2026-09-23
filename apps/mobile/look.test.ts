@@ -79,6 +79,23 @@ test("selectable accents stay readable on the dark surfaces and as button fills"
     }
     assert.ok(contrast(colors.canvas, accent) >= 4.5, `canvas text on ${accent}`);
   }
+  const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const accentControls = [
+    ['accessibilityLabel="Send message"', "styles.sendLabel"],
+    ['accessibilityLabel={consent ? "Approve once"', "styles.taskControlLabel"],
+    ["accessibilityLabel={option.label}", "styles.questionOptionLabel"],
+    ['accessibilityLabel="Send answer"', "styles.questionSendLabel"],
+    ['accessibilityLabel="Resume task"', "styles.taskControlLabel"],
+    ["function LookOption(", "styles.choiceTitle"],
+  ].map(([start, end]) => {
+    const from = app.indexOf(start);
+    const to = from === -1 ? -1 : app.indexOf(end, from + start.length);
+    return to === -1 ? "" : app.slice(from, to);
+  });
+  assert.ok(
+    accentControls.every((source) => source.includes("style") && !source.includes("styles.buttonDisabled")),
+    "accent pressables stay opaque when disabled",
+  );
   assert.ok(contrast(MASCOT_MARK_COLOR.w, MASCOT_MARK_COLOR.k) >= 3);
   assert.ok(contrast(MASCOT_MARK_COLOR.b, MASCOT_MARK_COLOR.t) >= 3);
   assert.ok(contrast(MASCOT_MARK_COLOR.c, MASCOT_MARK_COLOR.d) >= 3);

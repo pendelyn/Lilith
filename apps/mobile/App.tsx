@@ -1109,8 +1109,6 @@ function Home({
           style={({ pressed }) => [
             styles.sendButton,
             { backgroundColor: accent },
-            (draft.trim() === "" || state !== "success" || activeUserId !== null) &&
-              styles.buttonDisabled,
             pressed && styles.buttonPressed,
           ]}
         >
@@ -1504,7 +1502,7 @@ function SubagentStatusCard({
                     accessibilityLabel={consent ? "Approve once" : "Reject action"}
                     accessibilityHint={approvalConsentHint(card.approval!, consent)}
                     accessibilityState={{ disabled: locked, busy: decisionBusy }}
-                    style={[styles.taskControl, locked && styles.buttonDisabled]}
+                    style={styles.taskControl}
                   >
                     <Text style={consent ? [styles.taskControlLabel, { color: accent }] : styles.destructiveLabel}>{consent ? "Approve once" : "Reject"}</Text>
                   </Pressable>
@@ -1534,7 +1532,6 @@ function SubagentStatusCard({
                   styles.questionOption,
                   selected && styles.questionOptionSelected,
                   selected && { borderColor: accent },
-                  answerDisabled && styles.buttonDisabled,
                   pressed && !answerDisabled && styles.buttonPressed,
                 ]}
               >
@@ -1567,7 +1564,6 @@ function SubagentStatusCard({
             style={({ pressed }) => [
               styles.questionSend,
               { backgroundColor: accent },
-              (answerDisabled || draft.trim() === "") && styles.buttonDisabled,
               pressed && !answerDisabled && styles.buttonPressed,
             ]}
           >
@@ -1601,7 +1597,6 @@ function SubagentStatusCard({
           accessibilityState={{ disabled: resumeDisabled, busy: decisionBusy }}
           style={({ pressed }) => [
             styles.taskControl,
-            resumeDisabled && styles.buttonDisabled,
             pressed && !resumeDisabled && styles.buttonPressed,
           ]}
         >
@@ -1807,7 +1802,6 @@ function LookOption({
         selected && styles.choiceSelected,
         selected && { borderColor: border },
         pressed && !disabled && styles.choicePressed,
-        disabled && styles.buttonDisabled,
       ]}
     >
       {children}
