@@ -1,5 +1,7 @@
 import { join } from "node:path";
+import { createHomeRunner, loadHomeStateKey, loadRelayConfig } from "./home-runner.ts";
 import { createHealthServer, loadConfig } from "./health.ts";
+import { relayMailboxFromFetch } from "./relay-mailbox.ts";
 import { createMemoryStore } from "./memory.ts";
 import { createToolAllowStore } from "./tool-allow.ts";
 import { createRetentionStore, finishPendingDeletes, runExpiryJob } from "./retention.ts";
@@ -37,8 +39,29 @@ try {
   };
   retain();
   setInterval(retain, EXPIRY_INTERVAL_MS);
+  const relay = loadRelayConfig(process.env, config.token);
+  const stateKey = loadHomeStateKey(process.env, config.token, relay?.token ?? "");
+  if (relay !== null && stateKey === null) throw new Error("LILITH_HOME_STATE_KEY is required");
+  const home =
+    relay === null
+      ? null
+      : createHomeRunner({
+          relayUrl: relay.url,
+          apiToken: config.token,
+          relayToken: relay.token,
+          relay: relayMailboxFromFetch(relay.url, relay.token),
+          statePath: join(cwd, ".lilith-home-runner.json"),
+          stateKey: stateKey ?? undefined,
+        });
+  if (home) {
+    setInterval(() => {
+      void home.pump().catch((error: unknown) => {
+        console.error(error instanceof Error ? error.message : "Home runner relay failed");
+      });
+    }, 2_000);
+  }
   // Listen even if the tombstone is still pending: owner APIs fail closed, delete retry stays up.
-  const server = createHealthServer(config, tasks, memories, {}, retention, tools);
+  const server = createHealthServer(config, tasks, memories, {}, retention, tools, home);
   server.listen(config.port, config.host, () => {
     process.stdout.write(`API listening on http://${config.host}:${config.port}\n`);
   });

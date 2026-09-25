@@ -10,5 +10,8 @@
   "dependencies": {
     "@lilith/contracts": "*",
     "playwright-core": "1.63.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.139.0"
   }
 }
