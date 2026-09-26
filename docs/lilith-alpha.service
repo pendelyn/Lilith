@@ -1,0 +1,17 @@
+[Unit]
+Description=Lilith local alpha API (loopback only)
+After=default.target
+
+[Service]
+Type=simple
+UMask=0077
+NoNewPrivileges=yes
+UnsetEnvironment=SSH_AUTH_SOCK GPG_AGENT_INFO
+WorkingDirectory=%h/lilith-alpha/services/api
+EnvironmentFile=%h/.config/lilith-alpha/api.env
+ExecStart=%h/node-v24/bin/node src/index.ts
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

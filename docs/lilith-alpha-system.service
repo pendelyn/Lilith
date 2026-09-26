@@ -1,0 +1,24 @@
+[Unit]
+Description=Lilith alpha API (loopback only, dynamic user)
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=lilith-alpha
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/lilith-alpha
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=disconnected
+CapabilityBoundingSet=
+AmbientCapabilities=
+Environment=HOME=/var/lib/lilith-alpha
+EnvironmentFile=/etc/lilith-alpha/api.env
+ExecStart=/usr/bin/env HOST=127.0.0.1 /opt/node-v24/bin/node /opt/lilith-alpha/services/api/src/index.ts
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
