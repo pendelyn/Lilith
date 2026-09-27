@@ -72,6 +72,7 @@ import {
   runPublicPageRead,
   webResearchDepsForTask,
 } from "./web-research.ts";
+import { isHomeRunnerPath, routeHomeRunner, type HomeRunner } from "./home-runner.ts";
 import {
   inspectBrowserEffect,
   invokeBrowserEffect,
@@ -123,9 +124,10 @@ export function createHealthServer(
   web: BrowserDeps = {},
   retention: RetentionStore = createRetentionStore(),
   toolAllow: ToolAllowStore = createToolAllowStore(),
+  home: HomeRunner | null = null,
 ): Server {
   return createServer((req, res) => {
-    handleRequest(req, res, auth, store, memories, web, retention, toolAllow);
+    handleRequest(req, res, auth, store, memories, web, retention, toolAllow, home);
   });
 }
 
@@ -138,6 +140,7 @@ function handleRequest(
   web: BrowserDeps,
   retention: RetentionStore,
   toolAllow: ToolAllowStore,
+  home: HomeRunner | null,
 ): void {
   try {
     const owner = authenticateOwner(req.headers.authorization, auth);
@@ -212,7 +215,7 @@ function handleRequest(
         res.end();
         return;
       }
-      void handleAccountDelete(req, res, owner, store, memories, retention, toolAllow);
+      void handleAccountDelete(req, res, owner, store, memories, retention, toolAllow, home);
       return;
     }
 
@@ -223,6 +226,11 @@ function handleRequest(
         return;
       }
       writeJson(res, parseTaskListResponse({ tasks: listResearchCards(store, owner) }));
+      return;
+    }
+
+    if (home !== null && isHomeRunnerPath(pathname)) {
+      void routeHomeRunner(req, res, owner, home, pathname);
       return;
     }
 
@@ -691,9 +699,11 @@ async function handleAccountDelete(
   memories: MemoryStore,
   retention: RetentionStore,
   toolAllow: ToolAllowStore,
+  home: HomeRunner | null,
 ): Promise<void> {
   try {
     parseAccountDeleteRequest(await readJsonBody(req));
+    if (home !== null) await home.revokeOwner(owner);
     deleteAccount(retention, store, memories, owner, toolAllow);
     writeJson(res, parseAccountDeleteResponse({ deleted: true }));
   } catch (error) {

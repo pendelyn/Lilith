@@ -103,6 +103,10 @@ Default `npm test` does not use the public internet. Live check: `$env:LILITH_LI
 
 This is not a search engine, browser, or Codex tool. Isolated CLI jobs keep `--network=none`.
 
+## Home runner milestone (Issue #29)
+
+Optional outbound runner only. The API stays the owner and task authority; a Cloudflare Durable Object mailbox is transport; the home machine does not listen. Pairing is one-time, five minutes, and revocable. With the relay set, pairing and runner state is encrypted at rest in gitignored `.lilith-home-runner.json` under `LILITH_HOME_STATE_KEY`. The only job is the `echo-ok` fixture through `runIsolatedJob`. This milestone is not close-ready: nothing is deployed, the home runner refuses production credential env, and output redaction is not a guarantee for any other secret. Provider secrets stay off the relay. See `docs/home-runner.md`.
+
 ## Isolated browser (Issue #18)
 
 Recommended setup enables the same web-research flag that gates `Lies`. There is still **no live model** and **no desktop control**. Issue #8 stays deactivated. Page text is untrusted and cannot change tools, identity, or memories. Timeline screenshots in chat are Issue #19. Form text can be prepared as a preview; submit, upload, message, purchase, and ambiguous clicks wait for Issue #20 one-time approval.
