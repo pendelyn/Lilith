@@ -14,6 +14,10 @@ ProtectSystem=strict
 PrivateTmp=disconnected
 CapabilityBoundingSet=
 AmbientCapabilities=
+SocketBindAllow=ipv4:tcp:3000
+SocketBindDeny=any
+IPAddressAllow=127.0.0.1
+IPAddressDeny=any
 Environment=HOME=/var/lib/lilith-alpha
 EnvironmentFile=/etc/lilith-alpha/api.env
 ExecStart=/usr/bin/env HOST=127.0.0.1 /opt/node-v24/bin/node /opt/lilith-alpha/services/api/src/index.ts
