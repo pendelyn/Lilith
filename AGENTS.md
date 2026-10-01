@@ -16,7 +16,7 @@
 - Rollenregel (dauerhaft, ausdrücklich vom Nutzer verlangt): Der Orchestrator koordiniert, weist Arbeit zu, synthetisiert Ergebnisse und verwaltet Abnahme sowie GitHub-Lebenszyklus. Er implementiert keinen Code und behebt keine Fehler selbst.
 - Orchestrator: GPT-6 Sol mit Thinking-Level `high`.
 - Subagenten für Git: GPT-6 Luna.
-- Delegierte Cursor-Worker: Cursor Grok 4.7 mit `xhigh` über `scripts/cursor-grok.ps1`. Grok übernimmt Recherche, Implementierung, Tests, Review und Fixes. Aufruf nur über die Shell, ohne `timeout` und nicht über `ctx_execute` (dort endet der Lauf nach 120s). Stderr zeigt Fortschritt und alle 20s `cursor-grok: waiting`; Stdout ist erst am Ende eine JSON-Zeile. Ein Lauf dauert oft 30–45 Minuten. Stille auf Stdout ist kein Hänger. Verbindungsabbrüche zu `agent` wiederholt die CLI selbst.
+- Delegierte Cursor-Worker: Cursor Grok 4.7 mit `xhigh` über `scripts/cursor-grok.ps1` (Windows) oder `scripts/cursor-grok.sh` (Linux; Prompt über stdin, Standard `--mode ask`). Grok übernimmt Recherche, Implementierung, Tests, Review und Fixes. Aufruf nur über die Shell, ohne `timeout` und nicht über `ctx_execute` (dort endet der Lauf nach 120s). Stderr zeigt Fortschritt und alle 20s `cursor-grok: waiting`; Stdout ist erst am Ende eine JSON-Zeile. Ein Lauf dauert oft 30–45 Minuten. Stille auf Stdout ist kein Hänger. Verbindungsabbrüche zu `agent` wiederholt die CLI selbst.
 - Review ist ein frischer, separater Grok-Lauf.
 - Bei Grok-Ausfall kein stilles Selbstimplementieren und kein Modell-Fallback; den Blocker melden.
 - Writer besitzen ihre Issue-Branches und Worktrees.
