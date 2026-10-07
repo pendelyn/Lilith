@@ -1,10 +1,17 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { MAX_MEMORY_CONTENT, MAX_QUESTION_CHARS, MEMORY_CONFIRM_REPLY, parseAccountDeleteResponse, parseChatStreamEvent, parseHealthResponse, parseMemoryConfirmResponse, parseMemoryItem, parseMemoryListResponse, parseMemoryPauseRequest, parseRememberContent, parseSubagentCard, parseTaskListResponse, parseToolAllowResponse, type ApprovalRequest, type BrowserTimeline, type OptionalTool, type QuestionAnswer, type TaskState, type ToolPreset } from "@lilith/contracts";
+import { GeistMono_400Regular } from "@expo-google-fonts/geist-mono/400Regular";
+import { Onest_400Regular } from "@expo-google-fonts/onest/400Regular";
+import { Onest_500Medium } from "@expo-google-fonts/onest/500Medium";
+import { Onest_600SemiBold } from "@expo-google-fonts/onest/600SemiBold";
+import { Onest_700Bold } from "@expo-google-fonts/onest/700Bold";
+import { PixelifySans_400Regular } from "@expo-google-fonts/pixelify-sans/400Regular";
+import { useFonts } from "expo-font";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   SafeAreaProvider,
-  SafeAreaView,
+  useSafeAreaInsets,
 } from "react-native-safe-area-context";
 import {
   AccessibilityInfo,
@@ -103,12 +110,20 @@ import {
   type PendingTaskControl,
 } from "./task-controls";
 import { PixelMascot } from "./pixel-mascot";
-import { colors } from "./theme";
+import { colors, FONT_FACE, MAX_CHROME_FONT_SCALE, type FontFace } from "./theme";
+import { font } from "./src/theme/tokens";
 import { agentOverviewDestination, type HomeScreen } from "./navigation";
 import { GRID_SPRITE, SEND_SPRITE, SPARK_SPRITE } from "./sprites";
 
-// CLI-flavoured type for the chat surface only; functional screens stay on the system font.
-const mono = Platform.select({ ios: "Menlo", default: "monospace" });
+const FONT_ASSETS = {
+  Onest_400Regular,
+  Onest_500Medium,
+  Onest_600SemiBold,
+  Onest_700Bold,
+  PixelifySans_400Regular,
+  GeistMono_400Regular,
+} satisfies Record<FontFace, number>;
+const onest = FONT_FACE[font.ui];
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://10.0.2.2:3000").replace(/\/$/, "");
 const TIMEOUT_MS = 8000;
@@ -162,6 +177,7 @@ export default function App() {
   const [identity, setIdentity] = useState<AgentIdentity | null>(null);
   const [allowToolMigrate, setAllowToolMigrate] = useState(false);
   const [persistError, setPersistError] = useState(false);
+  const [fontsLoaded, fontError] = useFonts(FONT_ASSETS);
   const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const saveRevision = useRef(0);
   const accountPurge = useRef(createAccountPurge());
@@ -209,9 +225,9 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <SafeAreaView style={styles.safe}>
+      <View style={styles.root}>
         <StatusBar style="light" />
-        {!ready ? (
+        {!ready || (!fontsLoaded && fontError === null) ? (
           <View style={styles.loading} accessibilityLabel="Loading">
             <ActivityIndicator color={colors.accent} />
           </View>
@@ -241,7 +257,7 @@ export default function App() {
             }}
           />
         )}
-      </SafeAreaView>
+      </View>
     </SafeAreaProvider>
   );
 }
@@ -249,9 +265,11 @@ export default function App() {
 function Onboarding({ onComplete }: { onComplete: (identity: AgentIdentity) => void }) {
   const [name, setName] = useState(DEFAULT_NAME);
   const [mode, setMode] = useState<SetupMode | null>(null);
+  const insets = useSafeAreaInsets();
 
   return (
     <ScrollView
+      style={{ marginTop: insets.top, marginBottom: insets.bottom, marginLeft: insets.left, marginRight: insets.right }}
       keyboardShouldPersistTaps="handled"
       keyboardDismissMode="interactive"
       automaticallyAdjustKeyboardInsets
@@ -354,6 +372,7 @@ function Home({
   const list = useRef<FlatList<ChatMessage> | null>(null);
   const idSequence = useRef(0);
   const shouldAutoScroll = useRef(true);
+  const insets = useSafeAreaInsets();
   const busy = state === "loading" || state === "streaming";
   const memoryEnabled = memoryEnabledFromIdentity(identity);
   const webResearchEnabled = webResearchEnabledFromIdentity(identity);
@@ -971,11 +990,13 @@ function Home({
   }
 
   return (
+    // ponytail: the bottom inset stays outside the keyboard-avoiding frame so its keyboard offset is unchanged.
+    // A composer floating over the list must own this inset instead.
     <KeyboardAvoidingView
-      style={styles.chatScreen}
+      style={[styles.chatScreen, { marginBottom: insets.bottom, marginLeft: insets.left, marginRight: insets.right }]}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
-      <View style={styles.topBar}>
+      <View style={[styles.topBar, { marginTop: insets.top }]}>
         <Pressable onPress={() => setScreen(agentOverviewDestination(screen))} accessibilityRole="button" accessibilityLabel="Agent overview" style={styles.iconButton}>
           <Pixel rows={GRID_SPRITE} size={3} color={colors.accent} />
         </Pressable>
@@ -984,7 +1005,7 @@ function Home({
           <Pixel rows={SPARK_SPRITE} size={3} color={colors.accent} />
         </Pressable>
         <Pressable onPress={() => setScreen("account")} accessibilityRole="button" accessibilityLabel="Account and settings" style={styles.accountBadge}>
-          <Text style={styles.accountInitials}>ME</Text>
+          <Text maxFontSizeMultiplier={MAX_CHROME_FONT_SCALE} style={styles.accountInitials}>ME</Text>
         </Pressable>
       </View>
       {screen === "chat" ? <>
@@ -1266,7 +1287,7 @@ function Home({
       </View>
       )}
       {screen === "chat" ? <View style={styles.composerDock}>
-        {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
+        {state !== "success" ? <Pressable onPress={() => setScreen("settings")} accessibilityRole="button" accessibilityLabel={`Connection status: ${STATUS_TEXT[state]}. Open settings to connect.`} style={styles.connectionPrompt}><Text maxFontSizeMultiplier={MAX_CHROME_FONT_SCALE} style={[styles.memoryMeta, (state === "unauthorized" || state === "unreachable" || state === "unexpected") && styles.statusError]}>{STATUS_TEXT[state]} · Set up connection in Settings</Text></Pressable> : null}
         <View style={[styles.composer, { borderColor: accent }, composerFocused && styles.composerFocused]}>
         <TextInput
           value={draft}
@@ -1277,6 +1298,7 @@ function Home({
           onBlur={() => setComposerFocused(false)}
           multiline
           maxLength={MAX_MESSAGE_LENGTH}
+          maxFontSizeMultiplier={MAX_CHROME_FONT_SCALE}
           editable={state === "success" && activeUserId === null}
           keyboardAppearance="dark"
           accessibilityLabel="Message"
@@ -2063,12 +2085,12 @@ const styles = StyleSheet.create({
   topBarSpacer: { flex: 1 },
   iconButton: { width: 44, height: 44, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.accentSoft, borderRadius: 8, backgroundColor: colors.surface },
   accountBadge: { width: 44, height: 44, borderRadius: 22, backgroundColor: colors.accent, alignItems: "center", justifyContent: "center" },
-  accountInitials: { color: colors.canvas, fontSize: 14, fontWeight: "700", fontFamily: mono },
+  accountInitials: { color: colors.canvas, fontSize: 14, fontFamily: onest["700"] },
   pixelRow: { flexDirection: "row" },
   navigationPanel: { flexGrow: 1, paddingHorizontal: 18, paddingVertical: 16, gap: 12 },
   navigationCard: { padding: 16, gap: 6, borderWidth: 1, borderColor: colors.outline, borderRadius: 8, backgroundColor: colors.surface },
-  navigationTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  welcomeMark: { color: colors.accent, fontSize: 48, textAlign: "center" },
+  navigationTitle: { color: colors.text, fontSize: 17, fontFamily: onest["600"] },
+  welcomeMark: { color: colors.accent, fontSize: 48, fontFamily: onest["400"], textAlign: "center" },
   approvalCard: {
     padding: 12,
     gap: 8,
@@ -2077,8 +2099,8 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     backgroundColor: colors.surface,
   },
-  destructiveLabel: { color: colors.danger, fontSize: 15, fontWeight: "600" },
-  safe: {
+  destructiveLabel: { color: colors.danger, fontSize: 15, fontFamily: onest["600"] },
+  root: {
     flex: 1,
     backgroundColor: colors.canvas,
   },
@@ -2104,6 +2126,7 @@ const styles = StyleSheet.create({
     color: colors.text,
     paddingHorizontal: 12,
     fontSize: 16,
+    fontFamily: onest["400"],
   },
   connectButton: {
     paddingHorizontal: 16,
@@ -2118,11 +2141,12 @@ const styles = StyleSheet.create({
   connectLabel: {
     color: colors.canvas,
     fontSize: 15,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   connectionStatus: {
     color: colors.muted,
     fontSize: 13,
+    fontFamily: onest["400"],
     minHeight: 28,
     paddingHorizontal: 14,
     paddingTop: 6,
@@ -2137,7 +2161,7 @@ const styles = StyleSheet.create({
   chatSurface: { marginHorizontal: 14, flex: 1, borderWidth: 1, borderColor: colors.hairline, borderRadius: 12, backgroundColor: colors.chat, overflow: "hidden" },
   chatList: { flex: 1 },
   mascot: { position: "absolute", left: 12, bottom: 10, flexDirection: "row", alignItems: "flex-end", gap: 8 },
-  mascotActivity: { color: colors.accentSoft, fontFamily: mono, fontSize: 14, lineHeight: 18 },
+  mascotActivity: { color: colors.accentSoft, fontFamily: onest["400"], fontSize: 14, lineHeight: 18 },
   emptyChat: {
     flexGrow: 1,
     alignItems: "center",
@@ -2146,7 +2170,7 @@ const styles = StyleSheet.create({
   },
   emptyText: {
     color: colors.muted,
-    fontFamily: mono,
+    fontFamily: onest["400"],
     fontSize: 14,
     lineHeight: 20,
     textAlign: "center",
@@ -2174,10 +2198,10 @@ const styles = StyleSheet.create({
     backgroundColor: colors.user,
     borderColor: colors.accentSoft,
   },
-  messageTime: { color: colors.muted, fontFamily: mono, fontSize: 11, lineHeight: 14, paddingHorizontal: 2 },
+  messageTime: { color: colors.muted, fontFamily: onest["400"], fontVariant: ["tabular-nums"], fontSize: 11, lineHeight: 14, paddingHorizontal: 2 },
   messageText: {
     color: colors.text,
-    fontFamily: mono,
+    fontFamily: onest["400"],
     fontSize: 14,
     lineHeight: 20,
   },
@@ -2191,7 +2215,7 @@ const styles = StyleSheet.create({
   retryLabel: {
     color: colors.accent,
     fontSize: 15,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   subagentCard: {
     gap: 8,
@@ -2205,16 +2229,19 @@ const styles = StyleSheet.create({
   subagentRole: {
     color: colors.accent,
     fontSize: 13,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   subagentAssignment: {
     color: colors.text,
     fontSize: 15,
+    fontFamily: onest["400"],
     lineHeight: 20,
   },
   subagentState: {
     color: colors.muted,
     fontSize: 13,
+    fontFamily: onest["400"],
+    fontVariant: ["tabular-nums"],
   },
   browserStep: {
     gap: 4,
@@ -2229,6 +2256,7 @@ const styles = StyleSheet.create({
   questionPrompt: {
     color: colors.text,
     fontSize: 15,
+    fontFamily: onest["400"],
     lineHeight: 20,
     marginTop: 6,
   },
@@ -2251,7 +2279,7 @@ const styles = StyleSheet.create({
   questionOptionLabel: {
     color: colors.accent,
     fontSize: 15,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   questionInput: {
     borderWidth: 1,
@@ -2262,6 +2290,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.inset,
     color: colors.text,
     fontSize: 16,
+    fontFamily: onest["400"],
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
@@ -2279,7 +2308,7 @@ const styles = StyleSheet.create({
   questionSendLabel: {
     color: colors.canvas,
     fontSize: 15,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   taskControl: {
     alignSelf: "flex-start",
@@ -2297,7 +2326,7 @@ const styles = StyleSheet.create({
   taskControlLabel: {
     color: colors.accent,
     fontSize: 15,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   memoryList: {
     paddingHorizontal: 16,
@@ -2315,6 +2344,8 @@ const styles = StyleSheet.create({
   memoryMeta: {
     color: colors.muted,
     fontSize: 13,
+    fontFamily: onest["400"],
+    fontVariant: ["tabular-nums"],
     lineHeight: 18,
   },
   privacyNotice: {
@@ -2322,6 +2353,7 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     color: colors.secondary,
     fontSize: 15,
+    fontFamily: onest["400"],
     lineHeight: 22,
   },
   memoryPause: {
@@ -2349,6 +2381,7 @@ const styles = StyleSheet.create({
     backgroundColor: colors.inset,
     color: colors.text,
     fontSize: 16,
+    fontFamily: onest["400"],
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
@@ -2371,7 +2404,7 @@ const styles = StyleSheet.create({
     minHeight: 44,
     maxHeight: 120,
     color: colors.text,
-    fontFamily: mono,
+    fontFamily: onest["400"],
     fontSize: 14,
     lineHeight: 20,
     paddingHorizontal: 12,
@@ -2400,24 +2433,24 @@ const styles = StyleSheet.create({
   title: {
     color: colors.text,
     fontSize: 36,
-    fontWeight: "700",
-    letterSpacing: 0.2,
+    fontFamily: onest["700"],
   },
   lede: {
     color: colors.muted,
     fontSize: 17,
+    fontFamily: onest["400"],
     lineHeight: 24,
   },
   meta: {
     color: colors.muted,
     fontSize: 16,
+    fontFamily: onest["400"],
     lineHeight: 22,
   },
   sectionLabel: {
     color: colors.accent,
     fontSize: 17,
-    fontWeight: "600",
-    letterSpacing: 0.2,
+    fontFamily: onest["600"],
     marginTop: 8,
   },
   field: {
@@ -2426,7 +2459,7 @@ const styles = StyleSheet.create({
   fieldLabel: {
     color: colors.secondary,
     fontSize: 13,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   input: {
     backgroundColor: colors.inset,
@@ -2435,6 +2468,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     color: colors.text,
     fontSize: 17,
+    fontFamily: onest["400"],
     minHeight: 48,
     paddingHorizontal: 14,
     paddingVertical: 12,
@@ -2483,11 +2517,12 @@ const styles = StyleSheet.create({
   choiceTitle: {
     color: colors.text,
     fontSize: 17,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   choiceDetail: {
     color: colors.muted,
     fontSize: 15,
+    fontFamily: onest["400"],
     lineHeight: 20,
   },
   modeGroup: {
@@ -2515,11 +2550,12 @@ const styles = StyleSheet.create({
   buttonLabel: {
     color: colors.canvas,
     fontSize: 17,
-    fontWeight: "600",
+    fontFamily: onest["600"],
   },
   status: {
     color: colors.secondary,
     fontSize: 16,
+    fontFamily: onest["400"],
     lineHeight: 22,
   },
   statusSuccess: {
@@ -2527,5 +2563,6 @@ const styles = StyleSheet.create({
   },
   statusError: {
     color: colors.danger,
+    fontFamily: onest["400"],
   },
 });
