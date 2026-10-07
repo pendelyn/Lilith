@@ -18,13 +18,15 @@ LEFTOVERS = []
 
 FAKE_LINES = [
     "#!/usr/bin/env python3",
-    "import json, os, sys, time, pathlib, subprocess",
+    "import json, os, sys, time, pathlib, subprocess, signal",
     "cap = pathlib.Path(os.environ['CURSOR_GROK_CAPTURE'])",
     "cap.mkdir(parents=True, exist_ok=True)",
     "(cap / 'argv.json').write_text(json.dumps(sys.argv[1:], ensure_ascii=False), encoding='utf-8')",
     "(cap / 'stdin.bin').write_bytes(sys.stdin.buffer.read())",
     "(cap / 'cwd.txt').write_text(os.getcwd(), encoding='utf-8')",
     "(cap / 'self.pid').write_text(str(os.getpid()), encoding='utf-8')",
+    "(cap / 'gitdir.txt').write_text(os.environ.get('GIT_DIR', ''), encoding='utf-8')",
+    "(cap / 'gitwork.txt').write_text(os.environ.get('GIT_WORK_TREE', ''), encoding='utf-8')",
     "previous_umask = os.umask(0o077)",
     "os.umask(previous_umask)",
     "(cap / 'umask.txt').write_text('%04o' % previous_umask, encoding='utf-8')",
@@ -65,6 +67,13 @@ FAKE_LINES = [
     "        err.write(('burst-%s\\n' % n).encode())",
     "    err.flush()",
     "    emit_ok()",
+    "    raise SystemExit(0)",
+    "if mode == 'ignore-term':",
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+    "    signal.signal(signal.SIGINT, signal.SIG_IGN)",
+    "    signal.signal(signal.SIGHUP, signal.SIG_IGN)",
+    "    (cap / 'ignoring').write_text('1', encoding='utf-8')",
+    "    time.sleep(120)",
     "    raise SystemExit(0)",
     "if mode == 'tree':",
     "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])",
@@ -134,7 +143,7 @@ def make_env(fake, capture, mode, fake_exit):
     return env
 
 
-def launch(args, prompt, env, timeout=20):
+def launch(args, prompt, env, timeout=20, cwd=None):
     return subprocess.run(
         [str(WRAPPER), *args],
         input=prompt,
@@ -142,6 +151,7 @@ def launch(args, prompt, env, timeout=20):
         stderr=subprocess.PIPE,
         env=env,
         timeout=timeout,
+        cwd=cwd,
         check=False,
     )
 
@@ -209,6 +219,21 @@ def alive(pid):
         return False
     state = text.rsplit(")", 1)[-1].split()[0]
     return state != "Z"
+
+
+def flag_value(argv, flag):
+    return argv[argv.index(flag) + 1]
+
+
+def wait_file(path, proc, seconds=10):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.05)
+    return path.exists()
 
 
 def wait_pid(path, proc, seconds=10):
@@ -471,7 +496,124 @@ def run_tests():
         check(empty_prompt.returncode == 2, f"empty prompt exit {empty_prompt.returncode}")
         check(capture_of(empty_prompt_cap) is None, "empty prompt launched the fake CLI")
 
+    test_relative_workspace(fake)
+    test_git_env_guard(fake)
+    test_exec_failure(fake)
     test_cancel(fake)
+    test_cancel_ignores_term(fake)
+
+
+def test_relative_workspace(fake):
+    base = TMP / "rel base"
+    target = base / "my ws"
+    nested = base / "nest"
+    target.mkdir(parents=True)
+    nested.mkdir()
+    decoy = TMP / "cdpath-decoy" / "my ws"
+    decoy.mkdir(parents=True)
+
+    def assert_abs(name, cwd, arg):
+        cap = TMP / f"cap-{name}"
+        cap.mkdir()
+        env = make_env(fake, cap, "ok", None)
+        env["CDPATH"] = str(TMP / "cdpath-decoy")
+        proc = launch(
+            ["--workspace", arg, "--heartbeat-seconds", "30"],
+            b"rel",
+            env,
+            cwd=cwd,
+        )
+        err = proc.stderr.decode("utf-8", "replace")
+        got = capture_of(cap)
+        check(proc.returncode == 0, f"{name} exit {proc.returncode}: {err}")
+        check(got is not None, f"{name} did not launch: {err}")
+        if got is None:
+            return
+        argv, _stdin, child_cwd = got
+        chosen = flag_value(argv, "--workspace")
+        matches = os.path.isabs(chosen) and os.path.isdir(chosen) and os.path.samefile(chosen, target)
+        check(matches, f"{name} workspace {chosen!r} != {target}")
+        check("cdpath-decoy" not in chosen, f"{name} followed CDPATH: {chosen!r}")
+        check(child_cwd == chosen, f"{name} cwd {child_cwd!r} != workspace {chosen!r}")
+
+    assert_abs("rel-name", base, "my ws")
+    assert_abs("rel-dotdot", nested, "../my ws")
+
+
+def test_git_env_guard(fake):
+    decoy = TMP / "git-decoy"
+    init_repo(decoy, branch="issue/89-decoy")
+    main_repo = TMP / "git-env-main"
+    init_repo(main_repo)
+    foreign = {
+        "GIT_DIR": str(decoy / ".git"),
+        "GIT_WORK_TREE": str(decoy),
+    }
+    cap = TMP / "cap-git-env"
+    cap.mkdir()
+    env = make_env(fake, cap, "ok", None)
+    env.update(foreign)
+    rejected = launch(["--mode", "agent", "--workspace", str(main_repo)], b"no", env)
+    assert_rejected("git-env", rejected, cap)
+
+    issue = TMP / "git-env-issue"
+    init_repo(issue, branch="issue/89-real")
+    cap_ok = TMP / "cap-git-env-ok"
+    cap_ok.mkdir()
+    env_ok = make_env(fake, cap_ok, "ok", None)
+    env_ok["GIT_DIR"] = str(main_repo / ".git")
+    env_ok["GIT_WORK_TREE"] = str(main_repo)
+    accepted = launch(["--mode", "agent", "--workspace", str(issue)], b"yes", env_ok)
+    err = accepted.stderr.decode("utf-8", "replace")
+    got = capture_of(cap_ok)
+    check(accepted.returncode == 0, f"issue workspace with foreign GIT_DIR exit {accepted.returncode}: {err}")
+    check(got is not None, f"foreign GIT_DIR blocked a real issue branch: {err}")
+    if got is not None:
+        _argv, _stdin, cwd = got
+        check(cwd == str(issue), f"foreign GIT_DIR redirected cwd to {cwd!r}")
+        gitdir = (cap_ok / "gitdir.txt").read_text(encoding="utf-8")
+        gitwork = (cap_ok / "gitwork.txt").read_text(encoding="utf-8")
+        check(gitdir == "" and gitwork == "", f"child inherited GIT_DIR={gitdir!r} GIT_WORK_TREE={gitwork!r}")
+
+    wt_main = TMP / "wt-main"
+    init_repo(wt_main)
+    wt = TMP / "wt-issue"
+    git(wt_main, "worktree", "add", "-q", "-b", "issue/89-wt", str(wt))
+    cap_wt = TMP / "cap-git-env-wt"
+    cap_wt.mkdir()
+    env_wt = make_env(fake, cap_wt, "ok", None)
+    env_wt["GIT_DIR"] = str(wt_main / ".git")
+    env_wt["GIT_WORK_TREE"] = str(wt_main)
+    accepted_wt = launch(["--mode", "agent", "--workspace", str(wt)], b"wt", env_wt)
+    err_wt = accepted_wt.stderr.decode("utf-8", "replace")
+    got_wt = capture_of(cap_wt)
+    check(accepted_wt.returncode == 0, f"issue worktree with foreign GIT_DIR exit {accepted_wt.returncode}: {err_wt}")
+    check(got_wt is not None, f"foreign GIT_DIR blocked an issue worktree: {err_wt}")
+    if got_wt is not None:
+        _argv, _stdin, cwd = got_wt
+        check(cwd == str(wt), f"worktree cwd {cwd!r}")
+        gitdir = (cap_wt / "gitdir.txt").read_text(encoding="utf-8")
+        gitwork = (cap_wt / "gitwork.txt").read_text(encoding="utf-8")
+        check(gitdir == "" and gitwork == "", f"worktree child inherited GIT_DIR={gitdir!r} GIT_WORK_TREE={gitwork!r}")
+
+
+def test_exec_failure(fake):
+    bindir = TMP / "bad-python"
+    bindir.mkdir()
+    stub = bindir / "python3"
+    stub.write_text("#!/no/such/interpreter\n", encoding="utf-8")
+    stub.chmod(0o755)
+    cap = TMP / "cap-exec-fail"
+    cap.mkdir()
+    ws = TMP / "exec-ws"
+    ws.mkdir()
+    env = make_env(fake, cap, "ok", None)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    proc = launch(["--workspace", str(ws)], b"x", env, timeout=10)
+    err = proc.stderr.decode("utf-8", "replace")
+    check(proc.returncode == 1, f"failed exec exit {proc.returncode}: {err}")
+    check("failed to start cursor-grok supervisor" in err, f"exec failure was silent: {err}")
+    check(capture_of(cap) is None, "failed supervisor exec launched the fake CLI")
 
 
 def test_cancel(fake):
@@ -520,6 +662,60 @@ def test_cancel(fake):
     check(not alive(grand), f"grandchild {grand} still running after SIGTERM")
     check(not alive(fake_pid), f"fake {fake_pid} still running after SIGTERM")
     check(alive(other.pid), f"unrelated process {other.pid} was killed")
+
+
+def test_cancel_ignores_term(fake):
+    cap = TMP / "ignore-term"
+    cap.mkdir()
+    tree_ws = TMP / "ignore-ws"
+    tree_ws.mkdir()
+    env = make_env(fake, cap, "ignore-term", None)
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    LEFTOVERS.append(other.pid)
+    proc = subprocess.Popen(
+        [str(WRAPPER), "--workspace", str(tree_ws), "--heartbeat-seconds", "30"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        proc.stdin.write(b"ignore")
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    try:
+        ready = wait_file(cap / "ignoring", proc)
+        fake_pid = wait_pid(cap / "self.pid", proc)
+        check(ready, "ignore-term child never installed SIG_IGN")
+        check(fake_pid is not None, "ignore-term child never started")
+        if ready and fake_pid is not None:
+            started = time.monotonic()
+            os.kill(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+                check(False, "SIGKILL escalation waited for the heartbeat")
+            elapsed = time.monotonic() - started
+            err = proc.stderr.read().decode("utf-8", "replace")
+            out = proc.stdout.read()
+            check(elapsed < 5, f"cancel escalation took {elapsed:.2f}s with heartbeat 30")
+            check(proc.returncode == 143, f"ignore-term exit {proc.returncode} stderr={err[:400]}")
+            check(out == b"", f"ignore-term wrote stdout {out!r}")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and alive(fake_pid):
+                time.sleep(0.05)
+            check(not alive(fake_pid), f"fake {fake_pid} still running after SIGKILL escalation")
+            check(alive(other.pid), f"unrelated process {other.pid} was killed")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def main():

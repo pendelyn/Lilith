@@ -69,6 +69,14 @@ fi
 if [[ ! -d $workspace ]]; then
   die "Workspace is not a directory: $workspace" 2
 fi
+# The child cwd is the workspace, so a relative --workspace would be resolved
+# again from inside it. `cd -- -` is OLDPWD; CDPATH would pick a different tree.
+workspace_in=$workspace
+cd_target=$workspace
+if [[ $cd_target == - ]]; then
+  cd_target=./-
+fi
+workspace=$(CDPATH= cd -- "$cd_target" && pwd) || die "Workspace is not a directory: $workspace_in" 2
 
 if [[ -n ${CURSOR_GROK_AGENT:-} ]]; then
   agent=$CURSOR_GROK_AGENT
@@ -98,6 +106,9 @@ if ! grep -q '[^[:space:]]' "$td/prompt"; then
 fi
 
 if [[ $mode == agent ]]; then
+  # A parent GIT_DIR/GIT_WORK_TREE names some other checkout. Drop them for the
+  # guard and the child, or agent mode can be aimed at a branch we did not check.
+  unset GIT_DIR GIT_WORK_TREE
   git_err=0
   branch=$(git -C "$workspace" -c alias.branch= branch --show-current 2>/dev/null) || git_err=$?
   branch=${branch//$'\r'/}
@@ -125,6 +136,9 @@ fi
 cli+=(--workspace "$workspace")
 
 # exec replaces this shell. The supervisor unlinks the prompt file before launch.
+# A failed exec exits the shell before the next line; execfail makes it return.
+shopt -s execfail
+set +e
 exec python3 - "$td" "$workspace" "$agent" "$heartbeat" "${cli[@]}" <<'PY'
 import json
 import os
@@ -249,6 +263,14 @@ def run():
     sel = selectors.DefaultSelector()
     sel.register(out_raw, selectors.EVENT_READ, "out")
     sel.register(err_raw, selectors.EVENT_READ, "err")
+    # select() retries on EINTR, so a child that ignores SIGTERM would block
+    # until the heartbeat before cleanup escalates to SIGKILL.
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w)
+    sel.register(wake_r, selectors.EVENT_READ, "wake")
+    open_streams = 2
     out_buf = b""
     err_buf = b""
     result = None
@@ -287,7 +309,7 @@ def run():
                 sys.stderr.buffer.write(line + b"\n")
                 sys.stderr.buffer.flush()
 
-    while sel.get_map():
+    while open_streams:
         if state["aborted"] is not None:
             cleanup()
             return state["aborted"]
@@ -299,10 +321,20 @@ def run():
             events = sel.select(remain)
         except InterruptedError:
             continue
+        if state["aborted"] is not None:
+            cleanup()
+            return state["aborted"]
         if not events:
             beat()
             continue
         for key, _mask in events:
+            if key.data == "wake":
+                try:
+                    while os.read(key.fd, 65536):
+                        pass
+                except BlockingIOError:
+                    pass
+                continue
             try:
                 chunk = os.read(key.fd, 65536)
             except OSError:
@@ -313,6 +345,7 @@ def run():
                     sel.unregister(key.fileobj)
                 except Exception:
                     pass
+                open_streams -= 1
             else:
                 take(key.data, chunk, False)
 
@@ -352,4 +385,5 @@ finally:
         shutil.rmtree(td, ignore_errors=True)
 raise SystemExit(status)
 PY
+set -e
 die 'failed to start cursor-grok supervisor' 1
