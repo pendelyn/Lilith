@@ -108,7 +108,8 @@ test(
       assert.ok((info.HostConfig.CapDrop ?? []).includes("ALL"));
       assert.equal(JSON.stringify(info.HostConfig.Binds ?? []).includes("docker.sock"), false);
       assert.match(info.Config.Image, /playwright/);
-      const repo = execFileSync("docker", ["inspect", "--format", "{{index .RepoDigests 0}}", BROWSER_IMAGE.split("@")[0]!], {
+      // A digest pull is stored without the mutable tag. Inspect the pin create used.
+      const repo = execFileSync("docker", ["inspect", "--format", "{{index .RepoDigests 0}}", BROWSER_IMAGE], {
         encoding: "utf8",
       });
       assert.match(repo, /sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27/);
