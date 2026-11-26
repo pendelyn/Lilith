@@ -16,13 +16,12 @@
 - Rollenregel (dauerhaft, ausdrücklich vom Nutzer verlangt): Der Orchestrator koordiniert, weist Arbeit zu, synthetisiert Ergebnisse und verwaltet Abnahme sowie GitHub-Lebenszyklus. Er implementiert keinen Code und behebt keine Fehler selbst.
 - Orchestrator: GPT-6 Sol mit Thinking-Level `high`.
 - Subagenten für Git: GPT-6 Luna.
-- Delegierte Cursor-Worker: Cursor Grok 4.7 mit `xhigh` über `scripts/cursor-grok.ps1` (Windows) oder `scripts/cursor-grok.sh` (Linux; Prompt über stdin, Standard `--mode ask`). Grok übernimmt Recherche, Implementierung, Tests, Review und Fixes. Aufruf nur über die Shell, ohne `timeout` und nicht über `ctx_execute` (dort endet der Lauf nach 120s). Stderr zeigt Fortschritt und alle 20s `cursor-grok: waiting`; Stdout ist erst am Ende eine JSON-Zeile. Ein Lauf dauert oft 30–45 Minuten. Stille auf Stdout ist kein Hänger. Verbindungsabbrüche zu `agent` wiederholt die CLI selbst.
-- Review ist ein frischer, separater Grok-Lauf.
-- Bei Grok-Ausfall kein stilles Selbstimplementieren und kein Modell-Fallback; den Blocker melden.
-- Writer besitzen ihre Issue-Branches und Worktrees.
-- Grok läuft standardmäßig read-only (`ask` oder `plan`). Schreibende Läufe verwenden einen Issue-Branch; parallele schreibende Läufe zusätzlich einen eigenen Worktree.
-- Ausnahme ausschließlich für UI v4, Issues #79–#86 (ausdrücklich vom Nutzer genehmigt): Recherche, Implementierung, Tests, Fixes und frisches separates Review nur über Cursor Claude Opus 5.5 im monatlichen Cursor-Abo-Kontingent, nicht über GPT oder Grok; keine kostenpflichtigen Add-ons aktivieren. Diese Ausnahme hat Vorrang vor widersprüchenden Grok-Worker- und Review-Regeln; außerhalb von #79–#86 bleiben diese Regeln unverändert.
-- Vor jedem UI-Arbeitsbeginn an #79–#86 prüfen, dass Cursor Claude Opus 5.5 unter seinem tatsächlichen Identifier (derzeit `claude-opus-5-5-xhigh`) verfügbar ist und über das monatliche Cursor-Abo-Kontingent läuft, ohne kostenpflichtige Add-ons. Bei Nichtverfügbarkeit oder Unsicherheit stoppen und Nutzer sowie Orchestrator benachrichtigen; kein stiller Fallback. Orchestrator und Git-Subagenten bleiben unverändert und implementieren oder reviewen die UI von #79–#86 nicht. Branch- und Worktree-Pflicht, Tests, separates Review, Merge-Commit und der Read-only-Default (`ask` oder `plan`) gelten auch für Opus.
+- Delegierte GPT/Codex-Worker übernehmen Recherche, Implementierung, Tests, Fixes und Review. Auf Linux (`aria`) verwenden sie die bestehende, über ChatGPT authentifizierte Codex CLI; Prompts kommen über stdin.
+- Standard ist read-only: Recherche und Review mit `codex exec -C <worktree> -s read-only -`, schreibende Läufe mit `codex exec -C <worktree> -s workspace-write -`. Writer besitzen ihre Issue-Branches und Worktrees; pro Worktree schreibt nur ein Agent.
+- Auf Windows werden bei nicht verfügbarer Codex CLI Pi Codex/GPT-Worker eingesetzt.
+- Review erfolgt durch einen frischen, separaten GPT/Codex-Lauf. Der Orchestrator und Git-Subagenten übernehmen weder Implementierung noch fachliches Review.
+- Vor Arbeitsbeginn Verfügbarkeit und bestehenden authentifizierten Zugang prüfen. Bei Ausfall oder Unsicherheit stoppen und Nutzer sowie Orchestrator benachrichtigen; kein stilles Selbstimplementieren, kein stiller Modellwechsel und kein Fallback auf kostenpflichtige Add-ons.
+- Für UI v4, Issues #79–#86, ersetzt diese GPT/Codex-Richtlinie ausdrücklich die frühere Cursor-Claude-Opus-only-Ausnahme. Auch dort gelten Verfügbarkeits- und Zugangsprüfung, Read-only-Default, Issue-Branch und eigener Worktree, ein Writer, Tests, relevante Checks, Diff-Prüfung, frisches separates Review mit dokumentiertem Ergebnis im PR sowie Merge-Commit. Sicherheits-, Datenschutz-, Accessibility- und Datenverlustschutz bleiben verbindlich.
 
 ## Implementierung
 
